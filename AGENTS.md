@@ -11,7 +11,13 @@ Setup for an AI coding assistant. Zero dependencies — no `npm install`.
   boundary — it cannot be auto-granted.
 - **Standalone**: `npm start` (or `node server/server.mjs`) → http://localhost:5174/.
 
-Requires Node ≥ 18. Override the port with `PORT=…`.
+Requires Node ≥ 18. Override the port with `PORT=…`. If that port is taken by an
+unrelated process the server steps to the next free one; if another atlas
+instance holds it, this one reuses that UI and runs as an MCP/stdio worker.
+
+When you author a workflow or storyboard and no tab is open, the server opens the
+app in the user's browser so they see it immediately (suppress with
+`ATLAS_NO_OPEN=1`). An already-open tab live-reloads instead.
 
 ## What this is for
 

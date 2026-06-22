@@ -14,6 +14,7 @@ import http from 'node:http';
 import fs from 'node:fs/promises';
 import { existsSync, watch } from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { GENERATORS } from '../shared/generators.js';
 
@@ -24,10 +25,33 @@ const ALG_DIR = path.join(CONTENT, 'algorithms');
 const REVIEW_DIR = path.join(CONTENT, 'reviews');
 const WORKFLOWS = path.join(CONTENT, 'workflows.json');
 const INDEX = path.join(CONTENT, 'index.json');
-const PORT = process.env.PORT || 5174;
+const PORT = Number(process.env.PORT) || 5174;
+let activePort = PORT;          // the port the UI is actually reachable on (may shift if PORT is taken)
+let uiServedElsewhere = false;  // another atlas instance already owns the port — we're a stdio worker
+let lastOpenedAt = 0;           // debounce auto-opening the browser
 // logs MUST go to stderr — stdout is reserved for the MCP stdio protocol
 const log = (...a) => console.error('[workflow-atlas]', ...a);
 const BUILTINS = new Set(Object.keys(GENERATORS));
+
+// open the app in the user's default browser — but only when no live tab is
+// already connected (the live-reload SSE refreshes those), so authoring doesn't
+// spawn a pile of tabs. Disable entirely with ATLAS_NO_OPEN=1 (e.g. headless/CI).
+function openInBrowser(urlPath) {
+  if (process.env.ATLAS_NO_OPEN) return;
+  if (reloadClients.size > 0) return;                 // a tab is open and will live-reload itself
+  const now = Date.now();
+  if (now - lastOpenedAt < 4000) return;              // collapse a burst of saves into one open
+  lastOpenedAt = now;
+  const url = `http://localhost:${activePort}${urlPath || '/'}`;
+  try {
+    const p = process.platform;
+    const cmd = p === 'win32' ? ['cmd', ['/c', 'start', '', url]]
+      : p === 'darwin' ? ['open', [url]]
+      : ['xdg-open', [url]];
+    spawn(cmd[0], cmd[1], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    log('opened', url, 'in the browser');
+  } catch (e) { log('could not open a browser:', e.message, '—', url); }
+}
 
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
@@ -246,6 +270,7 @@ async function callTool(name, args) {
 
     case 'save_algorithm': {
       const id = await writeAlgorithm(a.spec);
+      openInBrowser(`/algorithms.html#${id}`);
       return `saved algorithm "${id}" → content/algorithms/${id}.json`;
     }
     case 'delete_algorithm': {
@@ -255,6 +280,7 @@ async function callTool(name, args) {
     }
     case 'save_workflows': {
       const n = await writeWorkflows(a.sheets);
+      openInBrowser('/');
       return `saved ${n} workflow sheet(s) → content/workflows.json`;
     }
 
@@ -381,7 +407,7 @@ try {
 
 /* ---------------- REST + static ---------------- */
 async function handleApi(req, res, url) {
-  if (url.pathname === '/api/health') return json(res, 200, { ok: true });
+  if (url.pathname === '/api/health') return json(res, 200, { ok: true, app: 'workflow-atlas', port: activePort });
   if (url.pathname === '/api/livereload') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
       Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*' });
@@ -431,12 +457,44 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.on('error', (e) => {
-  if (e.code === 'EADDRINUSE') log(`port ${PORT} already in use — app served by another instance; continuing with MCP over stdio.`);
-  else log('http error:', e.message);
+// probe whoever holds a port: is it another workflow-atlas instance, or something else?
+function probeHealth(port) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: 'localhost', port, path: '/api/health', timeout: 600 }, (res) => {
+      let d = ''; res.on('data', (c) => (d += c));
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+
+const MAX_PORT_TRIES = 12;
+let portTries = 0;
+
+server.on('error', async (e) => {
+  if (e.code !== 'EADDRINUSE') { log('http error:', e.message); return; }
+  const health = await probeHealth(activePort);
+  if (health && health.app === 'workflow-atlas') {
+    // a sibling instance already serves the UI here — reuse it, run as a stdio worker.
+    // (its file watcher live-reloads the shared content, so our edits still show.)
+    uiServedElsewhere = true;
+    log(`port ${activePort} already serves a workflow-atlas instance — using it for the UI; this process runs as an MCP/stdio worker.`);
+    return;
+  }
+  // occupied by something unrelated — step to the next port and serve the UI there.
+  if (portTries < MAX_PORT_TRIES) {
+    const next = PORT + (++portTries);
+    log(`port ${activePort} is busy (not workflow-atlas) — trying ${next}…`);
+    activePort = next;
+    setTimeout(() => server.listen(next), 60);
+  } else {
+    log(`no free port found after ${MAX_PORT_TRIES} tries — continuing with MCP over stdio only.`);
+  }
 });
-server.listen(PORT, () => {
-  log(`atlas → http://localhost:${PORT}/  (app: /algorithms.html · REST: /api · MCP: /mcp + stdio)`);
+
+server.listen(activePort, () => {
+  log(`atlas → http://localhost:${activePort}/  (app: /algorithms.html · REST: /api · MCP: /mcp + stdio)`);
 });
 
 // always accept MCP over stdio (active when Claude Code spawns us; harmless otherwise)

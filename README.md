@@ -47,6 +47,16 @@ tab **live-reloads** whenever a file changes — edit a spec, a workflow, or the
 CSS and the page refreshes itself (the app's own review autosaves are excluded,
 so typing a comment never reloads under you).
 
+When the assistant **authors** a workflow or storyboard (`save_workflows` /
+`save_algorithm`) and no tab is open yet, the server **opens the app in your
+default browser** so the result is in front of you; if a tab is already open it
+just live-reloads instead. Disable the auto-open with `ATLAS_NO_OPEN=1`.
+
+If the port (default `5174`, override with `PORT`) is busy, the server adapts:
+if another workflow-atlas instance already holds it, this process reuses that UI
+and runs as an MCP/stdio worker (the shared file watcher still live-reloads your
+edits); if something unrelated holds it, the server steps to the next free port.
+
 ## Edit
 
 All content is **JSON under `content/`** — no diagram syntax, no code. Edit the
