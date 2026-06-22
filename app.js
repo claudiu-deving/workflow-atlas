@@ -1,5 +1,6 @@
 // Workflow maps live in content/workflows.json — authored by the user or by an
 // AI over MCP (save_workflows). Fetched at boot so edits show on reload.
+import { esc } from './shared/esc.js';
 const $ = (id) => document.getElementById(id);
 const flow = $('flow');
 const indexNav = $('index');
@@ -17,7 +18,7 @@ function buildIndex() {
     const b = document.createElement('button');
     b.className = 'idx';
     b.dataset.id = s.id;
-    b.innerHTML = `<span class="idx-code">${s.code}</span><span class="idx-name">${s.name}</span>`;
+    b.innerHTML = `<span class="idx-code">${esc(s.code)}</span><span class="idx-name">${esc(s.name)}</span>`;
     b.addEventListener('click', () => select(i));
     indexNav.appendChild(b);
   });
@@ -45,7 +46,7 @@ function select(i) {
 
   const tally = countStatus(s);
   $('sh-code').textContent = s.code;
-  $('sh-count').textContent = `${tally.total} STEPS · ${tally.done} DONE · ${tally.todo} TO BUILD`;
+  $('sh-count').textContent = `${tally.total} STEPS · ${tally.done} DONE · ${tally.partial} PARTIAL · ${tally.todo} TO BUILD`;
   $('sh-title').textContent = s.title;
   $('sh-sub').textContent = s.sub;
 
@@ -58,7 +59,7 @@ function select(i) {
   svg.setAttribute('class', 'loops');
   flow.appendChild(svg);
 
-  s.stations.forEach((st, idx) => {
+  (s.stations || []).forEach((st, idx) => {
     if (idx > 0) flow.appendChild(linkEl(idx));
     flow.appendChild(stationEl(st, idx));
   });
@@ -99,7 +100,7 @@ function stationEl(st, idx) {
   card.innerHTML = `
     <div class="card-top">
       <h3>${esc(st.title)}</h3>
-      <span class="chip ${st.status}">${STATUS_LABEL[st.status] || st.status}</span>
+      <span class="chip ${esc(st.status || 'todo')}">${STATUS_LABEL[st.status] || esc(st.status || 'todo')}</span>
     </div>
     ${st.sub ? `<p class="sub">${esc(st.sub)}</p>` : ''}
     ${st.detail ? `<span class="has-detail">view callout${openCount ? ` · <span class="q">${openCount} open question${openCount > 1 ? 's' : ''}</span>` : ''}</span>` : ''}
@@ -123,14 +124,15 @@ function stationEl(st, idx) {
 function fanEl(fan) {
   const f = document.createElement('div');
   f.className = 'fan';
-  f.innerHTML = `<p class="fan-cap">parallel · ${fan.tracks.length} branches</p>`;
+  const tracks = fan.tracks || [];
+  f.innerHTML = `<p class="fan-cap">parallel · ${tracks.length} branches</p>`;
   const rail = document.createElement('div');
   rail.className = 'fan-rail';
-  fan.tracks.forEach((t) => {
+  tracks.forEach((t) => {
     const el = document.createElement('div');
     el.className = 'track';
     el.dataset.status = t.status || 'todo';
-    el.innerHTML = `<h4>${esc(t.title)}</h4><span class="tstatus">${STATUS_LABEL[t.status] || t.status}</span>`;
+    el.innerHTML = `<h4>${esc(t.title)}</h4><span class="tstatus">${STATUS_LABEL[t.status] || esc(t.status || 'todo')}</span>`;
     if (t.detail) {
       el.tabIndex = 0;
       const open = () => openCallout({ title: t.title, status: t.status, detail: t.detail }, null);
@@ -163,7 +165,7 @@ function drawLoops(s, svg) {
   const stations = [...flow.querySelectorAll('.station')];
   const fb = flow.getBoundingClientRect();
 
-  s.stations.forEach((st, idx) => {
+  (s.stations || []).forEach((st, idx) => {
     if (!st.loop) return;
     const from = stations[idx];
     const to = stations[st.loop.to];
@@ -193,7 +195,8 @@ function drawLoops(s, svg) {
 /* ---------- callout panel ---------- */
 function openCallout(st, idx) {
   const d = st.detail || {};
-  const parts = [`<div class="co-tag" style="color:var(--${st.status})">${(idx !== null && idx !== undefined) ? `STEP ${String(idx + 1).padStart(2, '0')} · ` : ''}${STATUS_LABEL[st.status] || st.status}</div>`,
+  const status = st.status || 'todo';
+  const parts = [`<div class="co-tag" style="color:var(--${esc(status)})">${(idx !== null && idx !== undefined) ? `STEP ${String(idx + 1).padStart(2, '0')} · ` : ''}${STATUS_LABEL[st.status] || esc(status)}</div>`,
     `<h2 class="co-title">${esc(st.title)}</h2>`];
   if (st.sub) parts.push(`<p class="co-sub">${esc(st.sub)}</p>`);
 
@@ -217,11 +220,11 @@ function block(h, inner) { return `<div class="co-block"><div class="co-h">${h}<
 
 /* ---------- helpers ---------- */
 function countStatus(s) {
-  const c = { done: 0, partial: 0, todo: 0, total: s.stations.length };
-  s.stations.forEach((st) => { c[st.status] = (c[st.status] || 0) + 1; });
+  const stations = s.stations || [];
+  const c = { done: 0, partial: 0, todo: 0, total: stations.length };
+  stations.forEach((st) => { const k = st.status || 'todo'; c[k] = (c[k] || 0) + 1; });
   return c;
 }
-function esc(s) { return String(s).replace(/[&<>"]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m])); }
 
 /* ---------- wiring ---------- */
 $('callout-close').addEventListener('click', closeCallout);

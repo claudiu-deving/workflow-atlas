@@ -17,14 +17,15 @@ channel between you and the assistant.
 Open source under the **MIT License** (see `LICENSE`). No build step, no npm
 install, no framework — plain HTML/CSS/JS and Node built-ins.
 
-> The bundled examples are **demo content**: a generic "ship a feature"
-> workflow and classic-algorithm storyboards (binary search, bubble sort,
-> Euclid's GCD). Replace the JSON under `content/` with your own (or have the
-> assistant do it over MCP).
+> The bundled examples are **demo content**: two workflow maps of the tool's own
+> internals — the **authoring loop** (how a described algorithm becomes a moving
+> storyboard) and **boot & serve** (how the server runs) — plus classic-algorithm
+> storyboards (binary search, bubble sort, Euclid's GCD). Replace the JSON under
+> `content/` with your own (or have the assistant do it over MCP).
 
 ## Run
 
-Zero install (Node ≥ 18). From this folder:
+Zero install (Node ≥ 20). From this folder:
 
 ```bash
 npm start                  # → http://localhost:5174/   (or: node server/server.mjs)
@@ -56,6 +57,12 @@ If the port (default `5174`, override with `PORT`) is busy, the server adapts:
 if another workflow-atlas instance already holds it, this process reuses that UI
 and runs as an MCP/stdio worker (the shared file watcher still live-reloads your
 edits); if something unrelated holds it, the server steps to the next free port.
+
+**Local-only by design.** The server binds to `127.0.0.1` and its write surface
+(the MCP tools and review autosave) rejects any request that isn't same-machine,
+same-origin — so a website you visit or another host on your network can't drive
+it. It is unauthenticated tooling meant for your own machine; only set
+`ATLAS_HOST` to expose it on another interface if you understand the risk.
 
 ## Edit
 

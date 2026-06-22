@@ -5,7 +5,10 @@
   "type": "module",
   "license": "MIT",
   "author": "Workflow Atlas contributors",
-  "engines": { "node": ">=18" },
+  "repository": { "type": "git", "url": "git+https://github.com/claudiu-deving/workflow-atlas.git" },
+  "homepage": "https://github.com/claudiu-deving/workflow-atlas#readme",
+  "bugs": { "url": "https://github.com/claudiu-deving/workflow-atlas/issues" },
+  "engines": { "node": ">=20" },
   "bin": { "workflow-atlas": "server/server.mjs" },
   "scripts": {
     "start": "node server/server.mjs"

@@ -4,11 +4,23 @@
   "name": "Bubble sort",
   "title": "Bubble sort",
   "sub": "Repeatedly swap adjacent out-of-order pairs; the largest value bubbles to the end each pass.",
-  "workflow": { "sheet": "build-verify", "label": "Build & verify › handle the edge cases" },
+  "workflow": {
+    "sheet": "authoring-loop",
+    "label": "Authoring loop › browser builds the storyboard"
+  },
   "kind": "array",
   "params": [
-    { "key": "early_exit", "label": "early exit", "sym": "", "value": 1, "unit": "", "min": 0, "max": 1, "step": 1,
-      "hint": "On = stop as soon as a full pass makes no swaps (already sorted). Off = always run every pass." }
+    {
+      "key": "early_exit",
+      "label": "early exit",
+      "sym": "",
+      "value": 1,
+      "unit": "",
+      "min": 0,
+      "max": 1,
+      "step": 1,
+      "hint": "On = stop as soon as a full pass makes no swaps (already sorted). Off = always run every pass."
+    }
   ],
   "code": [
     "bubbleSort(a):",
@@ -22,8 +34,20 @@
     "  return a"
   ],
   "builtin": "bubble-sort",
-  "data": { "array": [5, 2, 8, 1, 9, 3] },
+  "data": {
+    "array": [
+      5,
+      2,
+      8,
+      1,
+      9,
+      3
+    ]
+  },
   "questions": [
-    { "step": 0, "text": "For nearly-sorted input, is the early-exit check worth one extra comparison per pass?" }
+    {
+      "step": 0,
+      "text": "For nearly-sorted input, is the early-exit check worth one extra comparison per pass?"
+    }
   ]
 }

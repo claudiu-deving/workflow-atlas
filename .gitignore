@@ -2,3 +2,8 @@ node_modules/
 *.log
 .DS_Store
 .claude/settings.local.json
+
+# Per-user review overlays the server autosaves (tuned params, comments, decisions).
+# Local state — keep the directory, ignore its contents.
+content/reviews/*
+!content/reviews/.gitkeep

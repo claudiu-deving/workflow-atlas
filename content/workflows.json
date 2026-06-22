@@ -1,65 +1,221 @@
 {
   "sheets": [
     {
-      "id": "overview", "code": "SH-00", "name": "Feature — end to end",
-      "title": "From idea to release",
-      "sub": "The whole arc of shipping a change: frame it, design it, build it, verify it, release it.",
+      "id": "authoring-loop",
+      "code": "WA-00",
+      "name": "Authoring loop",
+      "title": "Show, don't tell — the authoring loop",
+      "sub": "How a described algorithm becomes a moving picture you can watch, and how your response feeds back to the assistant.",
       "stations": [
-        { "title": "Frame the problem", "sub": "what are we solving, and for whom", "status": "done",
-          "detail": { "in": ["Request / ticket"], "out": ["A one-line problem statement", "Success criteria"],
-            "note": "Agree on the problem before any solution." } },
-        { "title": "Design the approach", "sub": "pick an algorithm and a shape", "status": "partial",
-          "algorithm": "binary-search",
-          "detail": { "in": ["Problem statement"], "out": ["Chosen approach", "Interfaces / data shapes"],
-            "note": "Sketch the core algorithm as a storyboard before committing.",
-            "open": ["Build the simple version first, or design for scale up front?",
-                     "Which inputs must we handle on day one?"] } },
-        { "title": "Implement", "sub": "write the code behind the design", "status": "todo",
-          "detail": { "in": ["Approved design"], "out": ["Working code on a branch"] } },
-        { "title": "Verify", "sub": "tests, review, manual check", "status": "todo",
-          "loop": { "to": 2, "label": "changes requested" },
-          "detail": { "in": ["Branch"], "out": ["Green build", "Reviewed diff"],
-            "note": "If review asks for changes, loop back to implement." } },
-        { "title": "Release", "sub": "ship the three deliverables", "status": "todo",
-          "fan": { "tracks": [
-            { "title": "Deploy to production", "status": "todo" },
-            { "title": "Update the docs", "status": "todo" },
-            { "title": "Add telemetry / alerts", "status": "todo" }
-          ] },
-          "detail": { "in": ["Merged change"], "out": ["Live feature", "Docs", "Dashboards"] } }
+        {
+          "title": "Assistant proposes an algorithm",
+          "sub": "mid-conversation, instead of prose",
+          "status": "done",
+          "detail": {
+            "in": [
+              "A question you can't easily picture"
+            ],
+            "out": [
+              "Intent to build a storyboard"
+            ],
+            "note": "The whole point: hand you something to look at rather than a paragraph to decode."
+          }
+        },
+        {
+          "title": "Author over MCP",
+          "sub": "save_algorithm / save_workflows",
+          "status": "done",
+          "detail": {
+            "in": [
+              "save_algorithm { spec }",
+              "save_workflows { sheets }"
+            ],
+            "out": [
+              "Validated JSON"
+            ],
+            "note": "The spec is validated: id is a slug, kind is array|calc, and it carries either explicit steps[] or a builtin generator + data.",
+            "open": [
+              "Author explicit frames, or lean on a built-in generator?"
+            ]
+          }
+        },
+        {
+          "title": "Persist + re-index",
+          "sub": "server writes the files",
+          "status": "done",
+          "detail": {
+            "in": [
+              "Validated spec"
+            ],
+            "out": [
+              "content/algorithms/<id>.json",
+              "content/index.json rewritten"
+            ],
+            "note": "The discovery manifest is rebuilt on every save/delete, so the app finds the storyboard with no registration step."
+          }
+        },
+        {
+          "title": "Surface the change",
+          "sub": "the server already knows if a tab is live",
+          "status": "done",
+          "fan": {
+            "tracks": [
+              {
+                "title": "Tab open → live-reload",
+                "status": "done",
+                "detail": {
+                  "note": "fs.watch fires → SSE broadcast → the open tab runs location.reload()."
+                }
+              },
+              {
+                "title": "No tab → open the browser",
+                "status": "done",
+                "detail": {
+                  "note": "openInBrowser to the relevant view — gated by connected SSE clients, a 4s debounce, and ATLAS_NO_OPEN."
+                }
+              }
+            ]
+          },
+          "detail": {
+            "note": "Reviews (content/reviews/) are excluded from the watcher, so the app's own autosaves never trigger a reload."
+          }
+        },
+        {
+          "title": "Browser builds the storyboard",
+          "sub": "discover → load → render",
+          "status": "done",
+          "fan": {
+            "tracks": [
+              {
+                "title": "Binary search",
+                "status": "done",
+                "algorithm": "binary-search"
+              },
+              {
+                "title": "Bubble sort",
+                "status": "done",
+                "algorithm": "bubble-sort"
+              },
+              {
+                "title": "Euclid's GCD",
+                "status": "done",
+                "algorithm": "euclid-gcd"
+              }
+            ]
+          },
+          "detail": {
+            "in": [
+              "content/index.json"
+            ],
+            "out": [
+              "Traces",
+              "The rendered stage"
+            ],
+            "note": "fetch manifest → each spec → builtin generator or explicit steps → compute(params) → frames → array/worksheet stage."
+          }
+        },
+        {
+          "title": "You watch, then respond",
+          "sub": "tune, comment, decide",
+          "status": "done",
+          "loop": {
+            "to": 1,
+            "label": "comment / decision → revise"
+          },
+          "detail": {
+            "in": [
+              "The animation"
+            ],
+            "out": [
+              "Tuned params",
+              "Per-step comments",
+              "Recorded decisions"
+            ],
+            "note": "Edits autosave to content/reviews/<id>.json. The assistant reads them back over MCP (get_review, list_open_questions) and revises — closing the loop."
+          }
+        }
       ]
     },
     {
-      "id": "design", "code": "SH-01", "name": "Design",
-      "title": "Design the approach",
-      "sub": "Turn a problem statement into a concrete plan — and prove the core idea with a storyboard.",
+      "id": "boot-serve",
+      "code": "WA-01",
+      "name": "Boot & serve",
+      "title": "One zero-dependency process",
+      "sub": "How the server starts, claims a port, watches the project, and serves three surfaces at once.",
       "stations": [
-        { "title": "List the inputs & outputs", "status": "done",
-          "detail": { "in": ["Problem statement"], "out": ["Input set", "Expected output"] } },
-        { "title": "Pick the core algorithm", "sub": "the heart of the feature", "status": "partial",
-          "algorithm": "binary-search",
-          "detail": { "note": "Storyboard the candidate before writing it.",
-            "open": ["Is the data already sorted, or do we sort first?"] } },
-        { "title": "Define the data shapes", "sub": "types, invariants, edge cases", "status": "todo",
-          "detail": { "out": ["Interfaces / schemas"] } },
-        { "title": "Sign off the design", "sub": "ready to implement", "status": "todo",
-          "detail": { "note": "Everything below the spine merges here before coding starts." } }
-      ]
-    },
-    {
-      "id": "build-verify", "code": "SH-02", "name": "Build & verify",
-      "title": "Implement, then prove it works",
-      "sub": "Code the design, cover it with tests, and watch the algorithms run before review.",
-      "stations": [
-        { "title": "Implement the algorithm", "status": "todo", "algorithm": "binary-search" },
-        { "title": "Handle the edge cases", "sub": "empty, duplicate, not-found", "status": "todo",
-          "algorithm": "bubble-sort",
-          "detail": { "open": ["Fail loudly or return a sentinel when the input is empty?"] } },
-        { "title": "Unit tests", "sub": "one per branch of the logic", "status": "todo" },
-        { "title": "Self-review the diff", "sub": "read it like a stranger would", "status": "todo",
-          "loop": { "to": 0, "label": "rework" } },
-        { "title": "Open the pull request", "sub": "hand it to a reviewer", "status": "todo",
-          "detail": { "out": ["Reviewable change"] } }
+        {
+          "title": "Start the server",
+          "sub": "npm start, or Claude Code spawns it over stdio",
+          "status": "done",
+          "detail": {
+            "out": [
+              "One Node process — no dependencies"
+            ],
+            "note": "The same process serves the UI and speaks MCP, so the app and the assistant share one source of truth."
+          }
+        },
+        {
+          "title": "Claim a port",
+          "sub": "adapt to whatever holds it",
+          "status": "done",
+          "fan": {
+            "tracks": [
+              {
+                "title": "Free → serve the UI here",
+                "status": "done"
+              },
+              {
+                "title": "Another atlas → reuse it, run as a stdio worker",
+                "status": "done"
+              },
+              {
+                "title": "Something else → step to the next free port",
+                "status": "done"
+              }
+            ]
+          },
+          "detail": {
+            "note": "On EADDRINUSE it probes /api/health to tell which case it is, then reuses, climbs, or serves.",
+            "open": [
+              "Cap the port search (currently 12), or keep climbing?"
+            ]
+          }
+        },
+        {
+          "title": "Watch the project",
+          "sub": "for live reload",
+          "status": "done",
+          "detail": {
+            "in": [
+              "fs.watch(root, recursive)"
+            ],
+            "out": [
+              "A live-reload SSE stream"
+            ],
+            "note": "content/reviews/ is excluded so review autosaves don't reload the page under you."
+          }
+        },
+        {
+          "title": "Serve three things at once",
+          "sub": "from one handler",
+          "status": "done",
+          "fan": {
+            "tracks": [
+              {
+                "title": "Static app",
+                "status": "done"
+              },
+              {
+                "title": "REST review autosave",
+                "status": "done"
+              },
+              {
+                "title": "MCP — stdio + /mcp",
+                "status": "done"
+              }
+            ]
+          }
+        }
       ]
     }
   ]
