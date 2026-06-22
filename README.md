@@ -67,16 +67,23 @@ it. It is unauthenticated tooling meant for your own machine; only set
 ## Edit
 
 All content is **JSON under `content/`** — no diagram syntax, no code. Edit the
-files directly, or have the assistant write them over MCP (`save_workflows`,
-`save_algorithm`); changes show on reload.
+files directly, or have the assistant write them over MCP; changes show on
+reload. For workflows, prefer the **per-sheet/per-station** tools (`save_sheet`,
+`delete_sheet`, `reorder_sheets`, `set_station`, `delete_station`) over the
+replace-all `save_workflows` — they edit one piece without resending the rest.
 
 Workflow maps live in **`content/workflows.json`** (`{ sheets: [...] }`):
 
 - A **sheet** is `{ id, code, name, title, sub, stations: [...] }`; add one and
-  it appears in the left index automatically.
+  it appears in the left index automatically. `code` is a **short badge**
+  (e.g. `"WA-01"`), not the pseudocode an algorithm spec carries.
 - A **station** is `{ title, sub, status, detail }`. `detail` holds
-  `{ in[], out[], note, open[] }` — shown in the callout.
+  `{ in[], out[], note, open[] }` — shown in the callout. Each `open[]` question
+  can be **answered in the callout** (recorded as a decision); the assistant can
+  read and resolve them over MCP, same as algorithm questions.
 - `loop: { to, label }` draws a dashed feedback arc back to an earlier station.
+  `to` is a station index **or** a target station's title (a title survives
+  reordering).
 - `fan: { tracks: [...] }` renders parallel branches off the spine.
 - `algorithm: '<id>'` links a station to its storyboard.
 
@@ -136,12 +143,15 @@ artifact and the decision can't drift apart.
 reviews over REST, and speaks **MCP** — over **stdio** (how Claude Code launches
 it) *and* at `/mcp` over HTTP (for manual testing). Tools:
 
-- **Read** — `list_algorithms`, `get_algorithm`, `get_workflows`, `get_review`,
-  `list_open_questions`
-- **Author content** — `save_algorithm`, `delete_algorithm`, `save_workflows`
-  → write the JSON under `content/`
+- **Read** — `list_algorithms`, `get_algorithm`, `get_workflows`, `get_sheet`,
+  `get_review`, `get_workflow_review`, `list_open_questions`
+- **Author algorithms** — `save_algorithm`, `delete_algorithm`
+- **Author workflows** — `save_sheet` / `delete_sheet` / `reorder_sheets` and
+  `set_station` / `delete_station` (per-piece upserts; preferred), or
+  `save_workflows` (replace-all) → write `content/workflows.json`
 - **Review / decisions** — `set_param`, `set_comment`, `set_decision`,
-  `reopen_question`
+  `reopen_question` (algorithms); `set_workflow_decision`,
+  `reopen_workflow_question` (workflow open questions)
 - **The look** — `list_files`, `get_file`, `set_file` → read/overwrite the raw
   CSS / HTML / JS at the project root (`server/` and `content/` are off-limits —
   use the content tools for those)

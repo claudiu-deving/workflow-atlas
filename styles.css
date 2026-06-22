@@ -284,6 +284,15 @@ body {
   border-radius: 9px; padding: 11px 13px; }
 .co-open li::before { content: "OPEN "; font-family: var(--mono); font-size: 9.5px; color: var(--steel); letter-spacing: .1em; }
 
+/* answerable open questions in the callout (resolve like storyboard decisions) */
+.co-qs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 15px; }
+.co-q { background: var(--panel-2); border: 1px solid var(--hair); border-left: 2px solid var(--steel);
+  border-radius: 9px; padding: 11px 13px; }
+.co-q.is-decided { border-left-color: var(--done); }
+.co-q-text { font-size: 13px; color: var(--ink); line-height: 1.45; margin-bottom: 10px; }
+.co-q-text::before { content: "Q "; font-family: var(--mono); font-size: 9.5px; color: var(--steel); letter-spacing: .1em; }
+.co-q .decision { display: flex; flex-direction: column; }
+
 .scrim { position: fixed; inset: 0; background: rgba(6,8,11,.55); opacity: 0; pointer-events: none;
   transition: opacity .26s; z-index: 5; }
 .scrim.open { opacity: 1; pointer-events: auto; }
