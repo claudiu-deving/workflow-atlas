@@ -8,7 +8,12 @@
 /* ---------- binary search (array stage) ---------- */
 export function binarySearch(p, data) {
   const ARR = (data && data.array) || [];
-  const x = Math.round(p.target);
+  const x = Math.round(Number(p.target));
+  if (!Number.isFinite(x)) {
+    return [{ array: ARR.slice(), cls: {}, line: [1],
+      verdict: { ok: false, text: 'Target must be a number.' },
+      note: 'No numeric target to search for — set the target param.' }];
+  }
   const win = (lo, hi) => {
     const c = {};
     for (let i = 0; i < ARR.length; i++) c[i] = (i < lo || i > hi) ? 'eliminated' : 'idle';
@@ -23,25 +28,25 @@ export function binarySearch(p, data) {
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     const cMid = win(lo, hi); cMid[mid] = 'mid';
-    frames.push({ array: ARR, cls: cMid, ptr: { lo, hi, mid }, line: [3, 4],
+    frames.push({ array: ARR.slice(), cls: cMid, ptr: { lo, hi, mid }, line: [3, 4],
       note: `mid = (${lo} + ${hi}) / 2 = ${mid}. Compare a[${mid}] = ${ARR[mid]} against ${x}.` });
 
     if (ARR[mid] === x) {
       const c = win(lo, hi); c[mid] = 'found';
-      frames.push({ array: ARR, cls: c, ptr: { mid }, line: [4],
+      frames.push({ array: ARR.slice(), cls: c, ptr: { mid }, line: [4],
         verdict: { ok: true, text: `a[${mid}] = ${x} — found at index ${mid}.` },
         note: 'Exact match. Return the index.' });
       found = mid; break;
     }
     if (ARR[mid] < x) {
       const c = win(lo, hi); c[mid] = 'compare';
-      frames.push({ array: ARR, cls: c, ptr: { lo, hi, mid }, line: [5],
+      frames.push({ array: ARR.slice(), cls: c, ptr: { lo, hi, mid }, line: [5],
         verdict: { text: `${ARR[mid]} < ${x} — discard the left half, move lo to ${mid + 1}.` },
         note: 'The target must be to the right of mid.' });
       lo = mid + 1;
     } else {
       const c = win(lo, hi); c[mid] = 'compare';
-      frames.push({ array: ARR, cls: c, ptr: { lo, hi, mid }, line: [6],
+      frames.push({ array: ARR.slice(), cls: c, ptr: { lo, hi, mid }, line: [6],
         verdict: { text: `${ARR[mid]} > ${x} — discard the right half, move hi to ${mid - 1}.` },
         note: 'The target must be to the left of mid.' });
       hi = mid - 1;
@@ -50,7 +55,7 @@ export function binarySearch(p, data) {
 
   if (found < 0) {
     const c = {}; for (let i = 0; i < ARR.length; i++) c[i] = 'eliminated';
-    frames.push({ array: ARR, cls: c, line: [7],
+    frames.push({ array: ARR.slice(), cls: c, line: [7],
       verdict: { ok: false, text: `${x} is not in the array.` },
       note: 'lo passed hi with nothing left to check — the value is absent. Return −1.' });
   }
@@ -105,8 +110,13 @@ export function bubbleSort(p, data) {
 
 /* ---------- Euclid's gcd (worksheet stage) ---------- */
 export function euclidGcd(p) {
-  let a = Math.max(1, Math.round(p.a));
-  let b = Math.max(1, Math.round(p.b));
+  let a = Math.round(Number(p.a));
+  let b = Math.round(Number(p.b));
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a < 0 || b < 0) {
+    return [{ kind: 'result', label: 'gcd', result: '—', line: [0],
+      note: 'Both a and b must be non-negative numbers.' }];
+  }
+  // gcd(0,0)=0 and gcd(n,0)=n fall out naturally: the loop simply doesn't run.
   const a0 = a, b0 = b;
   const rows = [];
   rows.push({ kind: 'input', label: 'a', result: a0, line: 0,

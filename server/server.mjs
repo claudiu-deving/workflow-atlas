@@ -26,12 +26,22 @@ const REVIEW_DIR = path.join(CONTENT, 'reviews');
 const WORKFLOWS = path.join(CONTENT, 'workflows.json');
 const INDEX = path.join(CONTENT, 'index.json');
 const PORT = Number(process.env.PORT) || 5174;
+// Local-only by default: bind loopback so the unauthenticated write surface
+// (MCP tools, review autosave) is never reachable from the LAN. Advanced users
+// can opt into a different interface with ATLAS_HOST=0.0.0.0 (at their own risk).
+const HOST = process.env.ATLAS_HOST || '127.0.0.1';
 let activePort = PORT;          // the port the UI is actually reachable on (may shift if PORT is taken)
 let uiServedElsewhere = false;  // another atlas instance already owns the port — we're a stdio worker
 let lastOpenedAt = 0;           // debounce auto-opening the browser
 // logs MUST go to stderr — stdout is reserved for the MCP stdio protocol
 const log = (...a) => console.error('[workflow-atlas]', ...a);
 const BUILTINS = new Set(Object.keys(GENERATORS));
+// What each builtin generator needs to render a non-empty, non-NaN storyboard.
+const BUILTIN_REQUIRES = {
+  'binary-search': { array: true, params: ['target'] },
+  'bubble-sort': { array: true, params: [] },
+  'euclid-gcd': { array: false, params: ['a', 'b'] },
+};
 
 // open the app in the user's default browser — but only when no live tab is
 // already connected (the live-reload SSE refreshes those), so authoring doesn't
@@ -59,6 +69,22 @@ const MIME = {
   '.ico': 'image/x-icon', '.map': 'application/json',
 };
 const safeId = (s) => /^[a-z0-9][a-z0-9-]*$/.test(s || '');
+
+// Defend the write surface against cross-origin / DNS-rebinding abuse: a request
+// is only honored if its Host is loopback AND any Origin it carries is loopback
+// too. A rebinding page sends Host: evil.com; a plain cross-origin page sends
+// Origin: http://evil.com — both fail here, while the same-origin app passes.
+const isLoopbackHost = (h) => {
+  if (!h) return false;
+  const host = String(h).replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+};
+function isLocalRequest(req) {
+  if (!isLoopbackHost(req.headers.host)) return false;
+  const origin = req.headers.origin;
+  if (origin) { try { return isLoopbackHost(new URL(origin).host); } catch { return false; } }
+  return true;
+}
 const algPath = (id) => path.join(ALG_DIR, `${id}.json`);
 const reviewPath = (id) => path.join(REVIEW_DIR, `${id}.json`);
 
@@ -87,7 +113,17 @@ function validateAlgorithm(spec) {
   const hasBuiltin = typeof spec.builtin === 'string';
   const hasSteps = Array.isArray(spec.steps);
   if (!hasBuiltin && !hasSteps) throw new Error('spec needs either "steps" (array of frames) or "builtin" + "data"');
-  if (hasBuiltin && !BUILTINS.has(spec.builtin)) throw new Error(`unknown builtin "${spec.builtin}". Known: ${[...BUILTINS].join(', ')}`);
+  if (hasSteps && spec.steps.length === 0 && !hasBuiltin) throw new Error('spec.steps is empty — author at least one frame, or use a builtin');
+  if (hasBuiltin) {
+    if (!BUILTINS.has(spec.builtin)) throw new Error(`unknown builtin "${spec.builtin}". Known: ${[...BUILTINS].join(', ')}`);
+    // a builtin drives the storyboard from its data/params — without them it renders an empty or NaN board.
+    const req = BUILTIN_REQUIRES[spec.builtin] || {};
+    if (req.array && !Array.isArray(spec.data?.array)) throw new Error(`builtin "${spec.builtin}" requires data.array (an array of numbers)`);
+    for (const key of req.params || []) {
+      const p = (spec.params || []).find((x) => x && x.key === key);
+      if (!p || !Number.isFinite(Number(p.value))) throw new Error(`builtin "${spec.builtin}" requires a numeric param "${key}"`);
+    }
+  }
 }
 async function writeAlgorithm(spec) {
   validateAlgorithm(spec);
@@ -184,8 +220,18 @@ function json(res, code, body) {
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let d = ''; req.on('data', (c) => { d += c; if (d.length > 5e6) req.destroy(); });
-    req.on('end', () => resolve(d)); req.on('error', reject);
+    const chunks = []; let len = 0; let settled = false;
+    const finish = (fn, v) => { if (!settled) { settled = true; fn(v); } };
+    req.on('data', (c) => {
+      len += c.length;
+      // collect Buffers and decode once at the end — decoding per chunk corrupts
+      // multi-byte UTF-8 that straddles a chunk boundary.
+      if (len > 5e6) { req.destroy(); return finish(reject, new Error('payload too large')); }
+      chunks.push(c);
+    });
+    req.on('end', () => finish(resolve, Buffer.concat(chunks).toString('utf8')));
+    req.on('error', (e) => finish(reject, e));
+    req.on('close', () => finish(reject, new Error('connection closed before body completed')));
   });
 }
 
@@ -242,6 +288,11 @@ async function callTool(name, args) {
   const a = args || {};
   const needsAlg = new Set(['get_algorithm', 'get_review', 'delete_algorithm', 'set_param', 'set_comment', 'set_decision', 'reopen_question']);
   if (needsAlg.has(name) && !safeId(a.algorithm)) throw new Error('invalid or missing algorithm id (slug)');
+  // the advertised inputSchema is not enforced by the JSON-RPC layer, so validate
+  // the value types the stores rely on here, before anything is persisted.
+  const needsStep = new Set(['set_comment', 'set_decision', 'reopen_question']);
+  if (needsStep.has(name) && (!Number.isInteger(a.step) || a.step < 0)) throw new Error('step must be a non-negative integer');
+  if (name === 'set_param' && !Number.isFinite(a.value)) throw new Error('value must be a finite number');
   switch (name) {
     case 'list_algorithms': {
       const algs = await listAlgorithms();
@@ -354,8 +405,11 @@ async function dispatch(msg) {
 }
 
 async function handleMcp(req, res) {
+  // the MCP surface can write files and delete content; only honor same-machine,
+  // same-origin callers so a website or LAN peer can't drive it (CSRF / rebinding).
+  if (!isLocalRequest(req)) { res.writeHead(403); return res.end('forbidden: local requests only'); }
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    res.writeHead(204, { 'Access-Control-Allow-Methods': 'POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Mcp-Session-Id, Mcp-Protocol-Version' });
     return res.end();
   }
@@ -363,7 +417,7 @@ async function handleMcp(req, res) {
   let msg;
   try { msg = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'bad json' }); }
   const resp = await dispatch(msg);
-  if (!resp) { res.writeHead(202, { 'Access-Control-Allow-Origin': '*' }); return res.end(); }
+  if (!resp) { res.writeHead(202); return res.end(); }
   return json(res, 200, resp);
 }
 
@@ -390,7 +444,9 @@ function startStdio() {
 /* ---------------- live reload (zero-dep SSE) ---------------- */
 const reloadClients = new Set();
 function broadcastReload() {
-  for (const res of reloadClients) { try { res.write('data: reload\n\n'); } catch { /* dropped */ } }
+  for (const res of reloadClients) {
+    try { res.write('data: reload\n\n'); } catch { reloadClients.delete(res); }   // drop dead writers
+  }
 }
 let reloadTimer = null;
 // watch the project for edits and nudge open tabs to refresh. Skip the app's own
@@ -410,10 +466,15 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/health') return json(res, 200, { ok: true, app: 'workflow-atlas', port: activePort });
   if (url.pathname === '/api/livereload') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
-      Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*' });
+      Connection: 'keep-alive' });
     res.write('retry: 1000\n\n');
     reloadClients.add(res);
-    req.on('close', () => reloadClients.delete(res));
+    // a periodic comment-line heartbeat keeps proxies/NAT from dropping the idle
+    // stream, and lets us notice a dead peer; remove the client on any teardown.
+    const hb = setInterval(() => { try { res.write(':keepalive\n\n'); } catch { /* dropped */ } }, 25000);
+    const drop = () => { clearInterval(hb); reloadClients.delete(res); };
+    req.on('close', drop);
+    res.on('error', drop);
     return;   // long-lived connection
   }
   const m = url.pathname.match(/^\/api\/review\/([^/]+)$/);
@@ -422,6 +483,7 @@ async function handleApi(req, res, url) {
     if (!safeId(id)) return json(res, 400, { error: 'invalid algorithm' });
     if (req.method === 'GET') return json(res, 200, await readReview(id));
     if (req.method === 'PUT') {
+      if (!isLocalRequest(req)) return json(res, 403, { error: 'local requests only' });
       try {
         const obj = JSON.parse(await readBody(req));
         const out = await writeReview(id, obj);
@@ -433,11 +495,17 @@ async function handleApi(req, res, url) {
   return json(res, 404, { error: 'not found' });
 }
 
+// top-level paths that must never be served over HTTP (source, VCS, deps, agent config)
+const STATIC_DENY = new Set(['server', '.git', 'node_modules', '.claude']);
 async function handleStatic(req, res, url) {
   let rel = decodeURIComponent(url.pathname);
   if (rel === '/') rel = '/index.html';
   const filePath = path.normalize(path.join(ROOT, rel));
-  if (!filePath.startsWith(ROOT)) { res.writeHead(403); return res.end('forbidden'); }
+  // contain to the project root — compare WITH the separator so a sibling dir that
+  // merely shares the name prefix (e.g. workflow-atlas-backup) can't be reached.
+  if (filePath !== ROOT && !filePath.startsWith(ROOT + path.sep)) { res.writeHead(403); return res.end('forbidden'); }
+  const top = path.relative(ROOT, filePath).split(path.sep)[0];
+  if (STATIC_DENY.has(top)) { res.writeHead(403); return res.end('forbidden'); }
   try {
     const data = await fs.readFile(filePath);
     res.writeHead(200, { 'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream',
@@ -480,6 +548,10 @@ server.on('error', async (e) => {
     // (its file watcher live-reloads the shared content, so our edits still show.)
     uiServedElsewhere = true;
     log(`port ${activePort} already serves a workflow-atlas instance — using it for the UI; this process runs as an MCP/stdio worker.`);
+    // launched by hand (npm start, interactive) rather than as an MCP stdio worker:
+    // there is no stdin peer to talk to, so just show the existing UI and exit
+    // instead of lingering as an inert process that serves nothing.
+    if (process.stdin.isTTY) { openInBrowser('/'); setTimeout(() => process.exit(0), 300); }
     return;
   }
   // occupied by something unrelated — step to the next port and serve the UI there.
@@ -487,13 +559,13 @@ server.on('error', async (e) => {
     const next = PORT + (++portTries);
     log(`port ${activePort} is busy (not workflow-atlas) — trying ${next}…`);
     activePort = next;
-    setTimeout(() => server.listen(next), 60);
+    setTimeout(() => server.listen(next, HOST), 60);
   } else {
     log(`no free port found after ${MAX_PORT_TRIES} tries — continuing with MCP over stdio only.`);
   }
 });
 
-server.listen(activePort, () => {
+server.listen(activePort, HOST, () => {
   log(`atlas → http://localhost:${activePort}/  (app: /algorithms.html · REST: /api · MCP: /mcp + stdio)`);
 });
 

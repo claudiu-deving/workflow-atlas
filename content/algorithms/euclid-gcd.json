@@ -4,11 +4,12 @@
   "name": "Euclid’s GCD",
   "title": "Greatest common divisor (Euclid)",
   "sub": "Replace the larger number by its remainder against the smaller, until the remainder is zero.",
+  "workflow": { "sheet": "authoring-loop", "label": "Authoring loop › browser builds the storyboard" },
   "kind": "calc",
   "params": [
-    { "key": "a", "label": "first number", "sym": "a", "value": 1071, "unit": "", "min": 1, "max": 9999, "step": 1,
+    { "key": "a", "label": "first number", "sym": "a", "value": 1071, "unit": "", "min": 0, "max": 9999, "step": 1,
       "hint": "First operand. The derivation recomputes as you change it." },
-    { "key": "b", "label": "second number", "sym": "b", "value": 462, "unit": "", "min": 1, "max": 9999, "step": 1,
+    { "key": "b", "label": "second number", "sym": "b", "value": 462, "unit": "", "min": 0, "max": 9999, "step": 1,
       "hint": "Second operand." }
   ],
   "code": [

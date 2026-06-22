@@ -3,6 +3,7 @@
 // A spec is rendered straight from explicit `steps`, or driven live by a shared
 // `builtin` generator; either way the renderer only ever sees compute(params).
 import { GENERATORS } from './shared/generators.js';
+import { esc } from './shared/esc.js';
 
 let ALGORITHMS = [];     // [{ meta, kind, params, code, compute }]
 const SVGNS = 'http://www.w3.org/2000/svg';
@@ -49,7 +50,7 @@ function buildNav() {
   ALGORITHMS.forEach((a, i) => {
     const b = document.createElement('button');
     b.className = 'idx';
-    b.innerHTML = `<span class="idx-code">${a.meta.code}</span><span class="idx-name">${a.meta.name}</span>`;
+    b.innerHTML = `<span class="idx-code">${esc(a.meta.code)}</span><span class="idx-name">${esc(a.meta.name)}</span>`;
     b.addEventListener('click', () => loadAlg(i));
     nav.appendChild(b);
   });
@@ -100,9 +101,13 @@ async function loadAlg(i) {
   buildScrubber();
   idx = 0;
   render();
-  status(hasServer
-    ? 'Connected to the local server — tolerances & comments autosave to the repo, and Claude can read them over MCP.'
-    : 'No server: edits stay in this browser. Run "npm start" (node server/server.mjs) to autosave to the repo.');
+  if (!stepCount()) {
+    status('This storyboard has no steps to show — its builtin is unknown or its steps[] is empty. Check the spec.');
+  } else {
+    status(hasServer
+      ? 'Connected to the local server — tolerances & comments autosave to the repo, and Claude can read them over MCP.'
+      : 'No server: edits stay in this browser. Run "npm start" (node server/server.mjs) to autosave to the repo.');
+  }
 }
 
 // baseline overlay (tuned params + comments) — from the server, or the static
@@ -164,14 +169,14 @@ function buildParamBar() {
     const wrap = document.createElement('label');
     wrap.className = 'param'; wrap.title = p.hint;
     const isToggle = p.min === 0 && p.max === 1 && p.step === 1;
-    const labelHtml = `<span class="p-label">${p.label}</span>${p.sym ? `<span class="p-sym">${p.sym}</span>` : ''}`;
+    const labelHtml = `<span class="p-label">${esc(p.label)}</span>${p.sym ? `<span class="p-sym">${esc(p.sym)}</span>` : ''}`;
     if (isToggle) {
       wrap.innerHTML = labelHtml;
       const btn = document.createElement('button');
       btn.type = 'button'; btn.className = 'p-toggle';
       const sync = () => { btn.classList.toggle('on', !!params[p.key]); btn.textContent = params[p.key] ? 'on' : 'off'; };
       sync();
-      btn.addEventListener('click', () => { params[p.key] = params[p.key] ? 0 : 1; sync(); scheduleSave(); render(); });
+      btn.addEventListener('click', () => { params[p.key] = params[p.key] ? 0 : 1; sync(); scheduleSave(); buildScrubber(); render(); });
       wrap.appendChild(btn);
     } else {
       wrap.innerHTML = labelHtml;
@@ -181,7 +186,7 @@ function buildParamBar() {
       inp.addEventListener('input', () => {
         let v = parseFloat(inp.value); if (Number.isNaN(v)) return;
         v = Math.max(p.min, Math.min(p.max, v));
-        params[p.key] = v; scheduleSave(); render();
+        params[p.key] = v; scheduleSave(); buildScrubber(); render();
       });
       const unit = document.createElement('span'); unit.className = 'p-unit'; unit.textContent = p.unit;
       wrap.append(inp, unit);
@@ -193,14 +198,22 @@ function buildParamBar() {
   reset.title = 'Restore default tolerances';
   reset.addEventListener('click', () => {
     for (const p of trace.params) params[p.key] = p.value;
-    scheduleSave(); buildParamBar(); render();
+    scheduleSave(); buildParamBar(); buildScrubber(); render();
   });
   bar.appendChild(reset);
 }
 
 /* ---------- step model — every trace exposes compute(params) → rows/frames ---------- */
 const isCalc = () => trace.kind === 'calc';
-function rows() { return trace.compute(params) || []; }
+// memoize the computed frames: rows() is called several times per render (and per
+// playback tick), but the generator only needs to re-run when the trace or params
+// actually change. Keyed by trace id + params so it invalidates automatically.
+let _frames = null, _framesKey = '';
+function rows() {
+  const key = `${trace?.meta?.id}|${JSON.stringify(params)}`;
+  if (_framesKey !== key || !_frames) { _frames = trace.compute(params) || []; _framesKey = key; }
+  return _frames;
+}
 function stepCount() { return rows().length; }
 function currentStep() { const r = rows(); return r[Math.min(idx, r.length - 1)]; }
 
@@ -242,7 +255,11 @@ function renderArray() {
   cells.className = 'cells';
 
   const arr = f.array || [];
-  const max = Math.max(1, ...arr.map((v) => Math.abs(Number(v)) || 0));
+  // scale bars by the true value range (with a 0 baseline) so negative values
+  // render shorter than positives instead of by absolute magnitude.
+  const nums = arr.map((v) => Number(v) || 0);
+  const lo = Math.min(0, ...nums);
+  const span = (Math.max(1, ...nums) - lo) || 1;
   const ptrAt = {};
   if (f.ptr) for (const lbl in f.ptr) {
     const i = f.ptr[lbl];
@@ -253,7 +270,7 @@ function renderArray() {
   arr.forEach((v, i) => {
     const cell = document.createElement('div');
     cell.className = `cell ${(f.cls && f.cls[i]) || 'idle'}`;
-    cell.style.setProperty('--h', Math.round((Math.abs(Number(v)) || 0) / max * 100));
+    cell.style.setProperty('--h', Math.round(((Number(v) || 0) - lo) / span * 100));
     cell.innerHTML =
       `<div class="cell-bar"><span class="cell-val">${esc(String(v))}</span></div>` +
       `<div class="cell-ptr">${ptrAt[i] ? esc(ptrAt[i].join(' ')) : ''}</div>`;
@@ -269,15 +286,11 @@ function renderCalc() {
   const cur = r[idx] || {};
   renderChrome(cur, r.length);
 
-  // verdict: the running summary on the last row, else this row's result
+  // verdict: this row's result (when the row didn't carry its own verdict)
   const vEl = $('alg-verdict');
-  if (!cur.verdict) {
-    if (idx === r.length - 1 && trace.summary) {
-      vEl.textContent = trace.summary(params); vEl.className = 'verdict ok';
-    } else if (cur.result != null) {
-      vEl.textContent = `${cur.label} = ${cur.result}${cur.unit ? ` ${cur.unit}` : ''}`;
-      vEl.className = 'verdict ' + (cur.bad ? 'bad' : 'ok');
-    }
+  if (!cur.verdict && cur.result != null) {
+    vEl.textContent = `${cur.label ?? ''} = ${cur.result}${cur.unit ? ` ${cur.unit}` : ''}`;
+    vEl.className = 'verdict ' + (cur.bad ? 'bad' : 'ok');
   }
 
   const stage = $('alg-stage');
@@ -290,7 +303,7 @@ function renderCalc() {
     el.className = `wrow${j === idx ? ' cur' : ''}${row.kind ? ` ${row.kind}` : ''}${row.bad ? ' bad' : ''}`;
     el.innerHTML = `
       <div class="wrow-head">
-        <span class="wrow-label">${esc(row.label)}</span>
+        <span class="wrow-label">${esc(row.label || '')}</span>
         ${row.result != null ? `<span class="wrow-res">${esc(String(row.result))}${row.unit ? ` <i>${esc(row.unit)}</i>` : ''}</span>` : ''}
       </div>
       ${row.expr ? `<div class="wrow-expr">${esc(row.expr)}</div>` : ''}
@@ -403,7 +416,7 @@ function buildScrubber() {
 }
 function step(n) { idx = Math.max(0, Math.min(stepCount() - 1, idx + n)); render(); }
 function play() {
-  if (idx >= stepCount() - 1) idx = -1;
+  if (idx >= stepCount() - 1) idx = 0;   // restart from the first real step, not a blank -1 frame
   playing = true;
   clearInterval(timer);
   timer = setInterval(() => {
@@ -414,8 +427,6 @@ function play() {
 }
 function pause() { playing = false; clearInterval(timer); render(); }
 function toggle() { playing ? pause() : play(); }
-
-function esc(s) { return String(s).replace(/[&<>]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m])); }
 
 function status(msg) { const el = $('alg-status'); if (el) el.textContent = msg; }
 
