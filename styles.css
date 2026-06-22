@@ -529,3 +529,164 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .cell-bar { transition: none; }
 }
+
+/* ============================================================
+   Infinite canvas — nested charts + continuous semantic zoom
+   (keeps the graphite/amber technical-drawing identity)
+   ============================================================ */
+.board-sheet {
+  position: relative; z-index: 1;
+  height: 100vh; max-width: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.board-sheet .sheet-head {
+  margin: 0; padding: 16px 26px 12px;
+  background: var(--panel); border-bottom: 1px solid var(--edge);
+  position: relative; z-index: 4; flex: none;
+}
+.board-sheet .sh-eyebrow { margin-bottom: 10px; }
+.board-sheet .sh-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.board-sheet .sh-titles { min-width: 0; }
+.board-sheet #sh-title, .board-sheet .sh-title { font-size: 23px; }
+.board-sheet .sh-sub { font-size: 13.5px; margin: 6px 0 0; max-width: 70ch; }
+#sh-title.editable, .sh-sub.editable { outline: 1px dashed var(--edge); outline-offset: 4px; border-radius: 4px; cursor: text; }
+.canvas-hint { font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em; color: var(--faint); margin: 9px 0 0; }
+
+.toolbar { display: flex; gap: 8px; align-items: center; flex: none; }
+.tool {
+  font-family: var(--mono); font-size: 11px; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted); background: var(--panel-2); border: 1px solid var(--hair);
+  border-radius: 8px; padding: 7px 12px; cursor: pointer; white-space: nowrap;
+}
+.tool:hover { color: var(--ink); border-color: var(--edge); }
+.tool.edit.on { background: var(--steel); color: #1a1206; border-color: var(--steel); }
+
+/* viewport + the one transformed world */
+.canvas {
+  position: relative; flex: 1; min-height: 0; overflow: hidden;
+  background-color: var(--bg); cursor: grab; touch-action: none;
+  background-image:
+    linear-gradient(var(--hair) 1px, transparent 1px),
+    linear-gradient(90deg, var(--hair) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+.canvas.grabbing { cursor: grabbing; }
+/* will-change is toggled on by canvas.js only DURING a gesture, then dropped at rest
+   so Chrome re-rasterizes crisply at the final zoom (a permanent layer stays pixelated
+   until a repaint). */
+.world { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+.board { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+
+/* a node — reuses the card visual language; status drives the left rule + dot + chip */
+.node {
+  position: absolute;
+  background: var(--panel-2); border: 1px solid var(--hair); border-left: 3px solid var(--edge);
+  border-radius: 11px; box-shadow: 0 10px 30px -22px #000;
+}
+.node[data-status="done"]    { border-left-color: var(--done); }
+.node[data-status="partial"] { border-left-color: var(--partial); }
+.node[data-status="todo"]    { border-left-color: var(--todo); border-left-style: dashed; }
+.node.is-selected { border-color: var(--steel); box-shadow: 0 0 0 1px var(--steel), 0 10px 30px -18px #000; }
+.canvas.editing .node { cursor: grab; }
+
+.node-chrome { padding: 12px 14px; }
+.node-top { display: flex; align-items: center; gap: 10px; }
+.node-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--edge); }
+.node[data-status="done"]    .node-dot { background: var(--done); }
+.node[data-status="partial"] .node-dot { background: var(--partial); }
+.node[data-status="todo"]    .node-dot { background: transparent; border: 1.5px dashed var(--todo); }
+.node-title { font-family: var(--display); font-weight: 500; font-size: 16px; line-height: 1.2; margin: 0; flex: 1; min-width: 0; }
+.node-chip {
+  flex: none; font-family: var(--mono); font-size: 9.5px; font-weight: 600; letter-spacing: .08em;
+  text-transform: uppercase; padding: 3px 8px; border-radius: 999px; border: 1px solid currentColor;
+}
+.node[data-status="done"] .node-chip { color: var(--done); }
+.node[data-status="partial"] .node-chip { color: var(--partial); }
+.node[data-status="todo"] .node-chip { color: var(--todo); }
+.node-sub { color: var(--muted); font-size: 12.5px; line-height: 1.4; margin: 6px 0 0; }
+.node-foot { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.node-tag {
+  font-family: var(--mono); font-size: 9px; letter-spacing: .04em; text-transform: uppercase;
+  padding: 3px 7px; border-radius: 999px; border: 1px solid var(--hair); color: var(--faint);
+}
+.node-tag.algo { color: var(--steel); border-color: rgba(227, 166, 72, .35); }
+.node-tag.nest { color: var(--todo); border-color: rgba(110, 168, 230, .35); }
+.node-tag.q    { color: var(--steel); border-color: rgba(227, 166, 72, .35); }
+
+/* level-of-detail tiers (set by the engine from apparent on-screen size) */
+.node[data-lod="dot"] .node-sub, .node[data-lod="dot"] .node-foot, .node[data-lod="dot"] .node-chip { display: none; }
+.node[data-lod="dot"] .node-chrome { padding: 0; height: 100%; display: flex; align-items: center; }
+.node[data-lod="dot"] .node-title { font-size: 15px; padding: 0 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.node-inner { position: absolute; left: 0; top: 0; width: 100%; height: 100%; overflow: hidden; border-radius: 11px; display: none; transition: opacity .14s ease; }
+.node[data-lod="frame"] .node-inner { display: block; }
+.node[data-lod="frame"] .node-chrome { height: 30px; padding: 5px 12px; overflow: hidden; border-bottom: 1px solid var(--hair); }
+.node[data-lod="frame"] .node-title { font-size: 13px; }
+.node[data-lod="frame"] .node-sub, .node[data-lod="frame"] .node-foot { display: none; }
+.node[data-lod="frame"] .node-inner .board { background:
+  radial-gradient(circle at 1px 1px, var(--hair) 1px, transparent 0) 0 0 / 26px 26px; }
+
+/* connection ports (edit mode, on hover / selection) */
+.node-ports { display: none; }
+.canvas.editing .node:hover .node-ports, .canvas.editing .node.is-selected .node-ports { display: block; }
+.port {
+  position: absolute; width: 13px; height: 13px; border-radius: 50%;
+  background: var(--steel); border: 2px solid var(--bg); cursor: crosshair; z-index: 3;
+}
+.port-out { left: 50%; bottom: -7px; transform: translateX(-50%); }
+
+/* edges — one svg per board, in that board's own (scaled) coordinate system */
+.edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+.edges path.edge { fill: none; stroke: var(--muted); stroke-width: 1.5; opacity: .7; pointer-events: stroke; cursor: pointer; }
+.edges path.flow { stroke: var(--muted); }
+.edges path.loop { stroke: var(--steel); stroke-dasharray: 5 4; }
+.edges path.dep  { stroke: var(--todo); stroke-dasharray: 2 4; }
+.edges path.edge.is-selected { stroke: var(--ink); stroke-width: 2.4; opacity: 1; }
+.edges path.rubber { stroke: var(--steel); stroke-dasharray: 4 4; opacity: .9; fill: none; }
+.edge-label { fill: var(--steel); font-family: var(--mono); font-size: 10px; }
+
+/* toast (e.g. "edges stay within one board") */
+.canvas-toast {
+  position: absolute; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(10px);
+  background: var(--panel-2); border: 1px solid var(--edge); color: var(--ink);
+  font-family: var(--mono); font-size: 11.5px; padding: 9px 14px; border-radius: 8px;
+  opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 7;
+}
+.canvas-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* inspector — edit form (reuses the callout drawer) */
+.co-enter {
+  display: block; width: 100%; text-align: left; margin: 0 0 18px;
+  font-family: var(--mono); font-size: 11.5px; letter-spacing: .04em; color: var(--todo);
+  background: rgba(110, 168, 230, .08); border: 1px solid rgba(110, 168, 230, .35);
+  border-radius: 9px; padding: 10px 13px; cursor: pointer;
+}
+.co-enter:hover { background: rgba(110, 168, 230, .16); }
+.ed { display: flex; flex-direction: column; gap: 3px; }
+.ed-l { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); margin-top: 13px; }
+.ed-l i { text-transform: none; letter-spacing: 0; }
+.ed-in, .ed-ta, .ed-num {
+  background: var(--bg); border: 1px solid var(--hair); border-radius: 8px; color: var(--ink);
+  font-family: var(--body); font-size: 13px; padding: 8px 10px; width: 100%;
+}
+.ed-in:focus, .ed-ta:focus, .ed-num:focus { outline: none; border-color: var(--steel); }
+.ed-ta { resize: vertical; font-family: var(--body); }
+.ed-row { display: flex; gap: 10px; }
+.ed-row span { flex: 1; display: flex; flex-direction: column; }
+.seg-row { display: flex; gap: 4px; }
+.seg {
+  flex: 1; font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted); background: var(--bg); border: 1px solid var(--hair); border-radius: 7px; padding: 7px 6px; cursor: pointer;
+}
+.seg.on { background: var(--panel-2); color: var(--ink); border-color: var(--edge); box-shadow: inset 0 0 0 1px var(--hair); }
+.ed-actions { display: flex; gap: 8px; margin-top: 18px; }
+.ed-btn {
+  flex: 1; font-family: var(--mono); font-size: 11px; color: var(--ink);
+  background: var(--panel-2); border: 1px solid var(--hair); border-radius: 8px; padding: 9px 10px; cursor: pointer;
+}
+.ed-btn:hover { border-color: var(--edge); }
+.ed-btn.danger { color: #ef7a70; border-color: rgba(224, 89, 78, .35); }
+
+@media (prefers-reduced-motion: reduce) {
+  .node-inner { transition: none; }
+}

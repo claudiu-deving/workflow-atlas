@@ -1,22 +1,30 @@
-// Workflow maps for the active project — authored by the user or by an AI over MCP
-// (save_workflows). Fetched from the server's /api/p/<project>/… on boot.
+// Workflow maps for the active project — an infinite canvas of nested charts.
+// This module is the controller: it loads sheets, drives the left index, owns the
+// inspector (the right callout — read-only review OR an edit form), and persists
+// edits back to the server (debounced) so the in-app editor and the MCP authoring
+// tools write one source of truth. The canvas engine itself lives in canvas.js.
 import { esc } from './shared/esc.js';
+import { migrateSheet } from './shared/migrate.js';
+import { createCanvas } from './canvas.js';
 import { resolveProjects, apiBase, withProject, renderSwitcher, wireSwitchLinks, setTabTitle } from './shared/project.js';
+
 const $ = (id) => document.getElementById(id);
 let PROJECT = 'default';
 const API = () => apiBase(PROJECT);
-const flow = $('flow');
 const indexNav = $('index');
 const callout = $('callout');
 const scrim = $('scrim');
 const frame = document.querySelector('.frame');
 const STATUS_LABEL = { done: 'done', partial: 'partial', todo: 'to build' };
+const STATUSES = ['done', 'partial', 'todo'];
 
 let SHEETS = [];
 let current = null;
-let lastCallout = null;   // { st, idx } so answering a question can re-render the panel in place
+let editing = false;
+let lastSel = null;          // the canvas selection currently shown in the inspector
+let canvas = null;
 
-/* ---------- workflow review (decisions on station open[] questions) ---------- */
+/* ---------- workflow review (decisions on node open[] questions) ---------- */
 let wfReview = { decisions: {} };       // sheetId → { [question text]: { answer, by, at } }
 let wfHasServer = false;
 const AUTHOR_KEY = 'workflow-atlas.author';
@@ -32,23 +40,19 @@ async function loadWorkflowReview() {
     if (res.ok) { wfReview = await res.json(); wfHasServer = true; }
   } catch { /* server not running */ }
   if (!wfHasServer) {
-    // no server reachable: fall back to this browser's local draft for the project
     try { const d = JSON.parse(localStorage.getItem(wfDraftKey()) || 'null'); if (d) wfReview = d; } catch { /* ignore */ }
   }
   wfReview.decisions = wfReview.decisions || {};
 }
-// send ONE decision change so the server can merge it; it can't clobber a decision
-// recorded elsewhere since the page loaded. Reconcile local state with the result.
 async function persistWfChange(patch) {
   try { localStorage.setItem(wfDraftKey(), JSON.stringify(wfReview)); } catch { /* ignore */ }
   if (!wfHasServer) return;
   try {
     const res = await fetch(`${API()}/workflow-review`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
-    if (res.ok) { const j = await res.json(); if (j && j.saved && j.saved.decisions) wfReview = j.saved; }   // authoritative merged state
+    if (res.ok) { const j = await res.json(); if (j && j.saved && j.saved.decisions) wfReview = j.saved; }
   } catch { /* offline — local optimistic state stands */ }
 }
 function wfDecide(sheetId, question, answer, by) {
-  // optimistic local update for an instant re-render, then persist the single change
   wfReview.decisions = wfReview.decisions || {};
   wfReview.decisions[sheetId] = wfReview.decisions[sheetId] || {};
   wfReview.decisions[sheetId][question] = { answer, by: by || 'you', at: today() };
@@ -58,22 +62,48 @@ function wfReopen(sheetId, question) {
   if (wfReview.decisions && wfReview.decisions[sheetId]) delete wfReview.decisions[sheetId][question];
   persistWfChange({ sheet: sheetId, question, decision: null });
 }
-// unanswered open questions for a station — spine detail AND fan-track detail
-function stationOpenCount(st, sheetId) {
-  const dec = wfDecisions(sheetId);
-  const qs = [...((st.detail && st.detail.open) || [])];
-  for (const t of (st.fan && st.fan.tracks) || []) qs.push(...((t.detail && t.detail.open) || []));
-  return qs.filter((q) => !dec[q]).length;
+// unanswered open questions on a node (the canvas shows this as a badge)
+function nodeOpenCount(node) {
+  if (!node || !node.detail || !Array.isArray(node.detail.open)) return 0;
+  const dec = wfDecisions(current && current.id);
+  return node.detail.open.filter((q) => !dec[q]).length;
 }
-const badgeHtml = (n) => (n ? ` · <span class="q">${n} open question${n > 1 ? 's' : ''}</span>` : '');
-// after a decision changes, refresh every card's open-question badge in place
-function refreshBadges() {
-  if (!current) return;
-  (current.stations || []).forEach((st, idx) => {
-    const span = flow.querySelector(`.station[data-idx="${idx}"] .has-detail`);
-    if (span) span.innerHTML = `view callout${badgeHtml(stationOpenCount(st, current.id))}`;
+
+/* ---------- autosave (browser → server; debounced, coalesced) ---------- */
+const dirty = new Set();
+let saveTimer = null, inflightP = null;
+function cleanSheet(s) { const { stations, ...rest } = s; return rest; }   // commit v2: drop the legacy spine
+function scheduleSave(id) { dirty.add(id); window.__atlasDirty = true; clearTimeout(saveTimer); saveTimer = setTimeout(flushSaves, 600); }
+function putSheet(id) {
+  const sheet = SHEETS.find((s) => s.id === id);
+  if (!sheet) return Promise.resolve();
+  return fetch(`${API()}/sheet/${encodeURIComponent(id)}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sheet: cleanSheet(sheet) }),
   });
 }
+// Serialize flushes through a chained promise so an awaiter (the live-reload handler)
+// truly waits for the LATEST dirty set to land. A re-entrancy guard that returned early
+// would resolve before the in-flight PUT finished, letting location.reload() abort it.
+function flushSaves() {
+  const run = (inflightP || Promise.resolve()).then(async () => {
+    const ids = [...dirty]; dirty.clear();
+    try { for (const id of ids) await putSheet(id); }
+    catch { /* offline — optimistic state stands; file is truth on next load */ }
+    finally { window.__atlasDirty = dirty.size > 0; }
+  });
+  inflightP = run;
+  run.finally(() => { if (inflightP === run) inflightP = null; });
+  return run;
+}
+// On unload an async fetch is aborted as the document tears down — fire keepalive PUTs
+// synchronously so the final edit survives. (Sheets are small, well under the cap.)
+window.addEventListener('beforeunload', () => {
+  for (const id of dirty) {
+    const sheet = SHEETS.find((s) => s.id === id);
+    if (!sheet) continue;
+    try { fetch(`${API()}/sheet/${encodeURIComponent(id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sheet: cleanSheet(sheet) }), keepalive: true }); } catch { /* ignore */ }
+  }
+});
 
 /* ---------- sheet index (title block) ---------- */
 function buildIndex() {
@@ -82,7 +112,7 @@ function buildIndex() {
     const b = document.createElement('button');
     b.className = 'idx';
     b.dataset.id = s.id;
-    b.innerHTML = `<span class="idx-code">${esc(s.code)}</span><span class="idx-name">${esc(s.name)}</span>`;
+    b.innerHTML = `<span class="idx-code">${esc(s.code || '')}</span><span class="idx-name">${esc(s.name || s.title || s.id)}</span>`;
     b.addEventListener('click', () => select(i));
     indexNav.appendChild(b);
   });
@@ -96,14 +126,30 @@ async function boot() {
   wireSwitchLinks(PROJECT);
   try {
     const res = await fetch(`${API()}/workflows`, { cache: 'no-store' });
-    if (res.ok) SHEETS = (await res.json()).sheets || [];
+    if (res.ok) SHEETS = ((await res.json()).sheets || []).map(migrateSheet);
   } catch { /* server down */ }
   await loadWorkflowReview();
   buildIndex();
+  wireChrome();
+  canvas = createCanvas($('canvas'), {
+    onChange: (id) => { scheduleSave(id); refreshHeaderCount(); },
+    onSelect: (sel) => { lastSel = sel; if (sel) openInspector(sel); else closeCallout(); },
+    openCount: nodeOpenCount,
+  });
+  window.__atlasCanvas = canvas;   // handle for power-user debugging / automated checks
+  // dirty-aware live reload: our own autosave is hash-suppressed server-side, so a
+  // message here means a genuine MCP/other-session change — flush any pending edit first.
+  try {
+    new EventSource('/api/livereload?p=' + encodeURIComponent(PROJECT)).onmessage = async () => {
+      await flushSaves();   // ensure any pending/in-flight edit lands before the reload aborts it
+      location.reload();
+    };
+  } catch { /* no server */ }
+
   if (!SHEETS.length) {
     $('sh-title').textContent = info.projects.length ? 'No workflow maps yet' : 'Start the server';
     $('sh-sub').textContent = info.projects.length
-      ? 'Author one over MCP with save_sheet, or pick another project.'
+      ? 'Turn on Edit and double-click the canvas to drop a node, or author one over MCP.'
       : 'Run the Atlas server so the assistant can author maps for this project.';
     return;
   }
@@ -115,205 +161,193 @@ async function boot() {
 function select(i) {
   const s = SHEETS[i];
   if (!s) return;
-  current = s;
+  current = migrateSheet(s);
   location.hash = s.id;
-
   [...indexNav.children].forEach((b, j) => b.classList.toggle('active', j === i));
-
-  const tally = countStatus(s);
-  $('sh-code').textContent = s.code;
-  $('sh-count').textContent = `${tally.total} STEPS · ${tally.done} DONE · ${tally.partial} PARTIAL · ${tally.todo} TO BUILD`;
-  $('sh-title').textContent = s.title;
-  $('sh-sub').textContent = s.sub;
-
-  flow.classList.remove('anim');
-  flow.innerHTML = '';
+  $('sh-code').textContent = s.code || '';
+  $('sh-title').textContent = s.title || s.name || s.id;
+  $('sh-sub').textContent = s.sub || '';
+  refreshHeaderCount();
   closeCallout();
+  canvas.load(current);
+}
 
-  // overlay for loop-back arcs
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('class', 'loops');
-  flow.appendChild(svg);
+function refreshHeaderCount() {
+  if (!current || !current.board) { $('sh-count').textContent = ''; return; }
+  const nodes = current.board.nodes || [];
+  const c = { done: 0, partial: 0, todo: 0 };
+  nodes.forEach((n) => { const k = n.status || 'todo'; c[k] = (c[k] || 0) + 1; });
+  $('sh-count').textContent = `${nodes.length} NODES · ${c.done} DONE · ${c.partial} PARTIAL · ${c.todo} TO BUILD`;
+}
 
-  (s.stations || []).forEach((st, idx) => {
-    if (idx > 0) flow.appendChild(linkEl(idx));
-    flow.appendChild(stationEl(st, idx));
+/* ---------- chrome: edit toggle, fit, new map, editable header ---------- */
+function wireChrome() {
+  const editBtn = $('edit-toggle');
+  editBtn.addEventListener('click', () => {
+    editing = !editing;
+    editBtn.classList.toggle('on', editing);
+    editBtn.textContent = editing ? '✓ Editing' : 'Edit';
+    document.body.classList.toggle('is-editing', editing);
+    canvas.setEditing(editing);
+    if (lastSel) openInspector(lastSel);    // re-render inspector in the new mode
+    setHeaderEditable(editing);
   });
-
-  // force reflow, then animate in with stagger
-  void flow.offsetWidth;
-  flow.classList.add('anim');
-  [...flow.children].forEach((el, k) => {
-    if (el.classList?.contains('loops')) return;
-    el.style.animationDelay = `${k * 55}ms`;
-  });
-
-  scheduleLoopRedraw(1100);   // redraw through the staggered entrance animation
-}
-
-function linkEl() {
-  const d = document.createElement('div');
-  d.className = 'link';
-  return d;
-}
-
-function stationEl(st, idx) {
-  const wrap = document.createElement('div');
-  wrap.className = 'station';
-  wrap.dataset.status = st.status || 'todo';
-  wrap.dataset.idx = idx;
-
-  const marker = document.createElement('div');
-  marker.className = 'marker';
-  marker.innerHTML = `<div class="node-idx">${String(idx + 1).padStart(2, '0')}</div>`;
-
-  const body = document.createElement('div');
-
-  const card = document.createElement('div');
-  card.className = 'card';
-  card.tabIndex = 0;
-  const openCount = stationOpenCount(st, current && current.id);   // unanswered, incl. fan tracks
-  card.innerHTML = `
-    <div class="card-top">
-      <h3>${esc(st.title)}</h3>
-      <span class="chip ${esc(st.status || 'todo')}">${STATUS_LABEL[st.status] || esc(st.status || 'todo')}</span>
-    </div>
-    ${st.sub ? `<p class="sub">${esc(st.sub)}</p>` : ''}
-    ${st.detail ? `<span class="has-detail">view callout${badgeHtml(openCount)}</span>` : ''}
-  `;
-  if (st.detail) {
-    const open = () => openCallout(st, idx);
-    card.addEventListener('click', open);
-    card.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-  } else if (!st.algorithm) {
-    card.style.cursor = 'default';
-  }
-  if (st.algorithm) card.appendChild(algoLink(st.algorithm));
-  body.appendChild(card);
-
-  if (st.fan) body.appendChild(fanEl(st.fan));
-
-  wrap.append(marker, body);
-  return wrap;
-}
-
-function fanEl(fan) {
-  const f = document.createElement('div');
-  f.className = 'fan';
-  const tracks = fan.tracks || [];
-  f.innerHTML = `<p class="fan-cap">parallel · ${tracks.length} branches</p>`;
-  const rail = document.createElement('div');
-  rail.className = 'fan-rail';
-  tracks.forEach((t) => {
-    const el = document.createElement('div');
-    el.className = 'track';
-    el.dataset.status = t.status || 'todo';
-    el.innerHTML = `<h4>${esc(t.title)}</h4><span class="tstatus">${STATUS_LABEL[t.status] || esc(t.status || 'todo')}</span>`;
-    if (t.detail) {
-      el.tabIndex = 0;
-      const open = () => openCallout({ title: t.title, status: t.status, detail: t.detail }, null);
-      el.addEventListener('click', open);
-      el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  $('fit-btn').addEventListener('click', () => canvas.fit());
+  $('new-sheet').addEventListener('click', createSheet);
+  // delete the selected node/edge with the keyboard (edit mode, not while typing)
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { closeCallout(); return; }
+    if (!editing) return;
+    if ((e.key === 'Delete' || e.key === 'Backspace') && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) && !e.target.isContentEditable) {
+      if (canvas.getSelection()) { e.preventDefault(); canvas.deleteSelected(); }
     }
-    if (t.algorithm) el.appendChild(algoLink(t.algorithm));
-    rail.appendChild(el);
-  });
-  f.appendChild(rail);
-  return f;
-}
-
-// a link from a workflow step to its algorithm storyboard
-function algoLink(id) {
-  const b = document.createElement('button');
-  b.type = 'button';
-  b.className = 'algo-link';
-  b.innerHTML = '<span class="play">▶</span> storyboard';
-  b.title = `Open the “${id}” algorithm storyboard`;
-  b.addEventListener('click', (e) => { e.stopPropagation(); location.href = withProject(`algorithms.html#${id}`, PROJECT); });
-  b.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); } });
-  return b;
-}
-
-/* ---------- loop-back arcs (drawn after layout) ---------- */
-function drawLoops(s, svg) {
-  svg.querySelectorAll('path').forEach((p) => p.remove());
-  flow.querySelectorAll('.loop-label').forEach((l) => l.remove());
-  const stations = [...flow.querySelectorAll('.station')];
-  const fb = flow.getBoundingClientRect();
-
-  (s.stations || []).forEach((st, idx) => {
-    if (!st.loop) return;
-    // loop.to is a station index, or the title of a target station (survives reorder)
-    const target = typeof st.loop.to === 'string'
-      ? (s.stations || []).findIndex((x) => x && x.title === st.loop.to)
-      : st.loop.to;
-    const from = stations[idx];
-    const to = stations[target];
-    if (!from || !to) return;
-    const fr = from.getBoundingClientRect();
-    const tr = to.getBoundingClientRect();
-    const cardRight = from.querySelector('.card').getBoundingClientRect().right - fb.left;
-    const gutter = cardRight + 48;                 // bow clear of the cards
-    const xEnter = 55;                             // re-enter near the spine
-    const y1 = fr.top - fb.top + fr.height / 2;
-    const y2 = tr.top - fb.top + tr.height / 2;
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    // exit right from the source, bow out through the margin, re-enter the target
-    path.setAttribute('d', `M ${cardRight} ${y1} C ${gutter} ${y1}, ${gutter} ${y2}, ${xEnter} ${y2}`);
-    svg.appendChild(path);
-
-    const label = document.createElement('div');
-    label.className = 'loop-label';
-    label.textContent = st.loop.label || 'loop';
-    label.style.left = `${gutter}px`;
-    label.style.transform = 'translate(-50%, -50%)';
-    label.style.top = `${(y1 + y2) / 2}px`;
-    flow.appendChild(label);
   });
 }
+function setHeaderEditable(on) {
+  for (const [id, key] of [['sh-title', 'title'], ['sh-sub', 'sub']]) {
+    const el = $(id);
+    el.contentEditable = on ? 'true' : 'false';
+    el.classList.toggle('editable', on);
+    el.oninput = on ? () => { if (current) { current[key] = el.textContent; scheduleSave(current.id); } } : null;
+  }
+}
+async function createSheet() {
+  const base = 'map'; let n = 1, id = base;
+  const ids = new Set(SHEETS.map((s) => s.id));
+  while (ids.has(id)) id = `${base}-${++n}`;
+  const sheet = { id, code: `WA-${String(SHEETS.length).padStart(2, '0')}`, name: 'New map', title: 'New map', sub: '', schema: 2, board: { nodes: [], edges: [], view: { x: 0, y: 0, zoom: 1 } } };
+  SHEETS.push(sheet);
+  buildIndex();
+  select(SHEETS.length - 1);
+  if (!editing) $('edit-toggle').click();
+  scheduleSave(id);
+}
 
-/* ---------- callout panel ---------- */
-function openCallout(st, idx) {
-  lastCallout = { st, idx };
-  const d = st.detail || {};
-  const sheetId = current && current.id;
-  const status = st.status || 'todo';
-  const parts = [`<div class="co-tag" style="color:var(--${esc(status)})">${(idx !== null && idx !== undefined) ? `STEP ${String(idx + 1).padStart(2, '0')} · ` : ''}${STATUS_LABEL[st.status] || esc(status)}</div>`,
-    `<h2 class="co-title">${esc(st.title)}</h2>`];
-  if (st.sub) parts.push(`<p class="co-sub">${esc(st.sub)}</p>`);
-
-  if (d.in?.length) parts.push(block('Takes in', `<ul class="io">${d.in.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`));
-  if (d.out?.length) parts.push(block('Produces', `<ul class="io out">${d.out.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`));
-  if (d.note) parts.push(block('Where it stands', `<p class="co-note">${esc(d.note)}</p>`));
-  if (d.open?.length) parts.push(block('Open questions', `<ul class="co-qs">${d.open.map((q, i) => wfQuestionItem(sheetId, q, i)).join('')}</ul>`));
-  if (st.algorithm) parts.push(`<a class="co-algo" href="${esc(withProject(`algorithms.html#${st.algorithm}`, PROJECT))}"><span class="play">▶</span> Watch the algorithm storyboard</a>`);
-
-  $('callout-body').innerHTML = parts.join('');
-  if (d.open?.length && sheetId) wireWfDecisions(sheetId, d.open);
+/* ---------- inspector (the right callout) ---------- */
+function openInspector(sel) {
+  if (!sel) return closeCallout();
+  if (sel.kind === 'edge') return openEdgeInspector(sel);
+  const node = sel.node;
+  if (editing) renderNodeEditor(node, sel.board);
+  else renderNodeView(node);
   callout.classList.add('open');
   callout.setAttribute('aria-hidden', 'false');
   scrim.classList.add('open');
-  frame.classList.add('callout-open');   // wide screens: reserve a column so the map pushes clear
-  scheduleLoopRedraw();
+  frame.classList.add('callout-open');
 }
 
-// Loop arcs are positioned from live getBoundingClientRect, so they must be
-// (re)drawn after layout settles — the staggered entrance animation AND the
-// panel-mode reflow both move the endpoints. Redraw every frame until `ms`
-// elapses; concurrent calls just extend the window (one rAF loop, no stacking).
-function redrawLoops() { const svg = flow.querySelector('.loops'); if (current && svg) drawLoops(current, svg); }
-let _redrawUntil = 0, _redrawing = false;
-function scheduleLoopRedraw(ms = 350) {
-  _redrawUntil = Math.max(_redrawUntil, performance.now() + ms);
-  setTimeout(redrawLoops, ms);   // guaranteed settle-draw even if rAF is throttled (background tab)
-  if (_redrawing) return;
-  _redrawing = true;
-  const tick = () => {
-    redrawLoops();
-    if (performance.now() < _redrawUntil) requestAnimationFrame(tick);
-    else _redrawing = false;
-  };
-  requestAnimationFrame(tick);
+// read-only review view (answerable open questions — the original review loop)
+function renderNodeView(node) {
+  const d = node.detail || {};
+  const sheetId = current && current.id;
+  const status = node.status || 'todo';
+  const parts = [
+    `<div class="co-tag" style="color:var(--${esc(status)})">${STATUS_LABEL[status] || esc(status)}</div>`,
+    `<h2 class="co-title">${esc(node.title)}</h2>`,
+  ];
+  if (node.sub) parts.push(`<p class="co-sub">${esc(node.sub)}</p>`);
+  if (d.in && d.in.length) parts.push(block('Takes in', `<ul class="io">${d.in.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`));
+  if (d.out && d.out.length) parts.push(block('Produces', `<ul class="io out">${d.out.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`));
+  if (d.note) parts.push(block('Where it stands', `<p class="co-note">${esc(d.note)}</p>`));
+  if (d.open && d.open.length) parts.push(block('Open questions', `<ul class="co-qs">${d.open.map((q, i) => wfQuestionItem(sheetId, q, i)).join('')}</ul>`));
+  if (node.board) parts.push(`<button class="co-enter" type="button">⤢ Zoom into this chart</button>`);
+  if (node.algorithm) parts.push(`<a class="co-algo" href="${esc(withProject(`algorithms.html#${node.algorithm}`, PROJECT))}"><span class="play">▶</span> Watch the algorithm storyboard</a>`);
+  $('callout-body').innerHTML = parts.join('');
+  if (d.open && d.open.length && sheetId) wireWfDecisions(sheetId, d.open);
+  const enter = $('callout-body').querySelector('.co-enter');
+  if (enter) enter.addEventListener('click', () => canvas.zoomToNode(node));
+}
+
+// edit form: mutate the node in place, repaint the canvas, schedule a save
+function renderNodeEditor(node, board) {
+  node.detail = node.detail || {};
+  const d = node.detail;
+  const openSnapshot = [...(d.open || [])];   // to detect a question RENAME and carry its decision
+  const seg = STATUSES.map((s) => `<button type="button" class="seg ${node.status === s ? 'on' : ''}" data-st="${s}">${STATUS_LABEL[s]}</button>`).join('');
+  $('callout-body').innerHTML = `
+    <div class="co-tag">EDIT NODE</div>
+    <div class="ed">
+      <label class="ed-l">Title</label>
+      <input class="ed-in" id="ed-title" value="${esc(node.title || '')}" />
+      <label class="ed-l">Subtitle</label>
+      <input class="ed-in" id="ed-sub" value="${esc(node.sub || '')}" />
+      <label class="ed-l">Status</label>
+      <div class="seg-row" id="ed-status">${seg}</div>
+      <label class="ed-l">Note</label>
+      <textarea class="ed-ta" id="ed-note" rows="3">${esc(d.note || '')}</textarea>
+      <label class="ed-l">Takes in <i>(one per line)</i></label>
+      <textarea class="ed-ta" id="ed-in" rows="2">${esc((d.in || []).join('\n'))}</textarea>
+      <label class="ed-l">Produces <i>(one per line)</i></label>
+      <textarea class="ed-ta" id="ed-out" rows="2">${esc((d.out || []).join('\n'))}</textarea>
+      <label class="ed-l">Open questions <i>(one per line)</i></label>
+      <textarea class="ed-ta" id="ed-open" rows="2">${esc((d.open || []).join('\n'))}</textarea>
+      <label class="ed-l">Algorithm storyboard id <i>(optional)</i></label>
+      <input class="ed-in" id="ed-algo" value="${esc(node.algorithm || '')}" />
+      <div class="ed-row">
+        <span><label class="ed-l">Width</label><input class="ed-num" id="ed-w" type="number" min="80" value="${node.w || 240}" /></span>
+        <span><label class="ed-l">Height</label><input class="ed-num" id="ed-h" type="number" min="48" value="${node.h || 96}" /></span>
+      </div>
+      <div class="ed-actions">
+        <button type="button" class="ed-btn" id="ed-sub-chart">${node.board ? '⤢ Enter chart inside' : '＋ Add chart inside'}</button>
+        <button type="button" class="ed-btn danger" id="ed-del">🗑 Delete node</button>
+      </div>
+    </div>`;
+  const b = $('callout-body');
+  const save = () => { scheduleSave(current.id); canvas.refresh(); };
+  const lines = (v) => v.split('\n').map((x) => x.trim()).filter(Boolean);
+  b.querySelector('#ed-title').addEventListener('input', (e) => { node.title = e.target.value; save(); });
+  b.querySelector('#ed-sub').addEventListener('input', (e) => { node.sub = e.target.value || undefined; save(); });
+  b.querySelector('#ed-note').addEventListener('input', (e) => { d.note = e.target.value || undefined; save(); });
+  b.querySelector('#ed-in').addEventListener('input', (e) => { d.in = lines(e.target.value); save(); });
+  b.querySelector('#ed-out').addEventListener('input', (e) => { d.out = lines(e.target.value); save(); });
+  const openEl = b.querySelector('#ed-open');
+  openEl.addEventListener('input', (e) => { d.open = lines(e.target.value); save(); });
+  openEl.addEventListener('change', () => {
+    // On blur, if exactly one question was renamed (one removed + one added), carry any
+    // recorded decision across to the new wording — decisions key on exact text, so a
+    // rename would otherwise silently orphan the answer and re-show the question as open.
+    const cur = d.open || [];
+    const removed = openSnapshot.filter((q) => !cur.includes(q));
+    const added = cur.filter((q) => !openSnapshot.includes(q));
+    if (removed.length === 1 && added.length === 1) {
+      const dec = wfDecisions(current.id)[removed[0]];
+      if (dec) { wfDecide(current.id, added[0], dec.answer, dec.by); wfReopen(current.id, removed[0]); }
+    }
+    openSnapshot.length = 0; openSnapshot.push(...cur);
+  });
+  b.querySelector('#ed-algo').addEventListener('input', (e) => { node.algorithm = e.target.value.trim() || undefined; save(); });
+  b.querySelector('#ed-w').addEventListener('input', (e) => { node.w = Math.max(80, +e.target.value || 240); save(); });
+  b.querySelector('#ed-h').addEventListener('input', (e) => { node.h = Math.max(48, +e.target.value || 96); save(); });
+  b.querySelectorAll('#ed-status .seg').forEach((btn) => btn.addEventListener('click', () => {
+    node.status = btn.dataset.st;
+    b.querySelectorAll('#ed-status .seg').forEach((x) => x.classList.toggle('on', x === btn));
+    save();
+  }));
+  b.querySelector('#ed-sub-chart').addEventListener('click', () => canvas.addSubchart());
+  b.querySelector('#ed-del').addEventListener('click', () => { canvas.deleteSelected(); closeCallout(); });
+}
+
+function openEdgeInspector(sel) {
+  const e = sel.edge;
+  const kinds = ['flow', 'loop', 'dep'];
+  const body = editing
+    ? `<div class="co-tag">EDIT EDGE</div>
+       <h2 class="co-title">${esc(e.from)} → ${esc(e.to)}</h2>
+       <label class="ed-l">Kind</label>
+       <div class="seg-row" id="ed-kind">${kinds.map((k) => `<button type="button" class="seg ${(e.kind || 'flow') === k ? 'on' : ''}" data-k="${k}">${k}</button>`).join('')}</div>
+       <label class="ed-l">Label</label>
+       <input class="ed-in" id="ed-elabel" value="${esc(e.label || '')}" />
+       <div class="ed-actions"><button type="button" class="ed-btn danger" id="ed-edel">🗑 Delete edge</button></div>`
+    : `<div class="co-tag">CONNECTION</div><h2 class="co-title">${esc(e.from)} → ${esc(e.to)}</h2>
+       <p class="co-sub">${esc(e.kind || 'flow')}${e.label ? ' · ' + esc(e.label) : ''}</p>`;
+  $('callout-body').innerHTML = body;
+  callout.classList.add('open'); callout.setAttribute('aria-hidden', 'false'); scrim.classList.add('open'); frame.classList.add('callout-open');
+  if (!editing) return;
+  const b = $('callout-body');
+  const save = () => { scheduleSave(current.id); canvas.refresh(); };
+  b.querySelectorAll('#ed-kind .seg').forEach((btn) => btn.addEventListener('click', () => { e.kind = btn.dataset.k; b.querySelectorAll('#ed-kind .seg').forEach((x) => x.classList.toggle('on', x === btn)); save(); }));
+  b.querySelector('#ed-elabel').addEventListener('input', (ev) => { e.label = ev.target.value || undefined; save(); });
+  b.querySelector('#ed-edel').addEventListener('click', () => { canvas.deleteSelected(); closeCallout(); });
 }
 
 // one open question: a recorded decision (with reopen), or a form to answer it
@@ -336,7 +370,7 @@ function wfQuestionItem(sheetId, q, i) {
 }
 function wireWfDecisions(sheetId, questions) {
   const body = $('callout-body');
-  const rerender = () => { refreshBadges(); if (lastCallout) openCallout(lastCallout.st, lastCallout.idx); };
+  const rerender = () => { if (canvas) canvas.refresh(); if (lastSel && lastSel.kind === 'node') renderNodeView(lastSel.node); };
   body.querySelectorAll('.decide').forEach((btn) => btn.addEventListener('click', () => {
     const li = btn.closest('.co-q');
     const answer = li.querySelector('.answer').value.trim();
@@ -351,30 +385,19 @@ function wireWfDecisions(sheetId, questions) {
     rerender();
   }));
 }
+
 function closeCallout() {
   callout.classList.remove('open');
   callout.setAttribute('aria-hidden', 'true');
   scrim.classList.remove('open');
-  if (frame.classList.contains('callout-open')) { frame.classList.remove('callout-open'); scheduleLoopRedraw(); }
+  frame.classList.remove('callout-open');
+  if (canvas) canvas.clearSelection();
 }
 function block(h, inner) { return `<div class="co-block"><div class="co-h">${h}</div>${inner}</div>`; }
-
-/* ---------- helpers ---------- */
-function countStatus(s) {
-  const stations = s.stations || [];
-  const c = { done: 0, partial: 0, todo: 0, total: stations.length };
-  stations.forEach((st) => { const k = st.status || 'todo'; c[k] = (c[k] || 0) + 1; });
-  return c;
-}
 
 /* ---------- wiring ---------- */
 $('callout-close').addEventListener('click', closeCallout);
 scrim.addEventListener('click', closeCallout);
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeCallout(); });
-window.addEventListener('resize', () => {
-  const svg = flow.querySelector('.loops');
-  if (current && svg) drawLoops(current, svg);
-});
 window.addEventListener('hashchange', () => {
   const i = SHEETS.findIndex((s) => s.id === location.hash.slice(1));
   if (i >= 0 && SHEETS[i] !== current) select(i);
