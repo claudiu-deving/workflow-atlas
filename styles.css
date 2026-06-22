@@ -360,12 +360,12 @@ body {
 .wrow-expr { font-family: var(--mono); font-size: 12.5px; color: var(--muted); margin-top: 7px; }
 .wrow-sub { font-family: var(--mono); font-size: 11.5px; color: var(--faint); margin-top: 4px; }
 
-/* array stage — a row of value cells, height tracks value */
-.cells { display: flex; align-items: flex-end; justify-content: center; flex-wrap: wrap;
-  gap: 12px; padding: 28px 20px; width: 100%; min-height: 320px; }
-.cell { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; }
+/* array stage — a single row of value cells, height tracks value */
+.cells { display: flex; align-items: flex-end; justify-content: center; flex-wrap: nowrap;
+  gap: 9px; padding: 28px 16px; width: 100%; min-height: 320px; overflow-x: auto; }
+.cell { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; flex: 0 0 auto; }
 .cell-bar {
-  width: 46px; height: calc(var(--h, 0) * 1.4px + 30px);
+  width: 38px; height: calc(var(--h, 0) * 1.4px + 30px);
   display: flex; align-items: flex-start; justify-content: center; padding-top: 7px;
   border: 1px solid var(--edge); border-radius: 8px; background: var(--panel-2);
   color: var(--muted); transition: height .35s, background .3s, border-color .3s, box-shadow .3s, opacity .3s;

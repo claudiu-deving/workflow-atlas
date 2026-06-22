@@ -13,21 +13,34 @@ Setup for an AI coding assistant. Zero dependencies — no `npm install`.
 
 Requires Node ≥ 18. Override the port with `PORT=…`.
 
+## What this is for
+
+A communication channel: when you propose an algorithm, **build a storyboard for
+it over MCP** so the user can watch it run, rather than parsing prose. Author
+the visuals; don't just describe them.
+
 ## MCP tools
 
-- `list_algorithms`, `get_algorithm_source`, `get_review`
-- `set_param` (tune a tolerance), `set_comment` (per-step note)
-- `list_open_questions`, `set_decision`, `reopen_question`
+- **Read** — `list_algorithms`, `get_algorithm`, `get_workflows`, `get_review`,
+  `list_open_questions`
+- **Author content** — `save_algorithm` (create/replace a storyboard from a JSON
+  spec), `delete_algorithm`, `save_workflows`
+- **Review / decisions** — `set_param`, `set_comment`, `set_decision`,
+  `reopen_question`
+- **The look** — `list_files`, `get_file`, `set_file` (raw CSS/HTML/JS at the
+  project root; `server/` and `content/` are off-limits)
 
-All writes land in `traces/<algorithm>.review.json` — the same file the app
-autosaves and reloads, so you and the user share one source of truth.
+`save_algorithm` takes `{ spec }`. The simplest spec is explicit frames:
+`{ id, name, kind:"array", code:[…pseudocode…], params:[], steps:[ {array, cls,
+ptr, note, line, verdict, question?} … ] }`. Read `get_algorithm` on a bundled
+demo for a worked example, and `README.md` for the full frame/row shapes.
 
-## Where to edit
+## Where things live
 
-- **Workflows** → `data.js` (the `SHEETS` array).
-- **Algorithm storyboards** → add a `traces/<name>.js` trace, then register it in
-  the `ALGORITHMS` array in `storyboard.js`.
-- **Tuned params / comments / decisions** → `traces/*.review.json` (or via the
-  MCP tools above; don't hand-edit while the app is autosaving).
-
-See `README.md` for the data shapes and the full design.
+- **Storyboards** → `content/algorithms/<id>.json` (auto-discovered; no
+  registration). Use `save_algorithm`.
+- **Workflow maps** → `content/workflows.json`. Use `save_workflows`.
+- **Review overlay** (tuned params / comments / decisions) →
+  `content/reviews/<id>.json`. Use the review tools; don't hand-edit while the
+  app is autosaving.
+- **Styling** → `styles.css` and the HTML shells, via `set_file`.

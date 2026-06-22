@@ -1,5 +1,5 @@
-import { SHEETS } from './data.js';
-
+// Workflow maps live in content/workflows.json — authored by the user or by an
+// AI over MCP (save_workflows). Fetched at boot so edits show on reload.
 const $ = (id) => document.getElementById(id);
 const flow = $('flow');
 const indexNav = $('index');
@@ -7,17 +7,32 @@ const callout = $('callout');
 const scrim = $('scrim');
 const STATUS_LABEL = { done: 'done', partial: 'partial', todo: 'to build' };
 
+let SHEETS = [];
 let current = null;
 
 /* ---------- sheet index (title block) ---------- */
-SHEETS.forEach((s, i) => {
-  const b = document.createElement('button');
-  b.className = 'idx';
-  b.dataset.id = s.id;
-  b.innerHTML = `<span class="idx-code">${s.code}</span><span class="idx-name">${s.name}</span>`;
-  b.addEventListener('click', () => select(i));
-  indexNav.appendChild(b);
-});
+function buildIndex() {
+  indexNav.innerHTML = '';
+  SHEETS.forEach((s, i) => {
+    const b = document.createElement('button');
+    b.className = 'idx';
+    b.dataset.id = s.id;
+    b.innerHTML = `<span class="idx-code">${s.code}</span><span class="idx-name">${s.name}</span>`;
+    b.addEventListener('click', () => select(i));
+    indexNav.appendChild(b);
+  });
+}
+
+async function boot() {
+  try {
+    const res = await fetch('content/workflows.json', { cache: 'no-store' });
+    if (res.ok) SHEETS = (await res.json()).sheets || [];
+  } catch { /* no content */ }
+  buildIndex();
+  if (!SHEETS.length) return;
+  const start = SHEETS.findIndex((s) => s.id === location.hash.slice(1));
+  select(start >= 0 ? start : 0);
+}
 
 /* ---------- render a sheet ---------- */
 function select(i) {
@@ -221,5 +236,4 @@ window.addEventListener('hashchange', () => {
   if (i >= 0 && SHEETS[i] !== current) select(i);
 });
 
-const start = SHEETS.findIndex((s) => s.id === location.hash.slice(1));
-select(start >= 0 ? start : 0);
+boot();

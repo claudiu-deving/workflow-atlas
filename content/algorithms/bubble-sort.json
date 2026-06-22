@@ -1,0 +1,29 @@
+{
+  "id": "bubble-sort",
+  "tag": "ALG-02",
+  "name": "Bubble sort",
+  "title": "Bubble sort",
+  "sub": "Repeatedly swap adjacent out-of-order pairs; the largest value bubbles to the end each pass.",
+  "workflow": { "sheet": "build-verify", "label": "Build & verify › handle the edge cases" },
+  "kind": "array",
+  "params": [
+    { "key": "early_exit", "label": "early exit", "sym": "", "value": 1, "unit": "", "min": 0, "max": 1, "step": 1,
+      "hint": "On = stop as soon as a full pass makes no swaps (already sorted). Off = always run every pass." }
+  ],
+  "code": [
+    "bubbleSort(a):",
+    "  for i in 0 .. n-1:",
+    "    swapped = false",
+    "    for j in 0 .. n-2-i:",
+    "      if a[j] > a[j+1]:",
+    "        swap(a[j], a[j+1])",
+    "        swapped = true",
+    "    if not swapped: break       // early exit",
+    "  return a"
+  ],
+  "builtin": "bubble-sort",
+  "data": { "array": [5, 2, 8, 1, 9, 3] },
+  "questions": [
+    { "step": 0, "text": "For nearly-sorted input, is the early-exit check worth one extra comparison per pass?" }
+  ]
+}

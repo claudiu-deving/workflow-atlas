@@ -1,0 +1,28 @@
+{
+  "id": "binary-search",
+  "tag": "ALG-01",
+  "name": "Binary search",
+  "title": "Binary search",
+  "sub": "Halve a sorted array each step to locate a value in log₂n comparisons. Change the target to watch it re-run.",
+  "workflow": { "sheet": "build-verify", "label": "Build & verify › implement the algorithm" },
+  "kind": "array",
+  "params": [
+    { "key": "target", "label": "target value", "sym": "x", "value": 33, "unit": "", "min": 1, "max": 99, "step": 1,
+      "hint": "The value to search for. Change it to watch the search re-run live." }
+  ],
+  "code": [
+    "binarySearch(a, x):",
+    "  lo = 0;  hi = n - 1",
+    "  while lo <= hi:",
+    "    mid = (lo + hi) / 2",
+    "    if a[mid] == x: return mid",
+    "    if a[mid] <  x: lo = mid + 1",
+    "    else:           hi = mid - 1",
+    "  return -1            // absent"
+  ],
+  "builtin": "binary-search",
+  "data": { "array": [3, 9, 14, 21, 28, 33, 42, 55, 67, 80] },
+  "questions": [
+    { "step": 0, "text": "If the array held duplicate values, should this return the first match or any match?" }
+  ]
+}

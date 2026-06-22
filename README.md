@@ -2,21 +2,25 @@
 
 Two tools for thinking and communicating about software, in one tiny app:
 
-1. **Workflows** — hand-laid visual maps of a process, styled like shop drawings.
+1. **Workflows** — hand-laid visual maps of a process, styled like technical drawings.
 2. **Algorithm storyboards** — step-by-step *animations* of how an algorithm
    behaves, with editable parameters and per-step comments, so an idea lands as a
    moving picture instead of a wall of prose.
 
-A **zero-dependency local server** serves the app, autosaves your edits to disk,
-and bridges them to an AI coding assistant over **MCP** — so you and the
-assistant read and write the same tuned parameters and comments.
+A **zero-dependency local server** serves the app and gives an AI coding
+assistant an **MCP authoring surface**: it can create and edit the algorithm
+storyboards, the workflow maps, and even the CSS/HTML styling — so when the
+assistant proposes an algorithm it can *show* you a moving picture instead of a
+wall of prose you have to decode. Local-only tooling: a richer back-and-forth
+channel between you and the assistant.
 
 Open source under the **MIT License** (see `LICENSE`). No build step, no npm
 install, no framework — plain HTML/CSS/JS and Node built-ins.
 
 > The bundled examples are **demo content**: a generic "ship a feature"
 > workflow and classic-algorithm storyboards (binary search, bubble sort,
-> Euclid's GCD). Replace `data.js` and `traces/` with your own.
+> Euclid's GCD). Replace the JSON under `content/` with your own (or have the
+> assistant do it over MCP).
 
 ## Run
 
@@ -37,24 +41,27 @@ Read-only fallback (any static server, no autosave):
 python -m http.server 8080   # → http://localhost:8080
 ```
 
-(A server is needed because `app.js` imports `data.js` as an ES module, which
-the browser blocks over `file://`.) If an edit doesn't show up, it's the browser
-caching the module — hard-reload (Ctrl/Cmd-Shift-R).
+(A server is needed because the app fetches its content (`content/*.json`) over
+HTTP, which the browser blocks over `file://`.) With the server running the open
+tab **live-reloads** whenever a file changes — edit a spec, a workflow, or the
+CSS and the page refreshes itself (the app's own review autosaves are excluded,
+so typing a comment never reloads under you).
 
 ## Edit
 
-Everything lives in **`data.js`** — no diagram syntax, just structured data:
+All content is **JSON under `content/`** — no diagram syntax, no code. Edit the
+files directly, or have the assistant write them over MCP (`save_workflows`,
+`save_algorithm`); changes show on reload.
 
-- A **sheet** is `{ id, code, name, title, sub, stations: [...] }`; add one to
-  the `SHEETS` array and it appears in the left index automatically.
+Workflow maps live in **`content/workflows.json`** (`{ sheets: [...] }`):
+
+- A **sheet** is `{ id, code, name, title, sub, stations: [...] }`; add one and
+  it appears in the left index automatically.
 - A **station** is `{ title, sub, status, detail }`. `detail` holds
   `{ in[], out[], note, open[] }` — shown in the callout.
-- `loop: { to, label }` draws a dashed feedback arc back to an earlier station
-  (e.g. *checks fail → coefficients*).
-- `fan: { tracks: [...] }` renders parallel branches off the spine (e.g. the
-  three deliverables).
-
-Reload to see changes.
+- `loop: { to, label }` draws a dashed feedback arc back to an earlier station.
+- `fan: { tracks: [...] }` renders parallel branches off the spine.
+- `algorithm: '<id>'` links a station to its storyboard.
 
 ## Algorithm storyboards
 
@@ -64,24 +71,36 @@ in prose. The stage shows the data (an array of value cells, or a worksheet),
 the pseudocode highlights the active line, and the narration explains each step
 — synced to a play / step / scrub transport (← → to step, space to play).
 
-Each storyboard is a **trace** in `traces/*.js` exposing `meta`, `kind`
-(`'array'` or `'calc'`), `code` (pseudocode lines), editable `params`, and a
-`compute(params)` that returns the ordered frames. Because the frames are
-*computed* from the params, changing a param re-runs the whole walk live — e.g.
-change the search `target` and binary search re-evaluates. A frame may also
-carry an open `question`. First one: `traces/binary-search.js`. To add one,
-write a trace module and register it in the `ALGORITHMS` array in
-`storyboard.js`.
+Each storyboard is a **JSON spec** in `content/algorithms/<id>.json` —
+auto-discovered via `content/index.json`, no registration step. A spec is:
 
-### Saving tuned params + comments — the `.review.json` overlay
+```jsonc
+{
+  "id": "binary-search", "tag": "ALG-01", "name": "Binary search",
+  "sub": "…", "kind": "array",            // "array" (value cells) or "calc" (worksheet)
+  "code": ["pseudocode", "lines"],         // highlighted as it runs
+  "params": [ { "key": "target", "value": 33, "min": 1, "max": 99, "step": 1 } ],
+  "steps": [ /* explicit frames — the simple, fully-authorable path */ ]
+}
+```
 
-The algorithm trace (`*.js`) is mine to author. **Your layer** — tuned
-tolerances and per-step comments — is a committed file:
-`traces/<algorithm>.review.json`.
+A **frame** (`kind: "array"`) is `{ array[], cls{index:state}, ptr{label:index},
+note, line, verdict{ok?,text}, question? }`, where `state` is one of
+`idle·active·compare·lo·hi·mid·eliminated·found·sorted`. A **row**
+(`kind: "calc"`) is `{ label, result?, expr?, sub?, note, line, question? }`.
 
-With the server running, the app **autosaves straight to that file** as you edit
-(no Export, no JSON juggling). It auto-loads it as the baseline next time:
-defaults ← saved overlay. (Without a server, edits stay in the browser only.)
+Instead of `steps`, a spec may set `"builtin": "<name>"` + `"data"` to be driven
+live by a built-in generator in `shared/generators.js` (the bundled binary
+search, bubble sort, and Euclid demos use this — change a param and the whole
+walk re-runs). Authored storyboards just use `steps`. Add one with the
+`save_algorithm` MCP tool, or by dropping a JSON file in `content/algorithms/`.
+
+### Tuned params, comments & decisions — the review overlay
+
+Your layer over a storyboard — tuned params, per-step comments, and recorded
+decisions — is a separate file: `content/reviews/<id>.json`. With the server
+running the app **autosaves** to it as you edit and reloads it as the baseline
+next time. (Without a server, edits stay in the browser only.)
 
 ### Open questions → decisions
 
@@ -96,17 +115,23 @@ artifact and the decision can't drift apart.
 
 ### Server + MCP — so the assistant shares the same data
 
-`server/server.mjs` is one zero-dependency process that does three jobs: serves
-the app, autosaves reviews over REST, and speaks **MCP** — over **stdio** (how
-Claude Code launches it) *and* at `/mcp` over HTTP (for manual testing). Tools:
+`server/server.mjs` is one zero-dependency process that serves the app, persists
+reviews over REST, and speaks **MCP** — over **stdio** (how Claude Code launches
+it) *and* at `/mcp` over HTTP (for manual testing). Tools:
 
-- `list_algorithms`, `get_review`, `get_algorithm_source`
-- `set_param`, `set_comment`  → write the same `.review.json` files
-- `list_open_questions`, `set_decision`, `reopen_question`  → resolve questions
+- **Read** — `list_algorithms`, `get_algorithm`, `get_workflows`, `get_review`,
+  `list_open_questions`
+- **Author content** — `save_algorithm`, `delete_algorithm`, `save_workflows`
+  → write the JSON under `content/`
+- **Review / decisions** — `set_param`, `set_comment`, `set_decision`,
+  `reopen_question`
+- **The look** — `list_files`, `get_file`, `set_file` → read/overwrite the raw
+  CSS / HTML / JS at the project root (`server/` and `content/` are off-limits —
+  use the content tools for those)
 
-So the loop is: you tweak a tolerance or leave a comment in the app → it lands in
-the repo file → the assistant reads it over MCP, answers a comment or adjusts a
-value → you see it on reload. No file shuffling either way.
+So the loop is: the assistant proposes an algorithm → it builds the storyboard
+with `save_algorithm` → you watch it run and leave a comment or decision → the
+assistant reads that over MCP and revises. Showing, not just telling.
 
 **Claude Code manages the process.** A project `.mcp.json` runs the server as a
 stdio MCP server (`node server/server.mjs`), so Claude Code spawns it every
@@ -122,18 +147,21 @@ transport key.)
 
 ```
 workflow-atlas/
-  index.html         workflows shell (title block · sheet · callout)
-  algorithms.html    storyboard shell (stage · pseudocode · narration)
-  styles.css         shared design system — palette, type, spine, stage
-  app.js             workflow renderer (sheets, stations, loops, callout)
-  storyboard.js      algorithm player (replay, stage, transport)
-  data.js            workflow content        ← edit for workflows
-  traces/*.js        algorithm traces        ← edit / add for algorithms
-  traces/*.review.json  tuned params + comments per algorithm (server autosaves these)
-  server/server.mjs  zero-dep Node server: static + REST autosave + MCP (stdio + /mcp)
-  package.json       npm start, metadata (zero dependencies)
-  .mcp.json          registers the server for Claude Code
-  LICENSE            MIT
+  index.html             workflows shell (title block · sheet · callout)
+  algorithms.html        storyboard shell (stage · pseudocode · narration)
+  styles.css             design system — palette, type, spine, stage
+  app.js                 workflow renderer (sheets, stations, loops, callout)
+  storyboard.js          algorithm player (loads specs, replay, transport)
+  shared/generators.js   built-in algorithm generators (browser + server)
+  content/
+    index.json           discovery manifest (server rewrites on save/delete)
+    workflows.json       workflow maps          ← content tools edit these
+    algorithms/*.json    algorithm storyboards
+    reviews/*.json       tuned params + comments + decisions (server writes)
+  server/server.mjs      zero-dep Node server: static + REST + MCP (stdio + /mcp)
+  package.json           npm start, metadata (zero dependencies)
+  .mcp.json              registers the server for Claude Code
+  LICENSE                MIT
 ```
 
 `.mcp.json` registers the server with Claude Code for *this* repo:

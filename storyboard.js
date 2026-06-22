@@ -1,33 +1,81 @@
-import * as binarySearch from './traces/binary-search.js';
-import * as bubbleSort from './traces/bubble-sort.js';
-import * as euclid from './traces/euclid-gcd.js';
+// Algorithm storyboards are JSON specs under content/algorithms/, discovered via
+// content/index.json — authored by the user or by an AI over MCP (save_algorithm).
+// A spec is rendered straight from explicit `steps`, or driven live by a shared
+// `builtin` generator; either way the renderer only ever sees compute(params).
+import { GENERATORS } from './shared/generators.js';
 
-// add a trace module here to register its storyboard in the index
-const ALGORITHMS = [binarySearch, bubbleSort, euclid];
+let ALGORITHMS = [];     // [{ meta, kind, params, code, compute }]
 const SVGNS = 'http://www.w3.org/2000/svg';
 const $ = (id) => document.getElementById(id);
 
-let trace = null;        // active algorithm module
+let trace = null;        // active algorithm
 let idx = 0;             // current step
 let playing = false;
 let timer = null;
-let params = {};         // live editable tolerances
+let params = {};         // live editable params
 let comments = {};       // per-step comments (in memory; persisted via server/file)
 let decisions = {};      // step → { answer, by, at } resolving an authored open question
 let review = { params: {}, comments: {}, decisions: {} };  // baseline overlay loaded from server or sidecar
 let hasServer = false;   // is the autosave server reachable?
 let saveTimer = null;
 const STEP_MS = 1900;
-
-/* ---------- index (title block) ---------- */
 const nav = $('alg-index');
-ALGORITHMS.forEach((a, i) => {
-  const b = document.createElement('button');
-  b.className = 'idx';
-  b.innerHTML = `<span class="idx-code">${a.meta.code}</span><span class="idx-name">${a.meta.name}</span>`;
-  b.addEventListener('click', () => loadAlg(i));
-  nav.appendChild(b);
-});
+
+/* ---------- load JSON specs into renderable traces ---------- */
+function specToTrace(spec) {
+  const meta = {
+    id: spec.id, code: spec.tag || '', name: spec.name || spec.id,
+    title: spec.title || spec.name || spec.id, sub: spec.sub || '', workflow: spec.workflow,
+  };
+  let compute;
+  if (spec.builtin && GENERATORS[spec.builtin]) {
+    const gen = GENERATORS[spec.builtin];
+    const data = spec.data || {};
+    const questions = spec.questions || [];
+    compute = (p) => {
+      const frames = gen(p, data) || [];
+      questions.forEach((q) => { if (frames[q.step]) frames[q.step].question = q.text; });
+      return frames;
+    };
+  } else {
+    const steps = spec.steps || [];
+    compute = () => steps;       // explicit, agent-authored frames
+  }
+  return { meta, kind: spec.kind || 'array', params: spec.params || [], code: spec.code || [], compute };
+}
+
+function buildNav() {
+  nav.innerHTML = '';
+  ALGORITHMS.forEach((a, i) => {
+    const b = document.createElement('button');
+    b.className = 'idx';
+    b.innerHTML = `<span class="idx-code">${a.meta.code}</span><span class="idx-name">${a.meta.name}</span>`;
+    b.addEventListener('click', () => loadAlg(i));
+    nav.appendChild(b);
+  });
+}
+
+async function boot() {
+  let ids = [];
+  try {
+    const res = await fetch('content/index.json', { cache: 'no-store' });
+    if (res.ok) ids = (await res.json()).algorithms || [];
+  } catch { /* no content manifest */ }
+  const specs = await Promise.all(ids.map(async (id) => {
+    try {
+      const r = await fetch(`content/algorithms/${id}.json`, { cache: 'no-store' });
+      return r.ok ? specToTrace(await r.json()) : null;
+    } catch { return null; }
+  }));
+  ALGORITHMS = specs.filter(Boolean);
+  buildNav();
+  if (!ALGORITHMS.length) {
+    status('No algorithms yet. Author one over MCP with save_algorithm, then reload.');
+    return;
+  }
+  const start = ALGORITHMS.findIndex((a) => a.meta.id === location.hash.slice(1));
+  loadAlg(start >= 0 ? start : 0);
+}
 
 async function loadAlg(i) {
   trace = ALGORITHMS[i];
@@ -69,7 +117,7 @@ async function loadReview() {
   } catch { /* server not running */ }
   if (!hasServer) {
     try {
-      const res = await fetch(`traces/${trace.meta.id}.review.json`, { cache: 'no-store' });
+      const res = await fetch(`content/reviews/${trace.meta.id}.json`, { cache: 'no-store' });
       if (res.ok) take(await res.json());
     } catch { /* no sidecar yet */ }
     // local draft fallback when there's no server to write to
@@ -388,6 +436,5 @@ window.addEventListener('hashchange', () => {
   if (i >= 0 && ALGORITHMS[i] !== trace) loadAlg(i);
 });
 
-// open the algorithm named in the URL hash (e.g. linked from a workflow step)
-const startAlg = ALGORITHMS.findIndex((a) => a.meta.id === location.hash.slice(1));
-loadAlg(startAlg >= 0 ? startAlg : 0);
+// discover and load the storyboards, then open the one named in the URL hash
+boot();

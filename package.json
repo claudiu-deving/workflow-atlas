@@ -1,7 +1,7 @@
 {
   "name": "workflow-atlas",
-  "version": "0.1.0",
-  "description": "Visualize development workflows and animate algorithms as step-by-step storyboards. Ships a zero-dependency local server that autosaves your edits and bridges them to an AI coding assistant over MCP.",
+  "version": "0.2.0",
+  "description": "Visualize development workflows and animate algorithms as step-by-step storyboards. Ships a zero-dependency local server that lets an AI coding assistant author the storyboards, workflows, and styling over MCP — a richer channel for showing an algorithm, not just describing it.",
   "type": "module",
   "license": "MIT",
   "author": "Workflow Atlas contributors",
@@ -11,5 +11,5 @@
     "start": "node server/server.mjs"
   },
   "keywords": ["mcp", "workflow", "algorithm-visualization", "storyboard", "diagrams", "claude-code"],
-  "files": ["*.html", "*.js", "*.css", "traces/", "server/", "README.md", "LICENSE"]
+  "files": ["*.html", "*.js", "*.css", "content/", "shared/", "server/", "AGENTS.md", "README.md", "LICENSE"]
 }

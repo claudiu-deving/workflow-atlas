@@ -92,5 +92,7 @@
   </div>
 
   <script type="module" src="storyboard.js"></script>
+  <!-- dev live-reload: refresh when the local server reports a file change (no-op without the server) -->
+  <script>try { new EventSource('/api/livereload').onmessage = () => location.reload(); } catch (e) {}</script>
 </body>
 </html>

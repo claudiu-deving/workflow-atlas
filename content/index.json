@@ -1,0 +1,8 @@
+{
+  "note": "Discovery manifest — the server rewrites this on every algorithm create/delete. The app reads it to know which storyboards to load (works with or without the server).",
+  "algorithms": [
+    "binary-search",
+    "bubble-sort",
+    "euclid-gcd"
+  ]
+}

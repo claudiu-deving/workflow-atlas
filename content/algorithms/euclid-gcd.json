@@ -1,0 +1,27 @@
+{
+  "id": "euclid-gcd",
+  "tag": "ALG-03",
+  "name": "Euclid’s GCD",
+  "title": "Greatest common divisor (Euclid)",
+  "sub": "Replace the larger number by its remainder against the smaller, until the remainder is zero.",
+  "kind": "calc",
+  "params": [
+    { "key": "a", "label": "first number", "sym": "a", "value": 1071, "unit": "", "min": 1, "max": 9999, "step": 1,
+      "hint": "First operand. The derivation recomputes as you change it." },
+    { "key": "b", "label": "second number", "sym": "b", "value": 462, "unit": "", "min": 1, "max": 9999, "step": 1,
+      "hint": "Second operand." }
+  ],
+  "code": [
+    "gcd(a, b):",
+    "  while b != 0:",
+    "    r = a mod b",
+    "    a = b",
+    "    b = r",
+    "  return a"
+  ],
+  "builtin": "euclid-gcd",
+  "data": {},
+  "questions": [
+    { "step": 0, "text": "Should gcd(0, 0) be defined as 0, or treated as an input error?" }
+  ]
+}
