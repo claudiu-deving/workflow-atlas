@@ -6,6 +6,7 @@ const flow = $('flow');
 const indexNav = $('index');
 const callout = $('callout');
 const scrim = $('scrim');
+const frame = document.querySelector('.frame');
 const STATUS_LABEL = { done: 'done', partial: 'partial', todo: 'to build' };
 
 let SHEETS = [];
@@ -138,7 +139,7 @@ function select(i) {
     el.style.animationDelay = `${k * 55}ms`;
   });
 
-  requestAnimationFrame(() => drawLoops(s, svg));
+  scheduleLoopRedraw(1100);   // redraw through the staggered entrance animation
 }
 
 function linkEl() {
@@ -283,6 +284,27 @@ function openCallout(st, idx) {
   callout.classList.add('open');
   callout.setAttribute('aria-hidden', 'false');
   scrim.classList.add('open');
+  frame.classList.add('callout-open');   // wide screens: reserve a column so the map pushes clear
+  scheduleLoopRedraw();
+}
+
+// Loop arcs are positioned from live getBoundingClientRect, so they must be
+// (re)drawn after layout settles — the staggered entrance animation AND the
+// panel-mode reflow both move the endpoints. Redraw every frame until `ms`
+// elapses; concurrent calls just extend the window (one rAF loop, no stacking).
+function redrawLoops() { const svg = flow.querySelector('.loops'); if (current && svg) drawLoops(current, svg); }
+let _redrawUntil = 0, _redrawing = false;
+function scheduleLoopRedraw(ms = 350) {
+  _redrawUntil = Math.max(_redrawUntil, performance.now() + ms);
+  setTimeout(redrawLoops, ms);   // guaranteed settle-draw even if rAF is throttled (background tab)
+  if (_redrawing) return;
+  _redrawing = true;
+  const tick = () => {
+    redrawLoops();
+    if (performance.now() < _redrawUntil) requestAnimationFrame(tick);
+    else _redrawing = false;
+  };
+  requestAnimationFrame(tick);
 }
 
 // one open question: a recorded decision (with reopen), or a form to answer it
@@ -324,6 +346,7 @@ function closeCallout() {
   callout.classList.remove('open');
   callout.setAttribute('aria-hidden', 'true');
   scrim.classList.remove('open');
+  if (frame.classList.contains('callout-open')) { frame.classList.remove('callout-open'); scheduleLoopRedraw(); }
 }
 function block(h, inner) { return `<div class="co-block"><div class="co-h">${h}</div>${inner}</div>`; }
 
