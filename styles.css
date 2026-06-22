@@ -345,6 +345,20 @@ body {
   color: var(--muted); padding: 7px 8px; border-radius: 7px;
 }
 .switch a.on { background: var(--panel-2); color: var(--ink); box-shadow: inset 0 0 0 1px var(--hair); }
+
+/* project switcher (multi-project home dir) */
+.proj { margin-bottom: 18px; }
+.proj-switch {
+  width: 100%; cursor: pointer; appearance: none;
+  background: var(--bg); border: 1px solid var(--hair); border-radius: 9px;
+  color: var(--ink); font-family: var(--mono); font-size: 11.5px; letter-spacing: .04em;
+  padding: 8px 28px 8px 11px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--faint) 50%), linear-gradient(135deg, var(--faint) 50%, transparent 50%);
+  background-position: right 13px center, right 8px center; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat;
+}
+.proj-switch:hover { border-color: var(--edge); }
+.proj-switch:focus { outline: none; border-color: var(--steel); }
+.proj-switch:disabled { color: var(--faint); cursor: default; }
 .switch a:hover:not(.on) { color: var(--ink); }
 
 .dot.reject { background: transparent; border: 1.5px solid var(--reject, #e0594e); }

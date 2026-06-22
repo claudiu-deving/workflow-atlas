@@ -1,7 +1,10 @@
-// Workflow maps live in content/workflows.json — authored by the user or by an
-// AI over MCP (save_workflows). Fetched at boot so edits show on reload.
+// Workflow maps for the active project — authored by the user or by an AI over MCP
+// (save_workflows). Fetched from the server's /api/p/<project>/… on boot.
 import { esc } from './shared/esc.js';
+import { resolveProjects, apiBase, withProject, renderSwitcher, wireSwitchLinks, setTabTitle } from './shared/project.js';
 const $ = (id) => document.getElementById(id);
+let PROJECT = 'default';
+const API = () => apiBase(PROJECT);
 const flow = $('flow');
 const indexNav = $('index');
 const callout = $('callout');
@@ -21,31 +24,26 @@ const today = () => new Date().toISOString().slice(0, 10);
 const getAuthor = () => { try { return localStorage.getItem(AUTHOR_KEY) || ''; } catch { return ''; } };
 const wfDecisions = (sheetId) => (wfReview.decisions && wfReview.decisions[sheetId]) || {};
 
+const wfDraftKey = () => `workflow-atlas.wfreview.${PROJECT}`;
 async function loadWorkflowReview() {
   wfReview = { decisions: {} }; wfHasServer = false;
   try {
-    const res = await fetch('/api/workflow-review', { cache: 'no-store' });
+    const res = await fetch(`${API()}/workflow-review`, { cache: 'no-store' });
     if (res.ok) { wfReview = await res.json(); wfHasServer = true; }
   } catch { /* server not running */ }
   if (!wfHasServer) {
-    // static fallback: prefer the committed sidecar; only fall back to the local
-    // draft when there is no sidecar, so a committed update never loses to a stale
-    // localStorage snapshot.
-    let loadedSidecar = false;
-    try { const r = await fetch('content/reviews/_workflows.json', { cache: 'no-store' }); if (r.ok) { wfReview = await r.json(); loadedSidecar = true; } } catch { /* no sidecar */ }
-    if (!loadedSidecar) {
-      try { const d = JSON.parse(localStorage.getItem('workflow-atlas.wfreview') || 'null'); if (d) wfReview = d; } catch { /* ignore */ }
-    }
+    // no server reachable: fall back to this browser's local draft for the project
+    try { const d = JSON.parse(localStorage.getItem(wfDraftKey()) || 'null'); if (d) wfReview = d; } catch { /* ignore */ }
   }
   wfReview.decisions = wfReview.decisions || {};
 }
 // send ONE decision change so the server can merge it; it can't clobber a decision
 // recorded elsewhere since the page loaded. Reconcile local state with the result.
 async function persistWfChange(patch) {
-  try { localStorage.setItem('workflow-atlas.wfreview', JSON.stringify(wfReview)); } catch { /* ignore */ }
+  try { localStorage.setItem(wfDraftKey(), JSON.stringify(wfReview)); } catch { /* ignore */ }
   if (!wfHasServer) return;
   try {
-    const res = await fetch('/api/workflow-review', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+    const res = await fetch(`${API()}/workflow-review`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
     if (res.ok) { const j = await res.json(); if (j && j.saved && j.saved.decisions) wfReview = j.saved; }   // authoritative merged state
   } catch { /* offline — local optimistic state stands */ }
 }
@@ -91,13 +89,24 @@ function buildIndex() {
 }
 
 async function boot() {
+  const info = await resolveProjects();
+  PROJECT = info.active;
+  setTabTitle(PROJECT, 'Workflows');
+  renderSwitcher($('proj'), info);
+  wireSwitchLinks(PROJECT);
   try {
-    const res = await fetch('content/workflows.json', { cache: 'no-store' });
+    const res = await fetch(`${API()}/workflows`, { cache: 'no-store' });
     if (res.ok) SHEETS = (await res.json()).sheets || [];
-  } catch { /* no content */ }
+  } catch { /* server down */ }
   await loadWorkflowReview();
   buildIndex();
-  if (!SHEETS.length) return;
+  if (!SHEETS.length) {
+    $('sh-title').textContent = info.projects.length ? 'No workflow maps yet' : 'Start the server';
+    $('sh-sub').textContent = info.projects.length
+      ? 'Author one over MCP with save_sheet, or pick another project.'
+      : 'Run the Atlas server so the assistant can author maps for this project.';
+    return;
+  }
   const start = SHEETS.findIndex((s) => s.id === location.hash.slice(1));
   select(start >= 0 ? start : 0);
 }
@@ -220,7 +229,7 @@ function algoLink(id) {
   b.className = 'algo-link';
   b.innerHTML = '<span class="play">▶</span> storyboard';
   b.title = `Open the “${id}” algorithm storyboard`;
-  b.addEventListener('click', (e) => { e.stopPropagation(); location.href = `algorithms.html#${id}`; });
+  b.addEventListener('click', (e) => { e.stopPropagation(); location.href = withProject(`algorithms.html#${id}`, PROJECT); });
   b.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); } });
   return b;
 }
@@ -277,7 +286,7 @@ function openCallout(st, idx) {
   if (d.out?.length) parts.push(block('Produces', `<ul class="io out">${d.out.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`));
   if (d.note) parts.push(block('Where it stands', `<p class="co-note">${esc(d.note)}</p>`));
   if (d.open?.length) parts.push(block('Open questions', `<ul class="co-qs">${d.open.map((q, i) => wfQuestionItem(sheetId, q, i)).join('')}</ul>`));
-  if (st.algorithm) parts.push(`<a class="co-algo" href="algorithms.html#${esc(st.algorithm)}"><span class="play">▶</span> Watch the algorithm storyboard</a>`);
+  if (st.algorithm) parts.push(`<a class="co-algo" href="${esc(withProject(`algorithms.html#${st.algorithm}`, PROJECT))}"><span class="play">▶</span> Watch the algorithm storyboard</a>`);
 
   $('callout-body').innerHTML = parts.join('');
   if (d.open?.length && sheetId) wireWfDecisions(sheetId, d.open);

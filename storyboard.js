@@ -1,9 +1,12 @@
-// Algorithm storyboards are JSON specs under content/algorithms/, discovered via
-// content/index.json — authored by the user or by an AI over MCP (save_algorithm).
+// Algorithm storyboards for the active project — discovered via the server's
+// /api/p/<project>/index, authored by the user or by an AI over MCP (save_algorithm).
 // A spec is rendered straight from explicit `steps`, or driven live by a shared
 // `builtin` generator; either way the renderer only ever sees compute(params).
 import { GENERATORS } from './shared/generators.js';
 import { esc } from './shared/esc.js';
+import { resolveProjects, apiBase, withProject, renderSwitcher, wireSwitchLinks, setTabTitle } from './shared/project.js';
+let PROJECT = 'default';
+const API = () => apiBase(PROJECT);
 
 let ALGORITHMS = [];     // [{ meta, kind, params, code, compute }]
 const SVGNS = 'http://www.w3.org/2000/svg';
@@ -57,21 +60,28 @@ function buildNav() {
 }
 
 async function boot() {
+  const info = await resolveProjects();
+  PROJECT = info.active;
+  setTabTitle(PROJECT, 'Algorithms');
+  renderSwitcher($('proj'), info);
+  wireSwitchLinks(PROJECT);
   let ids = [];
   try {
-    const res = await fetch('content/index.json', { cache: 'no-store' });
+    const res = await fetch(`${API()}/index`, { cache: 'no-store' });
     if (res.ok) ids = (await res.json()).algorithms || [];
-  } catch { /* no content manifest */ }
+  } catch { /* server down */ }
   const specs = await Promise.all(ids.map(async (id) => {
     try {
-      const r = await fetch(`content/algorithms/${id}.json`, { cache: 'no-store' });
+      const r = await fetch(`${API()}/algorithm/${id}`, { cache: 'no-store' });
       return r.ok ? specToTrace(await r.json()) : null;
     } catch { return null; }
   }));
   ALGORITHMS = specs.filter(Boolean);
   buildNav();
   if (!ALGORITHMS.length) {
-    status('No algorithms yet. Author one over MCP with save_algorithm, then reload.');
+    status(info.projects.length
+      ? 'No storyboards in this project yet. Author one over MCP with save_algorithm, or pick another project.'
+      : 'No server reachable — run the Atlas server so the assistant can author storyboards.');
     return;
   }
   const start = ALGORITHMS.findIndex((a) => a.meta.id === location.hash.slice(1));
@@ -91,7 +101,7 @@ async function loadAlg(i) {
   if (trace.meta.workflow) {
     back.hidden = false;
     back.textContent = `◂ ${trace.meta.workflow.label}`;
-    back.href = `index.html#${trace.meta.workflow.sheet}`;
+    back.href = withProject(`index.html#${trace.meta.workflow.sheet}`, PROJECT);
   } else { back.hidden = true; }
 
   await loadReview();
@@ -105,27 +115,22 @@ async function loadAlg(i) {
     status('This storyboard has no steps to show — its builtin is unknown or its steps[] is empty. Check the spec.');
   } else {
     status(hasServer
-      ? 'Connected to the local server — tolerances & comments autosave to the repo, and Claude can read them over MCP.'
-      : 'No server: edits stay in this browser. Run "npm start" (node server/server.mjs) to autosave to the repo.');
+      ? 'Connected — tolerances & comments autosave to the project, and the assistant can read them over MCP.'
+      : 'No server: edits stay in this browser. Run the Atlas server to autosave to the project.');
   }
 }
 
-// baseline overlay (tuned params + comments) — from the server, or the static
-// sidecar file as a fallback when the server isn't running.
+// baseline overlay (tuned params + comments) — from the server, or this browser's
+// local draft as a fallback when the server isn't running.
 async function loadReview() {
   review = { params: {}, comments: {}, decisions: {} };
   hasServer = false;
   const take = (j) => { review.params = j.params || {}; review.comments = j.comments || {}; review.decisions = j.decisions || {}; };
   try {
-    const res = await fetch(`/api/review/${trace.meta.id}`, { cache: 'no-store' });
+    const res = await fetch(`${API()}/review/${trace.meta.id}`, { cache: 'no-store' });
     if (res.ok) { take(await res.json()); hasServer = true; }
   } catch { /* server not running */ }
   if (!hasServer) {
-    try {
-      const res = await fetch(`content/reviews/${trace.meta.id}.json`, { cache: 'no-store' });
-      if (res.ok) take(await res.json());
-    } catch { /* no sidecar yet */ }
-    // local draft fallback when there's no server to write to
     try { const d = JSON.parse(localStorage.getItem(overlayKey()) || 'null'); if (d) review = { params: d.params || {}, comments: d.comments || {}, decisions: d.decisions || {} }; }
     catch { /* ignore */ }
   }
@@ -133,7 +138,7 @@ async function loadReview() {
   decisions = { ...review.decisions };
 }
 
-const overlayKey = () => `workflow-atlas.overlay.${trace.meta.id}`;
+const overlayKey = () => `workflow-atlas.overlay.${PROJECT}.${trace.meta.id}`;
 function buildOverlay() {
   const p = {}; for (const k of trace.params.map((x) => x.key)) p[k] = params[k];
   const c = {}; for (const k in comments) if (comments[k] && String(comments[k]).trim()) c[k] = String(comments[k]).trim();
@@ -145,13 +150,13 @@ async function persist() {
   try { localStorage.setItem(overlayKey(), JSON.stringify(overlay)); } catch { /* ignore */ }
   if (hasServer) {
     try {
-      const res = await fetch(`/api/review/${trace.meta.id}`, {
+      const res = await fetch(`${API()}/review/${trace.meta.id}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(overlay),
       });
-      status(res.ok ? 'Saved to the repo ✓ — Claude can read it via MCP.' : 'Save failed — is the server up?');
+      status(res.ok ? 'Saved ✓ — the assistant can read it via MCP.' : 'Save failed — is the server up?');
     } catch { status('Save failed — server unreachable. Edits kept in this browser.'); }
   } else {
-    status('Saved in this browser. Run the server ("npm start") to write the repo.');
+    status('Saved in this browser. Run the Atlas server to persist to the project.');
   }
 }
 

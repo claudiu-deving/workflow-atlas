@@ -145,7 +145,7 @@
       "stations": [
         {
           "title": "Start the server",
-          "sub": "npm start, or Claude Code spawns it over stdio",
+          "sub": "npm start, or an MCP client spawns it over stdio",
           "status": "done",
           "detail": {
             "out": [

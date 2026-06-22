@@ -1,38 +1,39 @@
 #!/usr/bin/env node
-// Atlas review hook (Claude Code UserPromptSubmit).
+// Atlas review hook — Claude Code UserPromptSubmit integration (one supported client).
 //
-// Surfaces recorded decisions (and per-step comments) to Claude as context, so it
-// reads them back and revises without you re-prompting.
+// Surfaces recorded decisions (and per-step comments) to the assistant as context,
+// so it reads them back and revises without you re-prompting.
 //
-// Firing is PER UNIT (each algorithm storyboard / each workflow sheet): a unit
-// fires as soon as ALL of ITS OWN questions are answered — unrelated units with
-// still-open questions (e.g. the bundled demo content) never block it. Each unit
-// fires only ONCE per answered state; a per-id signature map under content/reviews/
-// records what was last surfaced. It never blocks your prompt: on any error it
-// exits 0 with no output. Set ATLAS_HOOK_DEBUG=1 to print diagnostics to stderr
-// (which Claude Code surfaces) so a misconfigured hook is discoverable.
+// Firing is PER UNIT (each algorithm storyboard / each workflow sheet): a unit fires
+// as soon as ALL of ITS OWN questions are answered — unrelated units with still-open
+// questions never block it. Each unit fires only ONCE per answered state. It never
+// blocks your prompt: on any error it exits 0 with no output. Set ATLAS_HOOK_DEBUG=1
+// to print diagnostics to stderr (which Claude Code surfaces).
 //
-// Content is resolved relative to THIS script (../content), because the Atlas MCP
-// server stores its data in its OWN repo — not in whatever project Claude Code is
-// pointed at (CLAUDE_PROJECT_DIR). Override with ATLAS_CONTENT_DIR if needed.
+// It reads the SAME project the Atlas server bound to for this session: the home dir
+// ($WORKFLOW_ATLAS_HOME, default ~/.workflow-atlas) → projects/<project>, where the
+// project is derived from the directory Claude Code is open in ($CLAUDE_PROJECT_DIR),
+// or set explicitly with $WORKFLOW_ATLAS_PROJECT. Override the path with
+// $ATLAS_CONTENT_DIR if needed.
 //
-// Wire it as a UserPromptSubmit command hook with the ABSOLUTE path to this file
-// (Claude Code is normally open in a different project than the Atlas repo):
+// Wire it as a UserPromptSubmit command hook with the ABSOLUTE path to this file:
 //   { "type": "command", "command": "node \"/abs/path/to/workflow-atlas/scripts/atlas-review-hook.mjs\"" }
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 const debug = (...a) => { if (process.env.ATLAS_HOOK_DEBUG) process.stderr.write('[atlas-review-hook] ' + a.join(' ') + '\n'); };
+const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'default';
 
 try {
-  const HERE = path.dirname(fileURLToPath(import.meta.url));
-  const CONTENT = process.env.ATLAS_CONTENT_DIR || path.resolve(HERE, '..', 'content');
+  const project = slug(process.env.WORKFLOW_ATLAS_PROJECT || path.basename(process.env.CLAUDE_PROJECT_DIR || process.cwd()));
+  const home = process.env.WORKFLOW_ATLAS_HOME || path.join(os.homedir(), '.workflow-atlas');
+  const CONTENT = process.env.ATLAS_CONTENT_DIR || path.join(home, 'projects', project);
   const ALG_DIR = path.join(CONTENT, 'algorithms');
   const REVIEW_DIR = path.join(CONTENT, 'reviews');
   const WORKFLOWS = path.join(CONTENT, 'workflows.json');
-  const MARKER = path.join(REVIEW_DIR, '.hook-surfaced');   // gitignored (content/reviews/*)
+  const MARKER = path.join(REVIEW_DIR, '.hook-surfaced');   // in the home dir, outside any repo
 
   const readJSON = (p, fb) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fb; } };
 

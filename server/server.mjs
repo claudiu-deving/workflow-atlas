@@ -4,27 +4,73 @@
 //   npm start            (or: node server/server.mjs)
 //
 // Serves the static app and exposes an MCP authoring surface so an AI assistant
-// can build the visuals it's explaining: create/edit algorithm storyboards and
-// workflow maps (stored as JSON under content/), tune review overlays, and edit
-// the look directly (raw CSS / HTML). Local-only tooling — a richer channel for
-// showing, not just describing, an algorithm. MCP runs over stdio (how Claude
-// Code launches it) and at /mcp over HTTP (for manual testing).
+// (any MCP client) can build the visuals it's explaining: create/edit algorithm
+// storyboards and workflow maps, tune review overlays, and edit the look directly
+// (raw CSS / HTML). Data for each project is stored under ~/.workflow-atlas, so one
+// install serves many projects and parallel sessions. Local-only tooling. MCP runs
+// over stdio (how an MCP client like Claude Code launches it) and at /mcp over HTTP.
 
 import http from 'node:http';
 import fs from 'node:fs/promises';
-import { existsSync, watch } from 'node:fs';
+import { existsSync, mkdirSync, watch } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { GENERATORS } from '../shared/generators.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');        // the app root (parent of server/)
-const CONTENT = path.join(ROOT, 'content');
-const ALG_DIR = path.join(CONTENT, 'algorithms');
-const REVIEW_DIR = path.join(CONTENT, 'reviews');
-const WORKFLOWS = path.join(CONTENT, 'workflows.json');
-const INDEX = path.join(CONTENT, 'index.json');
+const ROOT = path.resolve(__dirname, '..');        // the app files (this repo) — served as static
+const SEED = path.join(ROOT, 'content');           // bundled demo content used to seed a new project
+
+// Data (every user's projects) lives OUTSIDE the repo, so one install serves many
+// projects and many parallel sessions. Default ~/.workflow-atlas; override with
+// WORKFLOW_ATLAS_HOME. Each project is a folder under projects/ holding its own
+// algorithms/, reviews/, workflows.json, index.json.
+const ATLAS_HOME = process.env.WORKFLOW_ATLAS_HOME || path.join(os.homedir(), '.workflow-atlas');
+const PROJECTS_DIR = path.join(ATLAS_HOME, 'projects');
+const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'default';
+// Each server process is bound to ONE project: explicit WORKFLOW_ATLAS_PROJECT, else
+// derived from the launch directory — so an MCP client opened in repo X authors X's
+// project automatically, and parallel sessions in different repos stay isolated.
+// (Prefer CLAUDE_PROJECT_DIR so the server and the review hook agree on the project.)
+const CURRENT_PROJECT = slug(process.env.WORKFLOW_ATLAS_PROJECT || path.basename(process.env.CLAUDE_PROJECT_DIR || process.cwd()));
+
+const projDir = (p) => path.join(PROJECTS_DIR, slug(p));
+const algDir = (p) => path.join(projDir(p), 'algorithms');
+const reviewDir = (p) => path.join(projDir(p), 'reviews');
+const workflowsPath = (p) => path.join(projDir(p), 'workflows.json');
+const indexPath = (p) => path.join(projDir(p), 'index.json');
+const algPath = (p, id) => path.join(algDir(p), `${id}.json`);
+const reviewPath = (p, id) => path.join(reviewDir(p), `${id}.json`);
+const workflowReviewPath = (p) => path.join(reviewDir(p), '_workflows.json');
+
+// Atomic, serialized-per-file write. A torn write can't corrupt the live file, and
+// queueing writes to the same file avoids two concurrent renames onto the same
+// target (which Windows rejects with a sharing violation); a short retry covers a
+// cross-process race. The tmp is always cleaned up. Last writer in the queue wins.
+const writeQueues = new Map();
+async function renameWithRetry(tmp, file, tries = 6) {
+  for (let i = 0; ; i++) {
+    try { return await fs.rename(tmp, file); }
+    catch (e) {
+      if (i >= tries || !['EPERM', 'EBUSY', 'EACCES'].includes(e.code)) throw e;
+      await new Promise((r) => setTimeout(r, 8 * (i + 1)));
+    }
+  }
+}
+async function writeAtomic(file, data) {
+  const prev = writeQueues.get(file) || Promise.resolve();
+  const run = prev.catch(() => {}).then(async () => {
+    const tmp = `${file}.tmp-${randomUUID()}`;
+    try { await fs.writeFile(tmp, data, 'utf8'); await renameWithRetry(tmp, file); }
+    finally { await fs.rm(tmp, { force: true }).catch(() => {}); }
+  });
+  writeQueues.set(file, run);
+  try { await run; } finally { if (writeQueues.get(file) === run) writeQueues.delete(file); }
+}
+
 const PORT = Number(process.env.PORT) || 5174;
 // Local-only by default: bind loopback so the unauthenticated write surface
 // (MCP tools, review autosave) is never reachable from the LAN. Advanced users
@@ -53,7 +99,14 @@ function openInBrowser(urlPath) {
   if (hasAutoOpened) return;                          // already opened once this run
   if (reloadClients.size > 0) return;                 // a tab is open and will live-reload itself
   hasAutoOpened = true;
-  const url = `http://localhost:${activePort}${urlPath || '/'}`;
+  // carry the bound project so the tab opens on the right one — even when a sibling
+  // instance (a different project) owns the port and actually serves the UI.
+  const up = urlPath || '/';
+  const hashAt = up.indexOf('#');
+  const base = hashAt >= 0 ? up.slice(0, hashAt) : up;
+  const hash = hashAt >= 0 ? up.slice(hashAt) : '';
+  const withP = `${base}${base.includes('?') ? '&' : '?'}p=${encodeURIComponent(CURRENT_PROJECT)}${hash}`;
+  const url = `http://localhost:${activePort}${withP}`;
   try {
     const p = process.platform;
     const cmd = p === 'win32' ? ['cmd', ['/c', 'start', '', url]]
@@ -86,23 +139,40 @@ function isLocalRequest(req) {
   if (origin) { try { return isLoopbackHost(new URL(origin).host); } catch { return false; } }
   return true;
 }
-const algPath = (id) => path.join(ALG_DIR, `${id}.json`);
-const reviewPath = (id) => path.join(REVIEW_DIR, `${id}.json`);
-
-async function ensureDirs() {
-  await fs.mkdir(ALG_DIR, { recursive: true });
-  await fs.mkdir(REVIEW_DIR, { recursive: true });
+// Seed a brand-new project from the bundled demo content the first time it's used,
+// so an empty project isn't a blank wall. Runs once (when the project dir is absent).
+async function ensureDirs(p) {
+  const created = !existsSync(projDir(p));
+  await fs.mkdir(algDir(p), { recursive: true });
+  await fs.mkdir(reviewDir(p), { recursive: true });
+  // New projects start EMPTY (real work shouldn't be mixed with demo content).
+  // Opt in to the bundled demos for a fresh project with WORKFLOW_ATLAS_SEED=1.
+  if (created && process.env.WORKFLOW_ATLAS_SEED) {
+    try {
+      for (const f of await fs.readdir(path.join(SEED, 'algorithms'))) {
+        if (f.endsWith('.json')) await fs.copyFile(path.join(SEED, 'algorithms', f), path.join(algDir(p), f));
+      }
+      await fs.copyFile(path.join(SEED, 'workflows.json'), workflowsPath(p));
+      await rebuildIndex(p);
+    } catch { /* no seed available — leave the project empty */ }
+  }
+}
+async function listProjects() {
+  try {
+    const entries = await fs.readdir(PROJECTS_DIR, { withFileTypes: true });
+    return entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+  } catch { return []; }
 }
 
 /* ---------------- algorithm store ---------------- */
-async function listAlgorithms() {
+async function listAlgorithms(p) {
   try {
-    const files = await fs.readdir(ALG_DIR);
+    const files = await fs.readdir(algDir(p));
     return files.filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, '')).sort();
   } catch { return []; }
 }
-async function readAlgorithm(id) {
-  return JSON.parse(await fs.readFile(algPath(id), 'utf8'));
+async function readAlgorithm(p, id) {
+  return JSON.parse(await fs.readFile(algPath(p, id), 'utf8'));
 }
 function validateAlgorithm(spec) {
   if (!spec || typeof spec !== 'object') throw new Error('spec must be an object');
@@ -126,30 +196,31 @@ function validateAlgorithm(spec) {
     }
   }
 }
-async function writeAlgorithm(spec) {
+async function writeAlgorithm(p, spec) {
   validateAlgorithm(spec);
-  await ensureDirs();
-  await fs.writeFile(algPath(spec.id), JSON.stringify(spec, null, 2) + '\n', 'utf8');
-  await rebuildIndex();
+  await ensureDirs(p);
+  await writeAtomic(algPath(p, spec.id), JSON.stringify(spec, null, 2) + '\n');
+  await rebuildIndex(p);
   return spec.id;
 }
-async function deleteAlgorithm(id) {
-  await fs.rm(algPath(id), { force: true });
-  await fs.rm(reviewPath(id), { force: true });
-  await rebuildIndex();
+async function deleteAlgorithm(p, id) {
+  await fs.rm(algPath(p, id), { force: true });
+  await fs.rm(reviewPath(p, id), { force: true });
+  await rebuildIndex(p);
 }
-async function rebuildIndex() {
-  const algorithms = await listAlgorithms();
+async function rebuildIndex(p) {
+  const algorithms = await listAlgorithms(p);
   const body = {
-    note: 'Discovery manifest — the server rewrites this on every algorithm create/delete. The app reads it to know which storyboards to load (works with or without the server).',
+    note: 'Discovery manifest — the server rewrites this on every algorithm create/delete.',
     algorithms,
   };
-  await fs.writeFile(INDEX, JSON.stringify(body, null, 2) + '\n', 'utf8');
+  await fs.mkdir(projDir(p), { recursive: true });
+  await writeAtomic(indexPath(p), JSON.stringify(body, null, 2) + '\n');
 }
 // authored questions: builtins declare them in spec.questions; static traces
 // carry them inline on steps[i].question.
-async function readQuestions(id) {
-  const spec = await readAlgorithm(id);
+async function readQuestions(p, id) {
+  const spec = await readAlgorithm(p, id);
   if (spec.builtin) return (spec.questions || []).map((q) => ({ step: q.step, question: q.text }));
   return (spec.steps || []).map((st, i) => (st && st.question ? { step: i, question: st.question } : null)).filter(Boolean);
 }
@@ -229,14 +300,15 @@ function assertUniqueIds(sheets) {
   if (dup) throw new Error(`duplicate sheet id: ${dup} — sheet ids must be unique`);
 }
 
-async function readWorkflows() {
-  try { return JSON.parse(await fs.readFile(WORKFLOWS, 'utf8')); }
+async function readWorkflows(p) {
+  try { return JSON.parse(await fs.readFile(workflowsPath(p), 'utf8')); }
   catch { return { sheets: [] }; }
 }
-async function persistWorkflows(sheets) {
-  await fs.writeFile(WORKFLOWS, JSON.stringify({ sheets }, null, 2) + '\n', 'utf8');
+async function persistWorkflows(p, sheets) {
+  await fs.mkdir(projDir(p), { recursive: true });
+  await writeAtomic(workflowsPath(p), JSON.stringify({ sheets }, null, 2) + '\n');
 }
-async function writeWorkflows(obj) {
+async function writeWorkflows(p, obj) {
   const sheets = Array.isArray(obj) ? obj : (obj && obj.sheets);
   if (!Array.isArray(sheets)) throw new Error('workflows must be an array of sheets, or { sheets: [...] }');
   sheets.forEach((s) => validateSheet(s));
@@ -244,49 +316,49 @@ async function writeWorkflows(obj) {
   // Snapshot the prior file ONLY on this replace-all path — it's the destructive
   // op (an omitted sheet is deleted). Per-piece edits (save_sheet/set_station) must
   // NOT overwrite the .bak, or one follow-up edit would erase the recovery point.
-  try { await fs.copyFile(WORKFLOWS, WORKFLOWS + '.bak'); } catch { /* no prior file */ }
-  await persistWorkflows(sheets);
+  try { await fs.copyFile(workflowsPath(p), workflowsPath(p) + '.bak'); } catch { /* no prior file */ }
+  await persistWorkflows(p, sheets);
   return sheets.length;
 }
-async function getSheet(id) {
-  const s = ((await readWorkflows()).sheets || []).find((x) => x && x.id === id);
+async function getSheet(p, id) {
+  const s = ((await readWorkflows(p)).sheets || []).find((x) => x && x.id === id);
   if (!s) throw new Error(`no such sheet: ${id}`);
   return s;
 }
 // per-sheet upsert — authoring one sheet never resends the rest
-async function saveSheet(sheet) {
+async function saveSheet(p, sheet) {
   validateSheet(sheet);
-  const sheets = (await readWorkflows()).sheets || [];
+  const sheets = (await readWorkflows(p)).sheets || [];
   const i = sheets.findIndex((s) => s && s.id === sheet.id);
   const created = i < 0;
   if (created) sheets.push(sheet); else sheets[i] = sheet;
-  await persistWorkflows(sheets);
+  await persistWorkflows(p, sheets);
   return { id: sheet.id, created, count: sheets.length, warnings: lintSheets([sheet]) };
 }
-async function deleteSheet(id) {
-  const sheets = (await readWorkflows()).sheets || [];
+async function deleteSheet(p, id) {
+  const sheets = (await readWorkflows(p)).sheets || [];
   const next = sheets.filter((s) => !(s && s.id === id));
   if (next.length === sheets.length) throw new Error(`no such sheet: ${id}`);
-  await persistWorkflows(next);
+  await persistWorkflows(p, next);
   // intentionally KEEP the sheet's decisions in the review file: re-creating the
   // sheet later recovers them, and they only render for questions that still exist.
   return next.length;
 }
-async function reorderSheets(order) {
+async function reorderSheets(p, order) {
   if (!Array.isArray(order)) throw new Error('order must be an array of sheet ids');
-  const sheets = (await readWorkflows()).sheets || [];
+  const sheets = (await readWorkflows(p)).sheets || [];
   const byId = new Map(sheets.filter((s) => s && s.id).map((s) => [s.id, s]));
   const seen = new Set();
   const out = [];
   for (const id of order) { const s = byId.get(id); if (s && !seen.has(id)) { out.push(s); seen.add(id); } }
   for (const s of sheets) { if (s && !seen.has(s.id)) out.push(s); }   // unlisted sheets keep their order at the end
-  await persistWorkflows(out);
+  await persistWorkflows(p, out);
   return out.map((s) => s.id);
 }
 // station-level edits within one sheet
-async function setStation(sheetId, station, index) {
+async function setStation(p, sheetId, station, index) {
   validateStation(station, 'station');
-  const sheets = (await readWorkflows()).sheets || [];
+  const sheets = (await readWorkflows(p)).sheets || [];
   const sheet = sheets.find((s) => s && s.id === sheetId);
   if (!sheet) throw new Error(`no such sheet: ${sheetId}`);
   sheet.stations = Array.isArray(sheet.stations) ? sheet.stations : [];
@@ -298,11 +370,11 @@ async function setStation(sheetId, station, index) {
   if (index == null || index === len) { sheet.stations.push(station); at = len; created = true; }
   else if (index < len) { sheet.stations[index] = station; at = index; created = false; }
   else throw new Error(`index ${index} out of range (0..${len}); pass ${len} to append`);
-  await persistWorkflows(sheets);
+  await persistWorkflows(p, sheets);
   return { index: at, count: sheet.stations.length, created };
 }
-async function deleteStation(sheetId, index) {
-  const sheets = (await readWorkflows()).sheets || [];
+async function deleteStation(p, sheetId, index) {
+  const sheets = (await readWorkflows(p)).sheets || [];
   const sheet = sheets.find((s) => s && s.id === sheetId);
   if (!sheet) throw new Error(`no such sheet: ${sheetId}`);
   const st = Array.isArray(sheet.stations) ? sheet.stations : [];
@@ -321,17 +393,17 @@ async function deleteStation(sheetId, index) {
     }
   }
   sheet.stations = st;
-  await persistWorkflows(sheets);
+  await persistWorkflows(p, sheets);
   return { count: st.length };
 }
 
 /* ---------------- review store (params + comments + decisions) ---------------- */
-async function readReview(id) {
-  try { return JSON.parse(await fs.readFile(reviewPath(id), 'utf8')); }
+async function readReview(p, id) {
+  try { return JSON.parse(await fs.readFile(reviewPath(p, id), 'utf8')); }
   catch { return { $schema: 'storyboard-review', algorithm: id, params: {}, comments: {}, decisions: {} }; }
 }
-async function writeReview(id, obj) {
-  await ensureDirs();
+async function writeReview(p, id, obj) {
+  await ensureDirs(p);
   const out = {
     $schema: 'storyboard-review',
     algorithm: id,
@@ -340,31 +412,30 @@ async function writeReview(id, obj) {
     comments: obj.comments || {},
     decisions: obj.decisions || {},      // step → { answer, by, at } for resolved open questions
   };
-  await fs.writeFile(reviewPath(id), JSON.stringify(out, null, 2) + '\n', 'utf8');
+  await writeAtomic(reviewPath(p, id), JSON.stringify(out, null, 2) + '\n');
   return out;
 }
 
 /* ---------------- workflow review (decisions on station open[] questions) ---------------- */
-// One file for the whole map. Decisions are keyed by sheet id + the exact question
-// text (not a station index), so they survive reordering/insertion of stations.
-const WORKFLOW_REVIEW = path.join(REVIEW_DIR, '_workflows.json');
-async function readWorkflowReview() {
-  try { return JSON.parse(await fs.readFile(WORKFLOW_REVIEW, 'utf8')); }
+// One file per project. Decisions are keyed by sheet id + the exact question text
+// (not a station index), so they survive reordering/insertion of stations.
+async function readWorkflowReview(p) {
+  try { return JSON.parse(await fs.readFile(workflowReviewPath(p), 'utf8')); }
   catch { return { $schema: 'workflow-review', decisions: {} }; }
 }
-async function writeWorkflowReview(obj) {
-  await ensureDirs();
+async function writeWorkflowReview(p, obj) {
+  await ensureDirs(p);
   const out = {
     $schema: 'workflow-review',
     savedAt: new Date().toISOString().slice(0, 10),
     decisions: (obj && obj.decisions) || {},   // sheetId → { [question text]: { answer, by, at } }
   };
-  await fs.writeFile(WORKFLOW_REVIEW, JSON.stringify(out, null, 2) + '\n', 'utf8');
+  await writeAtomic(workflowReviewPath(p), JSON.stringify(out, null, 2) + '\n');
   return out;
 }
 // every open[] question across all sheets' stations and fan tracks
-async function workflowQuestions() {
-  const wf = await readWorkflows();
+async function workflowQuestions(p) {
+  const wf = await readWorkflows(p);
   const out = [];
   for (const s of wf.sheets || []) {
     const at = (detail, where) => { for (const q of (detail && detail.open) || []) out.push({ sheet: s.id, where, text: q }); };
@@ -375,20 +446,24 @@ async function workflowQuestions() {
   }
   return out;
 }
-async function setWorkflowDecision(sheetId, question, answer, by) {
-  const r = await readWorkflowReview();
+// keys that would corrupt the prototype chain if used to index a plain object
+const UNSAFE_KEY = (k) => k === '__proto__' || k === 'constructor' || k === 'prototype';
+async function setWorkflowDecision(p, sheetId, question, answer, by) {
+  if (UNSAFE_KEY(sheetId) || UNSAFE_KEY(question)) throw new Error('invalid sheet/question');
+  const r = await readWorkflowReview(p);
   r.decisions = r.decisions || {};
   r.decisions[sheetId] = r.decisions[sheetId] || {};
-  r.decisions[sheetId][question] = { answer: String(answer).trim(), by: (by || 'claude').trim(), at: new Date().toISOString().slice(0, 10) };
-  return writeWorkflowReview(r);
+  r.decisions[sheetId][question] = { answer: String(answer).trim(), by: (by || 'assistant').trim(), at: new Date().toISOString().slice(0, 10) };
+  return writeWorkflowReview(p, r);
 }
-async function reopenWorkflowQuestion(sheetId, question) {
-  const r = await readWorkflowReview();
+async function reopenWorkflowQuestion(p, sheetId, question) {
+  if (UNSAFE_KEY(sheetId) || UNSAFE_KEY(question)) throw new Error('invalid sheet/question');
+  const r = await readWorkflowReview(p);
   if (r.decisions && r.decisions[sheetId]) {
     delete r.decisions[sheetId][question];
     if (!Object.keys(r.decisions[sheetId]).length) delete r.decisions[sheetId];
   }
-  return writeWorkflowReview(r);
+  return writeWorkflowReview(p, r);
 }
 
 /* ---------------- raw file editing (the "look") ---------------- */
@@ -422,7 +497,9 @@ async function listEditableFiles() {
 /* ---------------- helpers ---------------- */
 function json(res, code, body) {
   const s = JSON.stringify(body);
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  // no Access-Control-Allow-Origin: the app is same-origin and the data is private —
+  // a cross-origin page must NOT be able to read project content/reviews.
+  res.writeHead(code, { 'Content-Type': 'application/json' });
   res.end(s);
 }
 function readBody(req) {
@@ -462,21 +539,21 @@ const TOOLS = [
       'and EITHER steps[] (explicit frames) OR builtin (one of: ' + [...BUILTINS].join(', ') + ') + data + questions[] }. ' +
       'A frame (kind "array") = { array[], cls{index:state}, ptr{label:index}, note, line, verdict{ok?,text}, question? } ' +
       'where state ∈ idle|active|compare|lo|hi|mid|eliminated|found|sorted. A row (kind "calc") = ' +
-      '{ label, result?, unit?, expr?, sub?, kind?(input|result), bad?, line, note, question? }. Persists to content/algorithms/<id>.json.',
+      '{ label, result?, unit?, expr?, sub?, kind?(input|result), bad?, line, note, question? }. Persists to this session\'s project.',
     inputSchema: { type: 'object', properties: { spec: { type: 'object' } }, required: ['spec'] } },
   { name: 'delete_algorithm', description: 'Delete an algorithm storyboard and its review. Persists.',
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' } }, required: ['algorithm'] } },
   { name: 'save_workflows', description: 'REPLACE-ALL the workflow maps — this OVERWRITES every sheet; any sheet you omit is DELETED. ' +
-      'Almost always use save_sheet/set_station for edits instead. If you do use this, call get_workflows first and resend the full set. (The previous file is snapshotted to content/workflows.json.bak.) ' +
+      'Almost always use save_sheet/set_station for edits instead. If you do use this, call get_workflows first and resend the full set. (The previous file is snapshotted to workflows.json.bak first.) ' +
       'sheets = [ { id (slug), code (SHORT badge string like "WA-01" — NOT pseudocode; an algorithm spec\'s "code" is a different field), name, title, sub, stations[] } ]. ' +
       'A station = { title, sub?, status (done|partial|todo), algorithm?, detail?{in[],out[],note,open[]}, loop?{to (station index OR a target station\'s title), label}, fan?{tracks[]} }. ' +
       'Example sheet: { "id":"checkout", "code":"WF-02", "name":"Checkout", "title":"Order checkout", "sub":"…", "stations":[ {"title":"Validate cart","status":"done","detail":{"in":["cart"],"out":["valid cart"],"open":["allow backorders?"]}} ] }. ' +
-      'The response echoes which sheet ids were added/updated/removed plus lint warnings. Persists to content/workflows.json.',
+      'The response echoes which sheet ids were added/updated/removed plus lint warnings. Persists to this session\'s project.',
     inputSchema: { type: 'object', properties: { sheets: { type: 'array' } }, required: ['sheets'] } },
   { name: 'get_sheet', description: 'Read ONE workflow sheet by id (lighter than get_workflows).',
     inputSchema: { type: 'object', properties: { sheet: { type: 'string' } }, required: ['sheet'] } },
   { name: 'save_sheet', description: 'Upsert ONE workflow sheet by id — create it or replace it in place WITHOUT resending the others. ' +
-      'sheet shape and station shape are exactly as in save_workflows (code is a SHORT badge). Returns created-or-updated + lint warnings. Persists to content/workflows.json.',
+      'sheet shape and station shape are exactly as in save_workflows (code is a SHORT badge). Returns created-or-updated + lint warnings. Persists to this session\'s project.',
     inputSchema: { type: 'object', properties: { sheet: { type: 'object' } }, required: ['sheet'] } },
   { name: 'delete_sheet', description: 'Delete ONE workflow sheet by id. Persists.',
     inputSchema: { type: 'object', properties: { sheet: { type: 'string' } }, required: ['sheet'] } },
@@ -505,12 +582,12 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' }, step: { type: 'number' } }, required: ['algorithm', 'step'] } },
 
   // the look — raw files
-  { name: 'list_files', description: 'List the raw app files you may read/edit to design the look (CSS, HTML, JS at the project root). Excludes server/ and content/.',
+  { name: 'list_files', description: 'List the raw app files you may read/edit to design the look (CSS, HTML, JS at the app root). Excludes server/ and the demo seed.',
     inputSchema: { type: 'object', properties: {} } },
   { name: 'get_file', description: 'Read a raw app file (e.g. styles.css, index.html, algorithms.html) to design the look.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
   { name: 'set_file', description: 'Overwrite a raw app file to restyle/redesign the app. Allowed extensions: css, html, js, json, svg, md, txt. ' +
-      'Cannot touch server/ or content/ (use the content tools for those). No guardrails on the markup itself — local tooling.',
+      'Cannot touch server/ or the demo seed (use the content tools for project data). No guardrails on the markup itself — local tooling.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
 ];
 
@@ -525,22 +602,23 @@ async function callTool(name, args) {
   if (name === 'set_param' && !Number.isFinite(a.value)) throw new Error('value must be a finite number');
   const needsSheet = new Set(['get_sheet', 'delete_sheet', 'set_station', 'delete_station', 'set_workflow_decision', 'reopen_workflow_question']);
   if (needsSheet.has(name) && !safeId(a.sheet)) throw new Error('invalid or missing sheet id (slug)');
+  const p = CURRENT_PROJECT;   // this server process is bound to one project (its launch dir)
   switch (name) {
     case 'list_algorithms': {
-      const algs = await listAlgorithms();
-      return algs.map((id) => `${id}${existsSync(reviewPath(id)) ? ' (review saved)' : ''}`).join('\n') || '(none)';
+      const algs = await listAlgorithms(p);
+      return algs.map((id) => `${id}${existsSync(reviewPath(p, id)) ? ' (review saved)' : ''}`).join('\n') || '(none)';
     }
-    case 'get_algorithm': return JSON.stringify(await readAlgorithm(a.algorithm), null, 2);
-    case 'get_workflows': return JSON.stringify(await readWorkflows(), null, 2);
-    case 'get_review': return JSON.stringify(await readReview(a.algorithm), null, 2);
+    case 'get_algorithm': return JSON.stringify(await readAlgorithm(p, a.algorithm), null, 2);
+    case 'get_workflows': return JSON.stringify(await readWorkflows(p), null, 2);
+    case 'get_review': return JSON.stringify(await readReview(p, a.algorithm), null, 2);
     case 'list_open_questions': {
-      const algs = await listAlgorithms();
+      const algs = await listAlgorithms(p);
       const lines = [];
       for (const id of algs) {
         let qs = [];
-        try { qs = await readQuestions(id); } catch (e) { lines.push(`${id}: (could not read questions: ${e.message})`); continue; }
+        try { qs = await readQuestions(p, id); } catch (e) { lines.push(`${id}: (could not read questions: ${e.message})`); continue; }
         if (!qs.length) continue;
-        const r = await readReview(id); const dec = r.decisions || {};
+        const r = await readReview(p, id); const dec = r.decisions || {};
         for (const q of qs) {
           const d = dec[q.step];
           lines.push(d
@@ -548,9 +626,9 @@ async function callTool(name, args) {
             : `[OPEN]    ${id} step ${q.step}: ${q.question}`);
         }
       }
-      const wq = await workflowQuestions();
+      const wq = await workflowQuestions(p);
       if (wq.length) {
-        const wdec = (await readWorkflowReview()).decisions || {};
+        const wdec = (await readWorkflowReview(p)).decisions || {};
         if (lines.length) lines.push('');
         lines.push('— workflow sheets —');
         for (const q of wq) {
@@ -564,92 +642,96 @@ async function callTool(name, args) {
     }
 
     case 'save_algorithm': {
-      const id = await writeAlgorithm(a.spec);
+      const id = await writeAlgorithm(p, a.spec);
       openInBrowser(`/algorithms.html#${id}`);
-      return `saved algorithm "${id}" → content/algorithms/${id}.json`;
+      return `saved algorithm "${id}" in project "${p}"`;
     }
     case 'delete_algorithm': {
-      if (!existsSync(algPath(a.algorithm))) throw new Error(`no such algorithm: ${a.algorithm}`);
-      await deleteAlgorithm(a.algorithm);
+      if (!existsSync(algPath(p, a.algorithm))) throw new Error(`no such algorithm: ${a.algorithm}`);
+      await deleteAlgorithm(p, a.algorithm);
       return `deleted algorithm "${a.algorithm}"`;
     }
     case 'save_workflows': {
-      const beforeIds = new Set(((await readWorkflows()).sheets || []).map((s) => s && s.id));
+      const beforeIds = new Set(((await readWorkflows(p)).sheets || []).map((s) => s && s.id));
       const incoming = Array.isArray(a.sheets) ? a.sheets : [];
       const afterIds = new Set(incoming.map((s) => s && s.id));
       const added = [...afterIds].filter((id) => !beforeIds.has(id));
       const removed = [...beforeIds].filter((id) => !afterIds.has(id));
       const updated = [...afterIds].filter((id) => beforeIds.has(id));
-      const n = await writeWorkflows(a.sheets);
+      const n = await writeWorkflows(p, a.sheets);
       openInBrowser('/');
       const warns = lintSheets(incoming);
       return `saved ${n} sheet(s) — added: [${added.join(', ')}]  updated: [${updated.join(', ')}]  removed: [${removed.join(', ')}]` +
         (warns.length ? `\n⚠ ${warns.join('\n⚠ ')}` : '');
     }
-    case 'get_sheet': return JSON.stringify(await getSheet(a.sheet), null, 2);
+    case 'get_sheet': return JSON.stringify(await getSheet(p, a.sheet), null, 2);
     case 'save_sheet': {
-      const r = await saveSheet(a.sheet);
+      const r = await saveSheet(p, a.sheet);
       openInBrowser('/');
       return `${r.created ? 'created' : 'updated'} sheet "${r.id}" (${r.count} sheet(s) total)` +
         (r.warnings.length ? `\n⚠ ${r.warnings.join('\n⚠ ')}` : '');
     }
     case 'delete_sheet': {
-      const n = await deleteSheet(a.sheet);
+      const n = await deleteSheet(p, a.sheet);
       openInBrowser('/');
       return `deleted sheet "${a.sheet}" (${n} remaining)`;
     }
     case 'reorder_sheets': {
-      const order = await reorderSheets(a.order);
+      const order = await reorderSheets(p, a.order);
       openInBrowser('/');
       return `sheet order: ${order.join(', ')}`;
     }
     case 'set_station': {
-      const r = await setStation(a.sheet, a.station, a.index);
+      const r = await setStation(p, a.sheet, a.station, a.index);
       openInBrowser('/');
       return `${r.created ? 'added' : 'replaced'} station #${r.index} in "${a.sheet}" (${r.count} station(s))`;
     }
     case 'delete_station': {
-      const r = await deleteStation(a.sheet, a.index);
+      const r = await deleteStation(p, a.sheet, a.index);
       openInBrowser('/');
       return `deleted station #${a.index} from "${a.sheet}" (${r.count} remaining)`;
     }
-    case 'get_workflow_review': return JSON.stringify(await readWorkflowReview(), null, 2);
+    case 'get_workflow_review': return JSON.stringify(await readWorkflowReview(p), null, 2);
     case 'set_workflow_decision': {
       if (!a.answer || !a.answer.trim()) throw new Error('answer is required');
-      const exists = (await workflowQuestions()).some((q) => q.sheet === a.sheet && q.text === a.question);
+      const exists = (await workflowQuestions(p)).some((q) => q.sheet === a.sheet && q.text === a.question);
       if (!exists) throw new Error(`no open question with that exact text on sheet "${a.sheet}" — see list_open_questions for the exact wording`);
-      await setWorkflowDecision(a.sheet, a.question, a.answer, a.by);
-      openInBrowser('/');
+      await setWorkflowDecision(p, a.sheet, a.question, a.answer, a.by);
+      openInBrowser('/'); scheduleReload();   // review writes are watcher-excluded; nudge open tabs
       return `decided on "${a.sheet}": ${a.question}\n→ ${a.answer.trim()}`;
     }
     case 'reopen_workflow_question': {
-      await reopenWorkflowQuestion(a.sheet, a.question);
-      openInBrowser('/');
+      await reopenWorkflowQuestion(p, a.sheet, a.question);
+      openInBrowser('/'); scheduleReload();
       return `reopened on "${a.sheet}": ${a.question}`;
     }
 
     case 'set_param': {
-      const r = await readReview(a.algorithm); r.params = r.params || {}; r.params[a.key] = a.value;
-      const out = await writeReview(a.algorithm, r);
+      const r = await readReview(p, a.algorithm); r.params = r.params || {}; r.params[a.key] = a.value;
+      const out = await writeReview(p, a.algorithm, r);
+      scheduleReload();
       return `set ${a.key} = ${a.value}\n${JSON.stringify(out.params)}`;
     }
     case 'set_comment': {
-      const r = await readReview(a.algorithm); r.comments = r.comments || {};
+      const r = await readReview(p, a.algorithm); r.comments = r.comments || {};
       if (a.text && a.text.trim()) r.comments[a.step] = a.text.trim(); else delete r.comments[a.step];
-      await writeReview(a.algorithm, r);
+      await writeReview(p, a.algorithm, r);
+      scheduleReload();
       return `comment on step ${a.step} ${a.text && a.text.trim() ? 'saved' : 'cleared'}`;
     }
     case 'set_decision': {
       if (!a.answer || !a.answer.trim()) throw new Error('answer is required');
-      const r = await readReview(a.algorithm); r.decisions = r.decisions || {};
-      r.decisions[a.step] = { answer: a.answer.trim(), by: (a.by || 'claude').trim(), at: new Date().toISOString().slice(0, 10) };
-      await writeReview(a.algorithm, r);
+      const r = await readReview(p, a.algorithm); r.decisions = r.decisions || {};
+      r.decisions[a.step] = { answer: a.answer.trim(), by: (a.by || 'assistant').trim(), at: new Date().toISOString().slice(0, 10) };
+      await writeReview(p, a.algorithm, r);
+      scheduleReload();
       return `decided step ${a.step}: ${r.decisions[a.step].answer}`;
     }
     case 'reopen_question': {
-      const r = await readReview(a.algorithm); r.decisions = r.decisions || {};
+      const r = await readReview(p, a.algorithm); r.decisions = r.decisions || {};
       delete r.decisions[a.step];
-      await writeReview(a.algorithm, r);
+      await writeReview(p, a.algorithm, r);
+      scheduleReload();
       return `reopened step ${a.step}`;
     }
 
@@ -720,7 +802,7 @@ async function handleMcp(req, res) {
   return json(res, 200, resp);
 }
 
-// MCP over stdio — how Claude Code launches & manages this server.
+// MCP over stdio — how an MCP client (e.g. Claude Code) launches & manages this server.
 function startStdio() {
   let buf = '';
   process.stdin.setEncoding('utf8');
@@ -748,17 +830,27 @@ function broadcastReload() {
   }
 }
 let reloadTimer = null;
-// watch the project for edits and nudge open tabs to refresh. Skip the app's own
-// review autosaves (content/reviews/) so typing a comment never reloads under you.
+const scheduleReload = () => { clearTimeout(reloadTimer); reloadTimer = setTimeout(broadcastReload, 120); };
+// 1) the app files in this repo (so restyling via set_file refreshes the tab)
 try {
   watch(ROOT, { recursive: true }, (_ev, file) => {
     if (!file) return;
     const f = String(file).split(path.sep).join('/');
-    if (f.startsWith('node_modules/') || f.startsWith('.git/') || f.startsWith('content/reviews/') || f.endsWith('.bak')) return;
-    clearTimeout(reloadTimer);
-    reloadTimer = setTimeout(broadcastReload, 120);
+    if (f.startsWith('node_modules/') || f.startsWith('.git/') || f.endsWith('.bak') || f.includes('.tmp-')) return;
+    scheduleReload();
   });
-} catch (e) { log('live-reload watch unavailable:', e.message); }
+} catch (e) { log('live-reload (app) unavailable:', e.message); }
+// 2) project data in the home dir — authoring (this session OR another) refreshes
+// open tabs. Skip reviews (the app's own autosaves) and atomic-write temp/.bak files.
+try {
+  mkdirSync(PROJECTS_DIR, { recursive: true });
+  watch(PROJECTS_DIR, { recursive: true }, (_ev, file) => {
+    if (!file) return;
+    const f = String(file).split(path.sep).join('/');
+    if (f.includes('/reviews/') || f.endsWith('.bak') || f.includes('.tmp-')) return;
+    scheduleReload();
+  });
+} catch (e) { log('live-reload (data) unavailable:', e.message); }
 
 /* ---------------- REST + static ---------------- */
 async function handleApi(req, res, url) {
@@ -776,48 +868,74 @@ async function handleApi(req, res, url) {
     res.on('error', drop);
     return;   // long-lived connection
   }
-  if (url.pathname === '/api/workflow-review') {
-    if (req.method === 'GET') return json(res, 200, await readWorkflowReview());
-    if (req.method === 'PUT') {
-      if (!isLocalRequest(req)) return json(res, 403, { error: 'local requests only' });
-      try {
-        const obj = JSON.parse(await readBody(req));
-        // single-decision PATCH: { sheet, question, decision } (decision=null → reopen).
-        // The server read-modify-writes ONE key, so a browser answer can't clobber a
-        // decision recorded by MCP (or another tab) since the page loaded.
-        let saved;
-        if (obj && typeof obj.sheet === 'string' && typeof obj.question === 'string') {
-          saved = obj.decision
-            ? await setWorkflowDecision(obj.sheet, obj.question, obj.decision.answer, obj.decision.by)
-            : await reopenWorkflowQuestion(obj.sheet, obj.question);
-        } else {
-          saved = await writeWorkflowReview(obj);   // whole-object replace (back-compat)
-        }
-        return json(res, 200, { ok: true, saved });
-      } catch (e) { return json(res, 400, { error: e.message }); }
+  // Everything below exposes project data (and enumerates projects), so it is
+  // local-only — same defense as the write paths, against a website reading it.
+  if (!isLocalRequest(req)) return json(res, 403, { error: 'local requests only' });
+
+  // the projects this install knows about + which one this server process authors
+  if (url.pathname === '/api/projects') return json(res, 200, { projects: await listProjects(), current: CURRENT_PROJECT });
+
+  // everything else is project-scoped: /api/p/<project>/<resource>
+  const pm = url.pathname.match(/^\/api\/p\/([^/]+)\/(.+)$/);
+  if (pm) {
+    const proj = slug(decodeURIComponent(pm[1]));
+    const rest = pm[2];
+
+    // content reads (the app fetches these instead of static content/ files)
+    if (req.method === 'GET' && rest === 'workflows') return json(res, 200, await readWorkflows(proj));
+    if (req.method === 'GET' && rest === 'index') {
+      try { return json(res, 200, JSON.parse(await fs.readFile(indexPath(proj), 'utf8'))); }
+      catch { return json(res, 200, { algorithms: await listAlgorithms(proj) }); }
     }
-    return json(res, 405, { error: 'GET or PUT' });
-  }
-  const m = url.pathname.match(/^\/api\/review\/([^/]+)$/);
-  if (m) {
-    const id = decodeURIComponent(m[1]);
-    if (!safeId(id)) return json(res, 400, { error: 'invalid algorithm' });
-    if (req.method === 'GET') return json(res, 200, await readReview(id));
-    if (req.method === 'PUT') {
-      if (!isLocalRequest(req)) return json(res, 403, { error: 'local requests only' });
-      try {
-        const obj = JSON.parse(await readBody(req));
-        const out = await writeReview(id, obj);
-        return json(res, 200, { ok: true, saved: out });
-      } catch (e) { return json(res, 400, { error: e.message }); }
+    const am = rest.match(/^algorithm\/([^/]+)$/);
+    if (am && req.method === 'GET') {
+      const id = decodeURIComponent(am[1]);
+      if (!safeId(id)) return json(res, 400, { error: 'invalid algorithm' });
+      try { return json(res, 200, await readAlgorithm(proj, id)); } catch { return json(res, 404, { error: 'not found' }); }
     }
-    return json(res, 405, { error: 'GET or PUT' });
+
+    // workflow review — single-decision PATCH so a browser answer can't clobber a
+    // decision recorded by MCP (or another tab) since the page loaded.
+    if (rest === 'workflow-review') {
+      if (req.method === 'GET') return json(res, 200, await readWorkflowReview(proj));
+      if (req.method === 'PUT') {
+        if (!isLocalRequest(req)) return json(res, 403, { error: 'local requests only' });
+        try {
+          const obj = JSON.parse(await readBody(req));
+          let saved;
+          if (obj && typeof obj.sheet === 'string' && typeof obj.question === 'string') {
+            saved = obj.decision
+              ? await setWorkflowDecision(proj, obj.sheet, obj.question, obj.decision.answer, obj.decision.by)
+              : await reopenWorkflowQuestion(proj, obj.sheet, obj.question);
+          } else { saved = await writeWorkflowReview(proj, obj); }
+          return json(res, 200, { ok: true, saved });
+        } catch (e) { return json(res, 400, { error: e.message }); }
+      }
+      return json(res, 405, { error: 'GET or PUT' });
+    }
+
+    // algorithm review (tuned params + comments + decisions)
+    const rm = rest.match(/^review\/([^/]+)$/);
+    if (rm) {
+      const id = decodeURIComponent(rm[1]);
+      if (!safeId(id)) return json(res, 400, { error: 'invalid algorithm' });
+      if (req.method === 'GET') return json(res, 200, await readReview(proj, id));
+      if (req.method === 'PUT') {
+        if (!isLocalRequest(req)) return json(res, 403, { error: 'local requests only' });
+        try {
+          const obj = JSON.parse(await readBody(req));
+          return json(res, 200, { ok: true, saved: await writeReview(proj, id, obj) });
+        } catch (e) { return json(res, 400, { error: e.message }); }
+      }
+      return json(res, 405, { error: 'GET or PUT' });
+    }
   }
   return json(res, 404, { error: 'not found' });
 }
 
-// top-level paths that must never be served over HTTP (source, VCS, deps, agent config)
-const STATIC_DENY = new Set(['server', '.git', 'node_modules', '.claude']);
+// top-level paths that must never be served over HTTP (source, VCS, deps, agent
+// config, and the demo seed — the app reads project data from /api instead)
+const STATIC_DENY = new Set(['server', '.git', 'node_modules', '.claude', 'content']);
 async function handleStatic(req, res, url) {
   let rel = decodeURIComponent(url.pathname);
   if (rel === '/') rel = '/index.html';
@@ -886,9 +1004,14 @@ server.on('error', async (e) => {
   }
 });
 
+// make sure this session's project exists (so it appears in the picker), seeding
+// demos only when WORKFLOW_ATLAS_SEED is set.
+ensureDirs(CURRENT_PROJECT).catch(() => {});
+
 server.listen(activePort, HOST, () => {
-  log(`atlas → http://localhost:${activePort}/  (app: /algorithms.html · REST: /api · MCP: /mcp + stdio)`);
+  log(`atlas → http://localhost:${activePort}/  (app · REST: /api · MCP: /mcp + stdio)`);
+  log(`project "${CURRENT_PROJECT}" · data in ${ATLAS_HOME}`);
 });
 
-// always accept MCP over stdio (active when Claude Code spawns us; harmless otherwise)
+// always accept MCP over stdio (active when an MCP client spawns us; harmless otherwise)
 startStdio();

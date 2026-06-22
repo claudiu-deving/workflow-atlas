@@ -7,21 +7,21 @@ Two tools for thinking and communicating about software, in one tiny app:
    behaves, with editable parameters and per-step comments, so an idea lands as a
    moving picture instead of a wall of prose.
 
-A **zero-dependency local server** serves the app and gives an AI coding
-assistant an **MCP authoring surface**: it can create and edit the algorithm
-storyboards, the workflow maps, and even the CSS/HTML styling — so when the
-assistant proposes an algorithm it can *show* you a moving picture instead of a
-wall of prose you have to decode. Local-only tooling: a richer back-and-forth
-channel between you and the assistant.
+A **zero-dependency local server** serves the app and gives any AI assistant — over
+**MCP**, so it's not tied to one provider — an authoring surface: it can create and
+edit the algorithm storyboards, the workflow maps, and even the CSS/HTML styling,
+so when the assistant proposes an algorithm it can *show* you a moving picture
+instead of a wall of prose. One install serves **many projects and parallel
+sessions**: each project's content lives in a home directory, and the server routes
+each session to its own project automatically (see [Projects](#projects)).
 
 Open source under the **MIT License** (see `LICENSE`). No build step, no npm
 install, no framework — plain HTML/CSS/JS and Node built-ins.
 
-> The bundled examples are **demo content**: two workflow maps of the tool's own
-> internals — the **authoring loop** (how a described algorithm becomes a moving
-> storyboard) and **boot & serve** (how the server runs) — plus classic-algorithm
-> storyboards (binary search, bubble sort, Euclid's GCD). Replace the JSON under
-> `content/` with your own (or have the assistant do it over MCP).
+> New projects start **empty**, so demos never mix with real work. To populate a
+> fresh project with the bundled **demo content** (the authoring-loop and boot &
+> serve maps, plus binary search / bubble sort / Euclid's GCD storyboards), run the
+> server once with `WORKFLOW_ATLAS_SEED=1`.
 
 ## Run
 
@@ -31,22 +31,17 @@ Zero install (Node ≥ 20). From this folder:
 npm start                  # → http://localhost:5174/   (or: node server/server.mjs)
 ```
 
-**With Claude Code**, you don't start it yourself — the project `.mcp.json`
-registers the server so Claude Code spawns and manages it for you (one-time:
-approve it when prompted). The same process serves the app at
-http://localhost:5174/ and gives the assistant the MCP tools.
+Works with **any MCP client**. With **Claude Code** you don't start it yourself —
+a project `.mcp.json` registers the server so the client spawns and manages it
+(one-time: approve it when prompted). Any other MCP client can launch
+`node server/server.mjs` over stdio just the same. The one process serves the app
+and exposes the MCP tools.
 
-Read-only fallback (any static server, no autosave):
-
-```bash
-python -m http.server 8080   # → http://localhost:8080
-```
-
-(A server is needed because the app fetches its content (`content/*.json`) over
-HTTP, which the browser blocks over `file://`.) With the server running the open
-tab **live-reloads** whenever a file changes — edit a spec, a workflow, or the
-CSS and the page refreshes itself (the app's own review autosaves are excluded,
-so typing a comment never reloads under you).
+The open tab **live-reloads** when content changes — author a spec or workflow
+(this session or another) and the page refreshes itself (review autosaves are
+excluded, so typing a comment never reloads under you). A server is **required**:
+the app fetches project data from `/api`, and that data lives in your home dir,
+not in the served folder.
 
 When the assistant **authors** a workflow or storyboard (`save_workflows` /
 `save_algorithm`) and no tab is open yet, the server **opens the app in your
@@ -64,15 +59,35 @@ same-origin — so a website you visit or another host on your network can't dri
 it. It is unauthenticated tooling meant for your own machine; only set
 `ATLAS_HOST` to expose it on another interface if you understand the risk.
 
+## Projects
+
+Every project's content (algorithms, workflow maps, review overlays) is stored
+under a home directory — `~/.workflow-atlas/projects/<project>/` by default,
+override the base with `$WORKFLOW_ATLAS_HOME`. So one install serves many projects,
+and parallel sessions stay isolated.
+
+- **Routing.** Each server process is bound to **one** project: by default the
+  directory it was launched in (so an MCP client opened in repo `acme` authors the
+  `acme` project automatically). Set `$WORKFLOW_ATLAS_PROJECT` to pick one
+  explicitly. The UI has a **project switcher** (top-left) to view any project, and
+  the active project shows in the browser tab title.
+- **Isolation & concurrency.** Different-project sessions never contend; writes are
+  atomic (temp-file + rename) so a torn write or two same-project sessions can't
+  corrupt a file. The destructive `save_workflows` (replace-all) snapshots the prior
+  file to `workflows.json.bak` first.
+- **Seeding.** New projects start empty; `WORKFLOW_ATLAS_SEED=1` copies the bundled
+  demos into a fresh project.
+
 ## Edit
 
-All content is **JSON under `content/`** — no diagram syntax, no code. Edit the
-files directly, or have the assistant write them over MCP; changes show on
-reload. For workflows, prefer the **per-sheet/per-station** tools (`save_sheet`,
-`delete_sheet`, `reorder_sheets`, `set_station`, `delete_station`) over the
-replace-all `save_workflows` — they edit one piece without resending the rest.
+All content is **JSON** — no diagram syntax, no code — stored per project under
+`$WORKFLOW_ATLAS_HOME` (see [Projects](#projects)) and edited through the **MCP
+tools** (the assistant authors it; changes show on reload). For workflows, prefer
+the **per-sheet/per-station** tools (`save_sheet`, `delete_sheet`, `reorder_sheets`,
+`set_station`, `delete_station`) over the replace-all `save_workflows` — they edit
+one piece without resending the rest.
 
-Workflow maps live in **`content/workflows.json`** (`{ sheets: [...] }`):
+A workflow map is a set of sheets (`{ sheets: [...] }`):
 
 - A **sheet** is `{ id, code, name, title, sub, stations: [...] }`; add one and
   it appears in the left index automatically. `code` is a **short badge**
@@ -94,8 +109,8 @@ short string, a bad `status`, and non-string `detail.open/in/out` (and
 no matching station, an open question whose exact text repeats within a sheet).
 Deleting a sheet **keeps** its recorded decisions, so re-creating the same id later
 recovers them. The destructive `save_workflows` (replace-all) snapshots the prior
-file to `content/workflows.json.bak` first, so an accidental reset is recoverable
-until the next replace-all.
+file to the project's `workflows.json.bak` first, so an accidental reset is
+recoverable until the next replace-all.
 
 ## Algorithm storyboards
 
@@ -105,8 +120,8 @@ in prose. The stage shows the data (an array of value cells, or a worksheet),
 the pseudocode highlights the active line, and the narration explains each step
 — synced to a play / step / scrub transport (← → to step, space to play).
 
-Each storyboard is a **JSON spec** in `content/algorithms/<id>.json` —
-auto-discovered via `content/index.json`, no registration step. A spec is:
+Each storyboard is a **JSON spec** (authored with `save_algorithm`, auto-discovered
+— no registration step). A spec is:
 
 ```jsonc
 {
@@ -127,14 +142,14 @@ Instead of `steps`, a spec may set `"builtin": "<name>"` + `"data"` to be driven
 live by a built-in generator in `shared/generators.js` (the bundled binary
 search, bubble sort, and Euclid demos use this — change a param and the whole
 walk re-runs). Authored storyboards just use `steps`. Add one with the
-`save_algorithm` MCP tool, or by dropping a JSON file in `content/algorithms/`.
+`save_algorithm` MCP tool.
 
 ### Tuned params, comments & decisions — the review overlay
 
 Your layer over a storyboard — tuned params, per-step comments, and recorded
-decisions — is a separate file: `content/reviews/<id>.json`. With the server
-running the app **autosaves** to it as you edit and reloads it as the baseline
-next time. (Without a server, edits stay in the browser only.)
+decisions — lives beside the spec in the project's `reviews/<id>.json`. With the
+server running the app **autosaves** to it as you edit and reloads it as the
+baseline next time. (Offline, edits stay in the browser only.)
 
 ### Open questions → decisions
 
@@ -150,21 +165,21 @@ artifact and the decision can't drift apart.
 ### Server + MCP — so the assistant shares the same data
 
 `server/server.mjs` is one zero-dependency process that serves the app, persists
-reviews over REST, and speaks **MCP** — over **stdio** (how Claude Code launches
-it) *and* at `/mcp` over HTTP (for manual testing). Tools:
+reviews over REST, and speaks **MCP** — over **stdio** (how an MCP client like
+Claude Code launches it) *and* at `/mcp` over HTTP (for manual testing). Every tool
+acts on the session's project. Tools:
 
 - **Read** — `list_algorithms`, `get_algorithm`, `get_workflows`, `get_sheet`,
   `get_review`, `get_workflow_review`, `list_open_questions`
 - **Author algorithms** — `save_algorithm`, `delete_algorithm`
 - **Author workflows** — `save_sheet` / `delete_sheet` / `reorder_sheets` and
   `set_station` / `delete_station` (per-piece upserts; preferred), or
-  `save_workflows` (replace-all) → write `content/workflows.json`
+  `save_workflows` (replace-all)
 - **Review / decisions** — `set_param`, `set_comment`, `set_decision`,
   `reopen_question` (algorithms); `set_workflow_decision`,
   `reopen_workflow_question` (workflow open questions)
 - **The look** — `list_files`, `get_file`, `set_file` → read/overwrite the raw
-  CSS / HTML / JS at the project root (`server/` and `content/` are off-limits —
-  use the content tools for those)
+  CSS / HTML / JS that style the app (project data is edited with the content tools)
 
 So the loop is: the assistant proposes an algorithm → it builds the storyboard
 with `save_algorithm` → you watch it run and leave a comment or decision → the
@@ -181,9 +196,9 @@ told to re-read). It fires **per unit** — answering one sheet doesn't wait on 
 others, and the bundled demo questions never block it — and only once per
 answered state.
 
-Because you normally run Claude Code in *another* project (the Atlas server is an
-MCP tool), wire it in your **user** settings with the **absolute** path to the
-script — the script finds Atlas's `content/` relative to itself:
+Wire it in your **user** settings with the **absolute** path to the script. It
+reads the same project the server bound to — derived from the directory Claude Code
+is open in, under `$WORKFLOW_ATLAS_HOME` — so it works from any repo:
 
 ```json
 { "hooks": { "UserPromptSubmit": [ { "hooks": [
@@ -191,18 +206,14 @@ script — the script finds Atlas's `content/` relative to itself:
 ] } ] } }
 ```
 
-Set `ATLAS_CONTENT_DIR` if your content lives elsewhere, and `ATLAS_HOOK_DEBUG=1`
-to print why it did/didn't fire to stderr. It never blocks your prompt.
+`ATLAS_HOOK_DEBUG=1` prints why it did/didn't fire (and which project) to stderr;
+`ATLAS_CONTENT_DIR` overrides the project path. It never blocks your prompt.
 
-**Claude Code manages the process.** A project `.mcp.json` runs the server as a
-stdio MCP server (`node server/server.mjs`), so Claude Code spawns it every
-session — you never start it by hand. One-time: **reload the session** (so
-`.mcp.json` is read) and **approve** the server when prompted. After that the
-tools are available and the app is live at http://localhost:5174/.
-
-(Approval is Claude Code's security boundary — it can't be auto-granted. If the
-server doesn't appear or won't connect, tell me; some builds want a different
-transport key.)
+**If your client is Claude Code**, a project `.mcp.json` runs the server as a stdio
+MCP server, so it's spawned every session — you never start it by hand. One-time:
+**reload the session** (so `.mcp.json` is read) and **approve** the server when
+prompted. Other MCP clients register `node server/server.mjs` however they spawn
+stdio servers.
 
 ## Files
 
@@ -214,18 +225,25 @@ workflow-atlas/
   app.js                 workflow renderer (sheets, stations, loops, callout)
   storyboard.js          algorithm player (loads specs, replay, transport)
   shared/generators.js   built-in algorithm generators (browser + server)
-  content/
-    index.json           discovery manifest (server rewrites on save/delete)
-    workflows.json       workflow maps          ← content tools edit these
-    algorithms/*.json    algorithm storyboards
-    reviews/*.json       tuned params + comments + decisions (server writes)
+  shared/project.js      active-project resolution + switcher (browser)
+  scripts/
+    atlas-review-hook.mjs  optional Claude Code UserPromptSubmit hook
+  content/               bundled demo seed (copied into a project on WORKFLOW_ATLAS_SEED=1)
   server/server.mjs      zero-dep Node server: static + REST + MCP (stdio + /mcp)
   package.json           npm start, metadata (zero dependencies)
   .mcp.json              registers the server for Claude Code
   LICENSE                MIT
+
+~/.workflow-atlas/       project DATA (override with $WORKFLOW_ATLAS_HOME)
+  projects/<project>/
+    workflows.json       workflow maps
+    algorithms/*.json    algorithm storyboards
+    index.json           discovery manifest (server rewrites on save/delete)
+    reviews/*.json       tuned params + comments + decisions (server writes)
 ```
 
-`.mcp.json` registers the server with Claude Code for *this* repo:
+`.mcp.json` registers the server (Claude Code's format; any MCP client can spawn
+`node server/server.mjs` over stdio):
 
 ```json
 { "mcpServers": { "workflow-atlas": { "command": "node", "args": ["server/server.mjs"] } } }
