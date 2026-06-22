@@ -32,7 +32,7 @@ const PORT = Number(process.env.PORT) || 5174;
 const HOST = process.env.ATLAS_HOST || '127.0.0.1';
 let activePort = PORT;          // the port the UI is actually reachable on (may shift if PORT is taken)
 let uiServedElsewhere = false;  // another atlas instance already owns the port — we're a stdio worker
-let lastOpenedAt = 0;           // debounce auto-opening the browser
+let hasAutoOpened = false;      // auto-open the browser at most once per server run
 // logs MUST go to stderr — stdout is reserved for the MCP stdio protocol
 const log = (...a) => console.error('[workflow-atlas]', ...a);
 const BUILTINS = new Set(Object.keys(GENERATORS));
@@ -43,15 +43,16 @@ const BUILTIN_REQUIRES = {
   'euclid-gcd': { array: false, params: ['a', 'b'] },
 };
 
-// open the app in the user's default browser — but only when no live tab is
-// already connected (the live-reload SSE refreshes those), so authoring doesn't
-// spawn a pile of tabs. Disable entirely with ATLAS_NO_OPEN=1 (e.g. headless/CI).
+// open the app in the user's default browser — but ONCE per server run, and only
+// if no live tab is already connected. After the first open, further authoring
+// just live-reloads the open tab; if you closed it, reopen the URL yourself. This
+// keeps editing from spawning a tab on every save. Disable entirely with
+// ATLAS_NO_OPEN=1 (e.g. headless/CI).
 function openInBrowser(urlPath) {
   if (process.env.ATLAS_NO_OPEN) return;
+  if (hasAutoOpened) return;                          // already opened once this run
   if (reloadClients.size > 0) return;                 // a tab is open and will live-reload itself
-  const now = Date.now();
-  if (now - lastOpenedAt < 4000) return;              // collapse a burst of saves into one open
-  lastOpenedAt = now;
+  hasAutoOpened = true;
   const url = `http://localhost:${activePort}${urlPath || '/'}`;
   try {
     const p = process.platform;
