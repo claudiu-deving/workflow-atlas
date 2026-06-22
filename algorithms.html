@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Workflow Atlas · Algorithm Storyboards</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;450;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="frame">
+    <aside class="titleblock">
+      <div class="tb-mark">
+        <span class="tb-logo">▚</span>
+        <div>
+          <div class="tb-name">WORKFLOW ATLAS</div>
+          <div class="tb-sub">Algorithm Storyboards</div>
+        </div>
+      </div>
+
+      <div class="switch">
+        <a href="index.html">Workflows</a>
+        <a href="algorithms.html" class="on">Algorithms</a>
+      </div>
+
+      <nav class="index" id="alg-index" aria-label="Algorithms"></nav>
+
+      <div class="tb-foot">
+        <div class="legend">
+          <span class="lg"><i class="dot done"></i>accepted — in the run</span>
+          <span class="lg"><i class="dot reject"></i>rejected — fails a test</span>
+          <span class="lg"><i class="dot idle"></i>untested</span>
+        </div>
+        <div class="tb-scale">HAND-AUTHORED TRACE · ← → STEP · SPACE PLAY</div>
+      </div>
+    </aside>
+
+    <main class="sheet alg" id="sheet">
+      <header class="sheet-head">
+        <div class="sh-eyebrow"><span id="alg-eyebrow-code">ALG-01</span><span class="sh-rule"></span><span class="sh-hint">tolerances are editable →</span></div>
+        <h1 id="alg-title"></h1>
+        <p class="sh-sub" id="alg-sub"></p>
+        <a class="backlink" id="alg-backlink" hidden></a>
+      </header>
+
+      <div class="params" id="alg-params"></div>
+
+      <section class="story">
+        <div class="stage-wrap"><div class="stage" id="alg-stage"></div></div>
+
+        <aside class="story-side">
+          <div class="pane">
+            <div class="pane-h">pseudocode</div>
+            <div class="code" id="alg-code"></div>
+          </div>
+          <div class="pane narr">
+            <div class="pane-h">what’s happening</div>
+            <p class="note" id="alg-note"></p>
+            <p class="verdict" id="alg-verdict"></p>
+          </div>
+        </aside>
+      </section>
+
+      <div class="transport">
+        <div class="tport-btns">
+          <button id="alg-restart" title="Restart">↺</button>
+          <button id="alg-prev" title="Previous (←)">◀</button>
+          <button id="alg-play" class="play" title="Play / pause (space)">▶</button>
+          <button id="alg-next" title="Next (→)">▶</button>
+          <span class="counter" id="alg-counter">01 / 01</span>
+        </div>
+        <div class="scrub" id="alg-scrub"></div>
+      </div>
+
+      <div class="pane question-pane" id="alg-question-pane" hidden>
+        <div class="pane-h">open question <span class="cmt-step" id="alg-question-step"></span></div>
+        <p class="question-text" id="alg-question-text"></p>
+        <div class="decision" id="alg-decision"></div>
+      </div>
+
+      <div class="pane comment-pane">
+        <div class="pane-h">comment <span class="cmt-step" id="alg-comment-step"></span></div>
+        <textarea id="alg-comment" class="comment" rows="2" placeholder="Leave a note on this step — saved in your browser, marked on the timeline."></textarea>
+      </div>
+
+      <div class="review-bar">
+        <span class="review-hint" id="alg-status">Connecting…</span>
+      </div>
+    </main>
+  </div>
+
+  <script type="module" src="storyboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Workflow Atlas</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;450;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="frame">
+    <!-- Title block / sheet index -->
+    <aside class="titleblock">
+      <div class="tb-mark">
+        <span class="tb-logo">▚</span>
+        <div>
+          <div class="tb-name">WORKFLOW ATLAS</div>
+          <div class="tb-sub">Workflows</div>
+        </div>
+      </div>
+
+      <div class="switch">
+        <a href="index.html" class="on">Workflows</a>
+        <a href="algorithms.html">Algorithms</a>
+      </div>
+
+      <nav class="index" id="index" aria-label="Sheets"></nav>
+
+      <div class="tb-foot">
+        <div class="legend" id="legend">
+          <span class="lg"><i class="dot done"></i>done — in the app</span>
+          <span class="lg"><i class="dot partial"></i>partial — exists in pieces</span>
+          <span class="lg"><i class="dot todo"></i>to build</span>
+        </div>
+        <div class="tb-scale">RC&nbsp;BEAM&nbsp;MILESTONE · 6&nbsp;SHEETS</div>
+      </div>
+    </aside>
+
+    <!-- Sheet -->
+    <main class="sheet" id="sheet">
+      <header class="sheet-head">
+        <div class="sh-eyebrow"><span id="sh-code">SH-00</span><span class="sh-rule"></span><span id="sh-count"></span></div>
+        <h1 id="sh-title"></h1>
+        <p class="sh-sub" id="sh-sub"></p>
+      </header>
+      <section class="flow" id="flow"></section>
+    </main>
+
+    <!-- Drawing callout / detail -->
+    <aside class="callout" id="callout" aria-hidden="true">
+      <button class="callout-close" id="callout-close" aria-label="Close detail">✕</button>
+      <div class="callout-body" id="callout-body"></div>
+    </aside>
+    <div class="scrim" id="scrim"></div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+{
+  "$schema": "storyboard-review",
+  "algorithm": "shear-design",
+  "savedAt": "2026-06-21",
+  "params": {
+    "V_Ed": 85,
+    "bw": 300,
+    "d": 540,
+    "fck": 30,
+    "fyk": 500,
+    "Asl": 942,
+    "link": 8,
+    "legs": 2
+  },
+  "comments": {},
+  "decisions": {
+    "6": {
+      "answer": "Economical one.",
+      "by": "demo",
+      "at": "2026-06-21"
+    }
+  }
+}
