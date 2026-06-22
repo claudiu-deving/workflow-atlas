@@ -6,10 +6,76 @@ const flow = $('flow');
 const indexNav = $('index');
 const callout = $('callout');
 const scrim = $('scrim');
+const frame = document.querySelector('.frame');
 const STATUS_LABEL = { done: 'done', partial: 'partial', todo: 'to build' };
 
 let SHEETS = [];
 let current = null;
+let lastCallout = null;   // { st, idx } so answering a question can re-render the panel in place
+
+/* ---------- workflow review (decisions on station open[] questions) ---------- */
+let wfReview = { decisions: {} };       // sheetId → { [question text]: { answer, by, at } }
+let wfHasServer = false;
+const AUTHOR_KEY = 'workflow-atlas.author';
+const today = () => new Date().toISOString().slice(0, 10);
+const getAuthor = () => { try { return localStorage.getItem(AUTHOR_KEY) || ''; } catch { return ''; } };
+const wfDecisions = (sheetId) => (wfReview.decisions && wfReview.decisions[sheetId]) || {};
+
+async function loadWorkflowReview() {
+  wfReview = { decisions: {} }; wfHasServer = false;
+  try {
+    const res = await fetch('/api/workflow-review', { cache: 'no-store' });
+    if (res.ok) { wfReview = await res.json(); wfHasServer = true; }
+  } catch { /* server not running */ }
+  if (!wfHasServer) {
+    // static fallback: prefer the committed sidecar; only fall back to the local
+    // draft when there is no sidecar, so a committed update never loses to a stale
+    // localStorage snapshot.
+    let loadedSidecar = false;
+    try { const r = await fetch('content/reviews/_workflows.json', { cache: 'no-store' }); if (r.ok) { wfReview = await r.json(); loadedSidecar = true; } } catch { /* no sidecar */ }
+    if (!loadedSidecar) {
+      try { const d = JSON.parse(localStorage.getItem('workflow-atlas.wfreview') || 'null'); if (d) wfReview = d; } catch { /* ignore */ }
+    }
+  }
+  wfReview.decisions = wfReview.decisions || {};
+}
+// send ONE decision change so the server can merge it; it can't clobber a decision
+// recorded elsewhere since the page loaded. Reconcile local state with the result.
+async function persistWfChange(patch) {
+  try { localStorage.setItem('workflow-atlas.wfreview', JSON.stringify(wfReview)); } catch { /* ignore */ }
+  if (!wfHasServer) return;
+  try {
+    const res = await fetch('/api/workflow-review', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+    if (res.ok) { const j = await res.json(); if (j && j.saved && j.saved.decisions) wfReview = j.saved; }   // authoritative merged state
+  } catch { /* offline — local optimistic state stands */ }
+}
+function wfDecide(sheetId, question, answer, by) {
+  // optimistic local update for an instant re-render, then persist the single change
+  wfReview.decisions = wfReview.decisions || {};
+  wfReview.decisions[sheetId] = wfReview.decisions[sheetId] || {};
+  wfReview.decisions[sheetId][question] = { answer, by: by || 'you', at: today() };
+  persistWfChange({ sheet: sheetId, question, decision: { answer, by: by || 'you' } });
+}
+function wfReopen(sheetId, question) {
+  if (wfReview.decisions && wfReview.decisions[sheetId]) delete wfReview.decisions[sheetId][question];
+  persistWfChange({ sheet: sheetId, question, decision: null });
+}
+// unanswered open questions for a station — spine detail AND fan-track detail
+function stationOpenCount(st, sheetId) {
+  const dec = wfDecisions(sheetId);
+  const qs = [...((st.detail && st.detail.open) || [])];
+  for (const t of (st.fan && st.fan.tracks) || []) qs.push(...((t.detail && t.detail.open) || []));
+  return qs.filter((q) => !dec[q]).length;
+}
+const badgeHtml = (n) => (n ? ` · <span class="q">${n} open question${n > 1 ? 's' : ''}</span>` : '');
+// after a decision changes, refresh every card's open-question badge in place
+function refreshBadges() {
+  if (!current) return;
+  (current.stations || []).forEach((st, idx) => {
+    const span = flow.querySelector(`.station[data-idx="${idx}"] .has-detail`);
+    if (span) span.innerHTML = `view callout${badgeHtml(stationOpenCount(st, current.id))}`;
+  });
+}
 
 /* ---------- sheet index (title block) ---------- */
 function buildIndex() {
@@ -29,6 +95,7 @@ async function boot() {
     const res = await fetch('content/workflows.json', { cache: 'no-store' });
     if (res.ok) SHEETS = (await res.json()).sheets || [];
   } catch { /* no content */ }
+  await loadWorkflowReview();
   buildIndex();
   if (!SHEETS.length) return;
   const start = SHEETS.findIndex((s) => s.id === location.hash.slice(1));
@@ -72,7 +139,7 @@ function select(i) {
     el.style.animationDelay = `${k * 55}ms`;
   });
 
-  requestAnimationFrame(() => drawLoops(s, svg));
+  scheduleLoopRedraw(1100);   // redraw through the staggered entrance animation
 }
 
 function linkEl() {
@@ -96,14 +163,14 @@ function stationEl(st, idx) {
   const card = document.createElement('div');
   card.className = 'card';
   card.tabIndex = 0;
-  const openCount = st.detail?.open?.length || 0;
+  const openCount = stationOpenCount(st, current && current.id);   // unanswered, incl. fan tracks
   card.innerHTML = `
     <div class="card-top">
       <h3>${esc(st.title)}</h3>
       <span class="chip ${esc(st.status || 'todo')}">${STATUS_LABEL[st.status] || esc(st.status || 'todo')}</span>
     </div>
     ${st.sub ? `<p class="sub">${esc(st.sub)}</p>` : ''}
-    ${st.detail ? `<span class="has-detail">view callout${openCount ? ` · <span class="q">${openCount} open question${openCount > 1 ? 's' : ''}</span>` : ''}</span>` : ''}
+    ${st.detail ? `<span class="has-detail">view callout${badgeHtml(openCount)}</span>` : ''}
   `;
   if (st.detail) {
     const open = () => openCallout(st, idx);
@@ -167,8 +234,12 @@ function drawLoops(s, svg) {
 
   (s.stations || []).forEach((st, idx) => {
     if (!st.loop) return;
+    // loop.to is a station index, or the title of a target station (survives reorder)
+    const target = typeof st.loop.to === 'string'
+      ? (s.stations || []).findIndex((x) => x && x.title === st.loop.to)
+      : st.loop.to;
     const from = stations[idx];
-    const to = stations[st.loop.to];
+    const to = stations[target];
     if (!from || !to) return;
     const fr = from.getBoundingClientRect();
     const tr = to.getBoundingClientRect();
@@ -194,7 +265,9 @@ function drawLoops(s, svg) {
 
 /* ---------- callout panel ---------- */
 function openCallout(st, idx) {
+  lastCallout = { st, idx };
   const d = st.detail || {};
+  const sheetId = current && current.id;
   const status = st.status || 'todo';
   const parts = [`<div class="co-tag" style="color:var(--${esc(status)})">${(idx !== null && idx !== undefined) ? `STEP ${String(idx + 1).padStart(2, '0')} · ` : ''}${STATUS_LABEL[st.status] || esc(status)}</div>`,
     `<h2 class="co-title">${esc(st.title)}</h2>`];
@@ -203,18 +276,77 @@ function openCallout(st, idx) {
   if (d.in?.length) parts.push(block('Takes in', `<ul class="io">${d.in.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`));
   if (d.out?.length) parts.push(block('Produces', `<ul class="io out">${d.out.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`));
   if (d.note) parts.push(block('Where it stands', `<p class="co-note">${esc(d.note)}</p>`));
-  if (d.open?.length) parts.push(block('Open questions', `<ul class="co-open">${d.open.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`));
+  if (d.open?.length) parts.push(block('Open questions', `<ul class="co-qs">${d.open.map((q, i) => wfQuestionItem(sheetId, q, i)).join('')}</ul>`));
   if (st.algorithm) parts.push(`<a class="co-algo" href="algorithms.html#${esc(st.algorithm)}"><span class="play">▶</span> Watch the algorithm storyboard</a>`);
 
   $('callout-body').innerHTML = parts.join('');
+  if (d.open?.length && sheetId) wireWfDecisions(sheetId, d.open);
   callout.classList.add('open');
   callout.setAttribute('aria-hidden', 'false');
   scrim.classList.add('open');
+  frame.classList.add('callout-open');   // wide screens: reserve a column so the map pushes clear
+  scheduleLoopRedraw();
+}
+
+// Loop arcs are positioned from live getBoundingClientRect, so they must be
+// (re)drawn after layout settles — the staggered entrance animation AND the
+// panel-mode reflow both move the endpoints. Redraw every frame until `ms`
+// elapses; concurrent calls just extend the window (one rAF loop, no stacking).
+function redrawLoops() { const svg = flow.querySelector('.loops'); if (current && svg) drawLoops(current, svg); }
+let _redrawUntil = 0, _redrawing = false;
+function scheduleLoopRedraw(ms = 350) {
+  _redrawUntil = Math.max(_redrawUntil, performance.now() + ms);
+  setTimeout(redrawLoops, ms);   // guaranteed settle-draw even if rAF is throttled (background tab)
+  if (_redrawing) return;
+  _redrawing = true;
+  const tick = () => {
+    redrawLoops();
+    if (performance.now() < _redrawUntil) requestAnimationFrame(tick);
+    else _redrawing = false;
+  };
+  requestAnimationFrame(tick);
+}
+
+// one open question: a recorded decision (with reopen), or a form to answer it
+function wfQuestionItem(sheetId, q, i) {
+  const dec = wfDecisions(sheetId)[q];
+  const body = dec
+    ? `<div class="decided">
+         <div class="decided-head">✓ DECIDED${dec.at ? ` · ${esc(dec.at)}` : ''}${dec.by ? ` · ${esc(dec.by)}` : ''}</div>
+         <p class="decided-answer">${esc(dec.answer)}</p>
+         <button class="reopen" type="button" data-i="${i}">Reopen</button>
+       </div>`
+    : `<div class="decision">
+         <textarea class="answer" data-i="${i}" rows="2" placeholder="Record the decision that resolves this…"></textarea>
+         <div class="decide-row">
+           <input class="author" type="text" placeholder="your name" value="${esc(getAuthor())}" />
+           <button class="decide" type="button" data-i="${i}">Mark decided</button>
+         </div>
+       </div>`;
+  return `<li class="co-q${dec ? ' is-decided' : ''}"><div class="co-q-text">${esc(q)}</div>${body}</li>`;
+}
+function wireWfDecisions(sheetId, questions) {
+  const body = $('callout-body');
+  const rerender = () => { refreshBadges(); if (lastCallout) openCallout(lastCallout.st, lastCallout.idx); };
+  body.querySelectorAll('.decide').forEach((btn) => btn.addEventListener('click', () => {
+    const li = btn.closest('.co-q');
+    const answer = li.querySelector('.answer').value.trim();
+    if (!answer) { li.querySelector('.answer').focus(); return; }
+    const by = li.querySelector('.author').value.trim();
+    try { if (by) localStorage.setItem(AUTHOR_KEY, by); } catch { /* ignore */ }
+    wfDecide(sheetId, questions[+btn.dataset.i], answer, by);
+    rerender();
+  }));
+  body.querySelectorAll('.reopen').forEach((btn) => btn.addEventListener('click', () => {
+    wfReopen(sheetId, questions[+btn.dataset.i]);
+    rerender();
+  }));
 }
 function closeCallout() {
   callout.classList.remove('open');
   callout.setAttribute('aria-hidden', 'true');
   scrim.classList.remove('open');
+  if (frame.classList.contains('callout-open')) { frame.classList.remove('callout-open'); scheduleLoopRedraw(); }
 }
 function block(h, inner) { return `<div class="co-block"><div class="co-h">${h}</div>${inner}</div>`; }
 

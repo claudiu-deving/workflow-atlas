@@ -27,12 +27,19 @@ the visuals; don't just describe them.
 
 ## MCP tools
 
-- **Read** — `list_algorithms`, `get_algorithm`, `get_workflows`, `get_review`,
-  `list_open_questions`
-- **Author content** — `save_algorithm` (create/replace a storyboard from a JSON
-  spec), `delete_algorithm`, `save_workflows`
+- **Read** — `list_algorithms`, `get_algorithm`, `get_workflows`, `get_sheet`,
+  `get_review`, `get_workflow_review`, `list_open_questions`
+- **Author algorithms** — `save_algorithm` (create/replace a storyboard from a
+  JSON spec), `delete_algorithm`
+- **Author workflows** — `save_sheet`/`delete_sheet`/`reorder_sheets` and
+  `set_station`/`delete_station` upsert ONE piece by id/index (preferred); or
+  `save_workflows` replaces all sheets. A sheet's `code` is a SHORT badge
+  (`"WA-01"`), not pseudocode; `loop.to` may be a station index or a target
+  station's title.
 - **Review / decisions** — `set_param`, `set_comment`, `set_decision`,
-  `reopen_question`
+  `reopen_question` (algorithms); `set_workflow_decision`,
+  `reopen_workflow_question` answer a station's `open[]` question (by sheet id +
+  exact question text)
 - **The look** — `list_files`, `get_file`, `set_file` (raw CSS/HTML/JS at the
   project root; `server/` and `content/` are off-limits)
 
@@ -45,7 +52,8 @@ demo for a worked example, and `README.md` for the full frame/row shapes.
 
 - **Storyboards** → `content/algorithms/<id>.json` (auto-discovered; no
   registration). Use `save_algorithm`.
-- **Workflow maps** → `content/workflows.json`. Use `save_workflows`.
+- **Workflow maps** → `content/workflows.json`. Use `save_sheet`/`set_station`
+  (per-piece) or `save_workflows` (replace-all).
 - **Review overlay** (tuned params / comments / decisions) →
   `content/reviews/<id>.json`. Use the review tools; don't hand-edit while the
   app is autosaving.

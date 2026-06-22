@@ -154,15 +154,171 @@ async function readQuestions(id) {
 }
 
 /* ---------------- workflow store ---------------- */
+const STATUSES = new Set(['done', 'partial', 'todo']);
+const MAX_CODE = 16;   // a sheet's `code` is a short badge ("WA-00"), not pseudocode
+
+// detail.in/out/open are arrays of strings; open[] questions are decision KEYS,
+// so a non-string here would silently break answering — reject it at the door.
+function validateDetail(detail, where) {
+  if (detail == null) return;
+  if (typeof detail !== 'object' || Array.isArray(detail)) throw new Error(`${where}.detail must be an object`);
+  for (const key of ['in', 'out', 'open']) {
+    const arr = detail[key];
+    if (arr == null) continue;
+    if (!Array.isArray(arr)) throw new Error(`${where}.detail.${key} must be an array of strings`);
+    arr.forEach((x, i) => { if (typeof x !== 'string') throw new Error(`${where}.detail.${key}[${i}] must be a string`); });
+  }
+}
+// A station may appear as a spine node or a fan track; both share title/status.
+function validateStation(st, where = 'station') {
+  if (!st || typeof st !== 'object' || Array.isArray(st)) throw new Error(`${where} must be an object`);
+  if (!st.title || typeof st.title !== 'string') throw new Error(`${where}.title is required (a string)`);
+  if (st.status != null && !STATUSES.has(st.status)) throw new Error(`${where}.status must be one of: ${[...STATUSES].join(', ')}`);
+  validateDetail(st.detail, where);
+  if (st.loop != null) {
+    if (typeof st.loop !== 'object' || (typeof st.loop.to !== 'number' && typeof st.loop.to !== 'string'))
+      throw new Error(`${where}.loop must be { to: <station index or title>, label? }`);
+  }
+  if (st.fan != null) {
+    if (typeof st.fan !== 'object' || !Array.isArray(st.fan.tracks)) throw new Error(`${where}.fan must be { tracks: [...] }`);
+    st.fan.tracks.forEach((t, i) => {
+      if (!t || typeof t !== 'object') throw new Error(`${where}.fan.tracks[${i}] must be an object`);
+      if (!t.title || typeof t.title !== 'string') throw new Error(`${where}.fan.tracks[${i}].title is required`);
+      if (t.status != null && !STATUSES.has(t.status)) throw new Error(`${where}.fan.tracks[${i}].status must be one of: ${[...STATUSES].join(', ')}`);
+      validateDetail(t.detail, `${where}.fan.tracks[${i}]`);
+    });
+  }
+}
+// Guard the `code` overload: on a SHEET it's a short badge, NOT the pseudocode
+// lines[] an algorithm spec carries — a long string/array here breaks the index.
+function validateSheet(sheet) {
+  if (!sheet || typeof sheet !== 'object' || Array.isArray(sheet)) throw new Error('sheet must be an object');
+  if (!safeId(sheet.id)) throw new Error('sheet.id must be a slug: [a-z0-9][a-z0-9-]*');
+  if (sheet.code != null) {
+    if (typeof sheet.code !== 'string') throw new Error('sheet.code is a SHORT badge string like "WA-01" (an algorithm spec\'s "code" is pseudocode lines[] — a different field). Got: ' + (Array.isArray(sheet.code) ? 'array' : typeof sheet.code));
+    if (sheet.code.length > MAX_CODE) throw new Error(`sheet.code is ${sheet.code.length} chars — keep the badge ≤ ${MAX_CODE}; it renders in the index chip`);
+  }
+  if (sheet.name != null && typeof sheet.name !== 'string') throw new Error('sheet.name must be a string');
+  if (sheet.stations != null && !Array.isArray(sheet.stations)) throw new Error('sheet.stations must be an array');
+  (sheet.stations || []).forEach((st, i) => validateStation(st, `stations[${i}]`));
+}
+// non-fatal hints echoed in save responses so the authoring loop is short
+function lintSheets(sheets) {
+  const warn = [];
+  for (const s of sheets || []) {
+    if (!s || typeof s !== 'object') continue;
+    if (typeof s.code === 'string' && s.code.length > 12) warn.push(`sheet ${s.id}: code is ${s.code.length} chars — badges read best ≤ 12`);
+    if (!Array.isArray(s.stations) || !s.stations.length) warn.push(`sheet ${s.id}: has no stations`);
+    for (const st of s.stations || []) {
+      if (st && st.loop && typeof st.loop.to === 'string' && !(s.stations || []).some((x) => x && x.title === st.loop.to))
+        warn.push(`sheet ${s.id}: station "${st.title}" loops to "${st.loop.to}" — no station has that title`);
+    }
+    // decisions are keyed by (sheet, question text), so identical open-question
+    // wording within one sheet collapses to a single decision — warn the author.
+    const seenQ = new Set();
+    const collect = (detail) => { for (const q of (detail && detail.open) || []) { if (typeof q === 'string') { if (seenQ.has(q)) warn.push(`sheet ${s.id}: open question "${q.slice(0, 40)}${q.length > 40 ? '…' : ''}" appears more than once — answering one resolves all (decisions key on question text)`); else seenQ.add(q); } } };
+    for (const st of s.stations || []) { collect(st && st.detail); for (const t of (st && st.fan && st.fan.tracks) || []) collect(t && t.detail); }
+  }
+  return warn;
+}
+// reject the same id appearing twice — every per-sheet tool addresses by id
+function assertUniqueIds(sheets) {
+  const ids = sheets.map((s) => s && s.id);
+  const dup = ids.find((id, i) => id != null && ids.indexOf(id) !== i);
+  if (dup) throw new Error(`duplicate sheet id: ${dup} — sheet ids must be unique`);
+}
+
 async function readWorkflows() {
   try { return JSON.parse(await fs.readFile(WORKFLOWS, 'utf8')); }
   catch { return { sheets: [] }; }
 }
+async function persistWorkflows(sheets) {
+  await fs.writeFile(WORKFLOWS, JSON.stringify({ sheets }, null, 2) + '\n', 'utf8');
+}
 async function writeWorkflows(obj) {
   const sheets = Array.isArray(obj) ? obj : (obj && obj.sheets);
   if (!Array.isArray(sheets)) throw new Error('workflows must be an array of sheets, or { sheets: [...] }');
-  await fs.writeFile(WORKFLOWS, JSON.stringify({ sheets }, null, 2) + '\n', 'utf8');
+  sheets.forEach((s) => validateSheet(s));
+  assertUniqueIds(sheets);
+  await persistWorkflows(sheets);
   return sheets.length;
+}
+async function getSheet(id) {
+  const s = ((await readWorkflows()).sheets || []).find((x) => x && x.id === id);
+  if (!s) throw new Error(`no such sheet: ${id}`);
+  return s;
+}
+// per-sheet upsert — authoring one sheet never resends the rest
+async function saveSheet(sheet) {
+  validateSheet(sheet);
+  const sheets = (await readWorkflows()).sheets || [];
+  const i = sheets.findIndex((s) => s && s.id === sheet.id);
+  const created = i < 0;
+  if (created) sheets.push(sheet); else sheets[i] = sheet;
+  await persistWorkflows(sheets);
+  return { id: sheet.id, created, count: sheets.length, warnings: lintSheets([sheet]) };
+}
+async function deleteSheet(id) {
+  const sheets = (await readWorkflows()).sheets || [];
+  const next = sheets.filter((s) => !(s && s.id === id));
+  if (next.length === sheets.length) throw new Error(`no such sheet: ${id}`);
+  await persistWorkflows(next);
+  // drop the sheet's recorded decisions so a re-created sheet doesn't inherit them
+  const rev = await readWorkflowReview();
+  if (rev.decisions && rev.decisions[id]) { delete rev.decisions[id]; await writeWorkflowReview(rev); }
+  return next.length;
+}
+async function reorderSheets(order) {
+  if (!Array.isArray(order)) throw new Error('order must be an array of sheet ids');
+  const sheets = (await readWorkflows()).sheets || [];
+  const byId = new Map(sheets.filter((s) => s && s.id).map((s) => [s.id, s]));
+  const seen = new Set();
+  const out = [];
+  for (const id of order) { const s = byId.get(id); if (s && !seen.has(id)) { out.push(s); seen.add(id); } }
+  for (const s of sheets) { if (s && !seen.has(s.id)) out.push(s); }   // unlisted sheets keep their order at the end
+  await persistWorkflows(out);
+  return out.map((s) => s.id);
+}
+// station-level edits within one sheet
+async function setStation(sheetId, station, index) {
+  validateStation(station, 'station');
+  const sheets = (await readWorkflows()).sheets || [];
+  const sheet = sheets.find((s) => s && s.id === sheetId);
+  if (!sheet) throw new Error(`no such sheet: ${sheetId}`);
+  sheet.stations = Array.isArray(sheet.stations) ? sheet.stations : [];
+  // validate the index SHAPE before deciding append-vs-replace, so a fractional
+  // or out-of-range index errors instead of silently appending.
+  if (index != null && (!Number.isInteger(index) || index < 0)) throw new Error('index must be a non-negative integer');
+  const len = sheet.stations.length;
+  let at, created;
+  if (index == null || index === len) { sheet.stations.push(station); at = len; created = true; }
+  else if (index < len) { sheet.stations[index] = station; at = index; created = false; }
+  else throw new Error(`index ${index} out of range (0..${len}); pass ${len} to append`);
+  await persistWorkflows(sheets);
+  return { index: at, count: sheet.stations.length, created };
+}
+async function deleteStation(sheetId, index) {
+  const sheets = (await readWorkflows()).sheets || [];
+  const sheet = sheets.find((s) => s && s.id === sheetId);
+  if (!sheet) throw new Error(`no such sheet: ${sheetId}`);
+  const st = Array.isArray(sheet.stations) ? sheet.stations : [];
+  if (!Number.isInteger(index) || index < 0 || index >= st.length) throw new Error(`station index ${index} out of range (0..${st.length - 1})`);
+  const removedTitle = st[index] && st[index].title;
+  st.splice(index, 1);
+  // keep loop.to targets consistent: shift numeric targets past the gap, and drop
+  // any loop (numeric or title-based) that pointed at the station just removed.
+  for (const s of st) {
+    if (!s || !s.loop) continue;
+    if (typeof s.loop.to === 'number') {
+      if (s.loop.to === index) delete s.loop;         // its target is gone
+      else if (s.loop.to > index) s.loop.to -= 1;      // shifted one left
+    } else if (typeof s.loop.to === 'string' && s.loop.to === removedTitle) {
+      delete s.loop;                                   // title target removed
+    }
+  }
+  sheet.stations = st;
+  await persistWorkflows(sheets);
+  return { count: st.length };
 }
 
 /* ---------------- review store (params + comments + decisions) ---------------- */
@@ -182,6 +338,53 @@ async function writeReview(id, obj) {
   };
   await fs.writeFile(reviewPath(id), JSON.stringify(out, null, 2) + '\n', 'utf8');
   return out;
+}
+
+/* ---------------- workflow review (decisions on station open[] questions) ---------------- */
+// One file for the whole map. Decisions are keyed by sheet id + the exact question
+// text (not a station index), so they survive reordering/insertion of stations.
+const WORKFLOW_REVIEW = path.join(REVIEW_DIR, '_workflows.json');
+async function readWorkflowReview() {
+  try { return JSON.parse(await fs.readFile(WORKFLOW_REVIEW, 'utf8')); }
+  catch { return { $schema: 'workflow-review', decisions: {} }; }
+}
+async function writeWorkflowReview(obj) {
+  await ensureDirs();
+  const out = {
+    $schema: 'workflow-review',
+    savedAt: new Date().toISOString().slice(0, 10),
+    decisions: (obj && obj.decisions) || {},   // sheetId → { [question text]: { answer, by, at } }
+  };
+  await fs.writeFile(WORKFLOW_REVIEW, JSON.stringify(out, null, 2) + '\n', 'utf8');
+  return out;
+}
+// every open[] question across all sheets' stations and fan tracks
+async function workflowQuestions() {
+  const wf = await readWorkflows();
+  const out = [];
+  for (const s of wf.sheets || []) {
+    const at = (detail, where) => { for (const q of (detail && detail.open) || []) out.push({ sheet: s.id, where, text: q }); };
+    for (const st of s.stations || []) {
+      at(st.detail, st.title || 'station');
+      for (const t of (st.fan && st.fan.tracks) || []) at(t.detail, `${st.title} › ${t.title}`);
+    }
+  }
+  return out;
+}
+async function setWorkflowDecision(sheetId, question, answer, by) {
+  const r = await readWorkflowReview();
+  r.decisions = r.decisions || {};
+  r.decisions[sheetId] = r.decisions[sheetId] || {};
+  r.decisions[sheetId][question] = { answer: String(answer).trim(), by: (by || 'claude').trim(), at: new Date().toISOString().slice(0, 10) };
+  return writeWorkflowReview(r);
+}
+async function reopenWorkflowQuestion(sheetId, question) {
+  const r = await readWorkflowReview();
+  if (r.decisions && r.decisions[sheetId]) {
+    delete r.decisions[sheetId][question];
+    if (!Object.keys(r.decisions[sheetId]).length) delete r.decisions[sheetId];
+  }
+  return writeWorkflowReview(r);
 }
 
 /* ---------------- raw file editing (the "look") ---------------- */
@@ -246,7 +449,7 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} } },
   { name: 'get_review', description: 'Read the saved review (tuned params + per-step comments + decisions) for an algorithm.',
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' } }, required: ['algorithm'] } },
-  { name: 'list_open_questions', description: 'List every authored open question across algorithms and whether it has been decided yet.',
+  { name: 'list_open_questions', description: 'List every authored open question — across algorithm storyboards AND workflow sheets — and whether each has been decided yet.',
     inputSchema: { type: 'object', properties: {} } },
 
   // author content
@@ -259,10 +462,32 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { spec: { type: 'object' } }, required: ['spec'] } },
   { name: 'delete_algorithm', description: 'Delete an algorithm storyboard and its review. Persists.',
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' } }, required: ['algorithm'] } },
-  { name: 'save_workflows', description: 'Replace the workflow maps. sheets = [ { id, code, name, title, sub, stations[] } ]. ' +
-      'A station = { title, sub?, status (done|partial|todo), algorithm?, detail?{in[],out[],note,open[]}, ' +
-      'loop?{to,label}, fan?{tracks[]} }. Persists to content/workflows.json.',
+  { name: 'save_workflows', description: 'REPLACE-ALL the workflow maps (prefer save_sheet for incremental edits). ' +
+      'sheets = [ { id (slug), code (SHORT badge string like "WA-01" — NOT pseudocode; an algorithm spec\'s "code" is a different field), name, title, sub, stations[] } ]. ' +
+      'A station = { title, sub?, status (done|partial|todo), algorithm?, detail?{in[],out[],note,open[]}, loop?{to (station index OR a target station\'s title), label}, fan?{tracks[]} }. ' +
+      'Example sheet: { "id":"checkout", "code":"WF-02", "name":"Checkout", "title":"Order checkout", "sub":"…", "stations":[ {"title":"Validate cart","status":"done","detail":{"in":["cart"],"out":["valid cart"],"open":["allow backorders?"]}} ] }. ' +
+      'The response echoes which sheet ids were added/updated/removed plus lint warnings. Persists to content/workflows.json.',
     inputSchema: { type: 'object', properties: { sheets: { type: 'array' } }, required: ['sheets'] } },
+  { name: 'get_sheet', description: 'Read ONE workflow sheet by id (lighter than get_workflows).',
+    inputSchema: { type: 'object', properties: { sheet: { type: 'string' } }, required: ['sheet'] } },
+  { name: 'save_sheet', description: 'Upsert ONE workflow sheet by id — create it or replace it in place WITHOUT resending the others. ' +
+      'sheet shape and station shape are exactly as in save_workflows (code is a SHORT badge). Returns created-or-updated + lint warnings. Persists to content/workflows.json.',
+    inputSchema: { type: 'object', properties: { sheet: { type: 'object' } }, required: ['sheet'] } },
+  { name: 'delete_sheet', description: 'Delete ONE workflow sheet by id. Persists.',
+    inputSchema: { type: 'object', properties: { sheet: { type: 'string' } }, required: ['sheet'] } },
+  { name: 'reorder_sheets', description: 'Reorder the sheets in the left index. order = [id, …]; any sheet id you omit keeps its order at the end. Persists.',
+    inputSchema: { type: 'object', properties: { order: { type: 'array', items: { type: 'string' } } }, required: ['order'] } },
+  { name: 'set_station', description: 'Add or replace ONE station inside a sheet WITHOUT resending the rest. ' +
+      'With "index" in range it replaces that station; omit index (or pass the current length) to append. station shape as in save_workflows. Returns the resulting index. Persists.',
+    inputSchema: { type: 'object', properties: { sheet: { type: 'string' }, station: { type: 'object' }, index: { type: 'number' } }, required: ['sheet', 'station'] } },
+  { name: 'delete_station', description: 'Delete the station at "index" within a sheet (numeric loop.to targets are shifted to stay consistent). Persists.',
+    inputSchema: { type: 'object', properties: { sheet: { type: 'string' }, index: { type: 'number' } }, required: ['sheet', 'index'] } },
+  { name: 'get_workflow_review', description: 'Read recorded decisions on workflow open questions: { decisions: { <sheetId>: { <question text>: { answer, by, at } } } }.',
+    inputSchema: { type: 'object', properties: {} } },
+  { name: 'set_workflow_decision', description: 'Answer a workflow open question — record a decision against a station/track open[] item, identified by its sheet id and the EXACT question text (see list_open_questions). Persists.',
+    inputSchema: { type: 'object', properties: { sheet: { type: 'string' }, question: { type: 'string' }, answer: { type: 'string' }, by: { type: 'string' } }, required: ['sheet', 'question', 'answer'] } },
+  { name: 'reopen_workflow_question', description: 'Clear a recorded decision so a workflow open question is open again. Persists.',
+    inputSchema: { type: 'object', properties: { sheet: { type: 'string' }, question: { type: 'string' } }, required: ['sheet', 'question'] } },
 
   // review / decisions
   { name: 'set_param', description: 'Set one param value in an algorithm review (re-evaluates the storyboard live). Persists.',
@@ -293,6 +518,8 @@ async function callTool(name, args) {
   const needsStep = new Set(['set_comment', 'set_decision', 'reopen_question']);
   if (needsStep.has(name) && (!Number.isInteger(a.step) || a.step < 0)) throw new Error('step must be a non-negative integer');
   if (name === 'set_param' && !Number.isFinite(a.value)) throw new Error('value must be a finite number');
+  const needsSheet = new Set(['get_sheet', 'delete_sheet', 'set_station', 'delete_station', 'set_workflow_decision', 'reopen_workflow_question']);
+  if (needsSheet.has(name) && !safeId(a.sheet)) throw new Error('invalid or missing sheet id (slug)');
   switch (name) {
     case 'list_algorithms': {
       const algs = await listAlgorithms();
@@ -316,6 +543,18 @@ async function callTool(name, args) {
             : `[OPEN]    ${id} step ${q.step}: ${q.question}`);
         }
       }
+      const wq = await workflowQuestions();
+      if (wq.length) {
+        const wdec = (await readWorkflowReview()).decisions || {};
+        if (lines.length) lines.push('');
+        lines.push('— workflow sheets —');
+        for (const q of wq) {
+          const d = (wdec[q.sheet] || {})[q.text];
+          lines.push(d
+            ? `[decided] ${q.sheet} (${q.where}): ${q.text}\n    → ${d.answer}${d.by ? ` (${d.by}, ${d.at || ''})` : ''}`
+            : `[OPEN]    ${q.sheet} (${q.where}): ${q.text}`);
+        }
+      }
       return lines.join('\n') || '(no authored questions)';
     }
 
@@ -330,9 +569,58 @@ async function callTool(name, args) {
       return `deleted algorithm "${a.algorithm}"`;
     }
     case 'save_workflows': {
+      const beforeIds = new Set(((await readWorkflows()).sheets || []).map((s) => s && s.id));
+      const incoming = Array.isArray(a.sheets) ? a.sheets : [];
+      const afterIds = new Set(incoming.map((s) => s && s.id));
+      const added = [...afterIds].filter((id) => !beforeIds.has(id));
+      const removed = [...beforeIds].filter((id) => !afterIds.has(id));
+      const updated = [...afterIds].filter((id) => beforeIds.has(id));
       const n = await writeWorkflows(a.sheets);
       openInBrowser('/');
-      return `saved ${n} workflow sheet(s) → content/workflows.json`;
+      const warns = lintSheets(incoming);
+      return `saved ${n} sheet(s) — added: [${added.join(', ')}]  updated: [${updated.join(', ')}]  removed: [${removed.join(', ')}]` +
+        (warns.length ? `\n⚠ ${warns.join('\n⚠ ')}` : '');
+    }
+    case 'get_sheet': return JSON.stringify(await getSheet(a.sheet), null, 2);
+    case 'save_sheet': {
+      const r = await saveSheet(a.sheet);
+      openInBrowser('/');
+      return `${r.created ? 'created' : 'updated'} sheet "${r.id}" (${r.count} sheet(s) total)` +
+        (r.warnings.length ? `\n⚠ ${r.warnings.join('\n⚠ ')}` : '');
+    }
+    case 'delete_sheet': {
+      const n = await deleteSheet(a.sheet);
+      openInBrowser('/');
+      return `deleted sheet "${a.sheet}" (${n} remaining)`;
+    }
+    case 'reorder_sheets': {
+      const order = await reorderSheets(a.order);
+      openInBrowser('/');
+      return `sheet order: ${order.join(', ')}`;
+    }
+    case 'set_station': {
+      const r = await setStation(a.sheet, a.station, a.index);
+      openInBrowser('/');
+      return `${r.created ? 'added' : 'replaced'} station #${r.index} in "${a.sheet}" (${r.count} station(s))`;
+    }
+    case 'delete_station': {
+      const r = await deleteStation(a.sheet, a.index);
+      openInBrowser('/');
+      return `deleted station #${a.index} from "${a.sheet}" (${r.count} remaining)`;
+    }
+    case 'get_workflow_review': return JSON.stringify(await readWorkflowReview(), null, 2);
+    case 'set_workflow_decision': {
+      if (!a.answer || !a.answer.trim()) throw new Error('answer is required');
+      const exists = (await workflowQuestions()).some((q) => q.sheet === a.sheet && q.text === a.question);
+      if (!exists) throw new Error(`no open question with that exact text on sheet "${a.sheet}" — see list_open_questions for the exact wording`);
+      await setWorkflowDecision(a.sheet, a.question, a.answer, a.by);
+      openInBrowser('/');
+      return `decided on "${a.sheet}": ${a.question}\n→ ${a.answer.trim()}`;
+    }
+    case 'reopen_workflow_question': {
+      await reopenWorkflowQuestion(a.sheet, a.question);
+      openInBrowser('/');
+      return `reopened on "${a.sheet}": ${a.question}`;
     }
 
     case 'set_param': {
@@ -476,6 +764,28 @@ async function handleApi(req, res, url) {
     req.on('close', drop);
     res.on('error', drop);
     return;   // long-lived connection
+  }
+  if (url.pathname === '/api/workflow-review') {
+    if (req.method === 'GET') return json(res, 200, await readWorkflowReview());
+    if (req.method === 'PUT') {
+      if (!isLocalRequest(req)) return json(res, 403, { error: 'local requests only' });
+      try {
+        const obj = JSON.parse(await readBody(req));
+        // single-decision PATCH: { sheet, question, decision } (decision=null → reopen).
+        // The server read-modify-writes ONE key, so a browser answer can't clobber a
+        // decision recorded by MCP (or another tab) since the page loaded.
+        let saved;
+        if (obj && typeof obj.sheet === 'string' && typeof obj.question === 'string') {
+          saved = obj.decision
+            ? await setWorkflowDecision(obj.sheet, obj.question, obj.decision.answer, obj.decision.by)
+            : await reopenWorkflowQuestion(obj.sheet, obj.question);
+        } else {
+          saved = await writeWorkflowReview(obj);   // whole-object replace (back-compat)
+        }
+        return json(res, 200, { ok: true, saved });
+      } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    return json(res, 405, { error: 'GET or PUT' });
   }
   const m = url.pathname.match(/^\/api\/review\/([^/]+)$/);
   if (m) {

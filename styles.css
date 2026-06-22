@@ -23,6 +23,7 @@
   --mono: 'JetBrains Mono', ui-monospace, monospace;
 
   --rail: 280px;
+  --callout-w: 400px;   /* detail panel width (also the reserved column in panel mode) */
 }
 
 * { box-sizing: border-box; }
@@ -40,6 +41,7 @@ body {
   min-height: 100%;
   display: grid;
   grid-template-columns: var(--rail) 1fr;
+  transition: grid-template-columns .26s cubic-bezier(.4, .0, .2, 1);
   background-image:
     linear-gradient(var(--hair) 1px, transparent 1px),
     linear-gradient(90deg, var(--hair) 1px, transparent 1px);
@@ -102,10 +104,10 @@ body {
 .tb-scale { margin-top: 16px; font-family: var(--mono); font-size: 9.5px; letter-spacing: .14em; color: var(--faint); }
 
 /* ---------------- Sheet ---------------- */
-.sheet { position: relative; z-index: 1; padding: 48px 56px 90px; max-width: 920px; margin-inline: auto; }
+.sheet { position: relative; z-index: 1; padding: 48px 56px 90px; max-width: 920px; margin-inline: auto; overflow-wrap: break-word; }
 .sheet-head { margin-bottom: 46px; }
 .sh-eyebrow {
-  display: flex; align-items: center; gap: 14px;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
   font-family: var(--mono); font-size: 11px; letter-spacing: .12em;
   color: var(--steel); text-transform: uppercase; margin-bottom: 14px;
 }
@@ -221,7 +223,7 @@ body {
 .fan { grid-column: 2; margin: 4px 0 6px; }
 .fan-rail { display: flex; gap: 12px; flex-wrap: wrap; padding-left: 2px; }
 .track {
-  flex: 1 1 150px; min-width: 150px;
+  flex: 1 1 150px; min-width: 0;
   background: var(--panel); border: 1px solid var(--hair);
   border-top: 2px solid var(--edge);
   border-radius: 9px; padding: 12px 13px; cursor: pointer;
@@ -250,10 +252,10 @@ body {
 
 /* ---------------- Callout (detail panel) ---------------- */
 .callout {
-  position: fixed; top: 0; right: 0; height: 100vh; width: 400px; max-width: 92vw;
+  position: fixed; top: 0; right: 0; height: 100vh; width: var(--callout-w); max-width: 92vw;
   background: var(--panel); border-left: 1px solid var(--edge);
   transform: translateX(100%); transition: transform .26s cubic-bezier(.4,.0,.2,1);
-  z-index: 6; padding: 26px 26px 40px; overflow-y: auto;
+  z-index: 6; padding: 26px 26px 40px; overflow-y: auto; overflow-wrap: break-word;
   box-shadow: -30px 0 60px -30px #000;
 }
 .callout.open { transform: translateX(0); }
@@ -284,9 +286,27 @@ body {
   border-radius: 9px; padding: 11px 13px; }
 .co-open li::before { content: "OPEN "; font-family: var(--mono); font-size: 9.5px; color: var(--steel); letter-spacing: .1em; }
 
+/* answerable open questions in the callout (resolve like storyboard decisions) */
+.co-qs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 15px; }
+.co-q { background: var(--panel-2); border: 1px solid var(--hair); border-left: 2px solid var(--steel);
+  border-radius: 9px; padding: 11px 13px; }
+.co-q.is-decided { border-left-color: var(--done); }
+.co-q-text { font-size: 13px; color: var(--ink); line-height: 1.45; margin-bottom: 10px; }
+.co-q-text::before { content: "Q "; font-family: var(--mono); font-size: 9.5px; color: var(--steel); letter-spacing: .1em; }
+.co-q .decision { display: flex; flex-direction: column; }
+
 .scrim { position: fixed; inset: 0; background: rgba(6,8,11,.55); opacity: 0; pointer-events: none;
   transition: opacity .26s; z-index: 5; }
 .scrim.open { opacity: 1; pointer-events: auto; }
+
+/* Panel mode (wide screens): opening the callout reserves a column so the map
+   pushes clear of the panel instead of hiding behind it. No scrim — you keep the
+   map in view and can click straight to another station. Below this width the
+   callout stays an overlay drawer (above) with its dimming scrim. */
+@media (min-width: 1080px) {
+  .frame.callout-open { grid-template-columns: var(--rail) minmax(0, 1fr) var(--callout-w); }
+  .frame.callout-open .scrim { opacity: 0; pointer-events: none; }
+}
 
 /* ---------------- entrance motion ---------------- */
 @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
@@ -307,7 +327,7 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .anim .station, .anim .link { animation: none; }
-  .card, .track, .callout { transition: none; }
+  .card, .track, .callout, .frame { transition: none; }
 }
 
 :focus-visible { outline: 2px solid var(--steel); outline-offset: 2px; border-radius: 4px; }
