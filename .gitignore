@@ -7,3 +7,6 @@ node_modules/
 # Local state — keep the directory, ignore its contents.
 content/reviews/*
 !content/reviews/.gitkeep
+
+# Recovery snapshot the server writes before each workflows.json save.
+content/workflows.json.bak

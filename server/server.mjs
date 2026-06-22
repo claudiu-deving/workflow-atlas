@@ -241,6 +241,10 @@ async function writeWorkflows(obj) {
   if (!Array.isArray(sheets)) throw new Error('workflows must be an array of sheets, or { sheets: [...] }');
   sheets.forEach((s) => validateSheet(s));
   assertUniqueIds(sheets);
+  // Snapshot the prior file ONLY on this replace-all path — it's the destructive
+  // op (an omitted sheet is deleted). Per-piece edits (save_sheet/set_station) must
+  // NOT overwrite the .bak, or one follow-up edit would erase the recovery point.
+  try { await fs.copyFile(WORKFLOWS, WORKFLOWS + '.bak'); } catch { /* no prior file */ }
   await persistWorkflows(sheets);
   return sheets.length;
 }
@@ -264,9 +268,8 @@ async function deleteSheet(id) {
   const next = sheets.filter((s) => !(s && s.id === id));
   if (next.length === sheets.length) throw new Error(`no such sheet: ${id}`);
   await persistWorkflows(next);
-  // drop the sheet's recorded decisions so a re-created sheet doesn't inherit them
-  const rev = await readWorkflowReview();
-  if (rev.decisions && rev.decisions[id]) { delete rev.decisions[id]; await writeWorkflowReview(rev); }
+  // intentionally KEEP the sheet's decisions in the review file: re-creating the
+  // sheet later recovers them, and they only render for questions that still exist.
   return next.length;
 }
 async function reorderSheets(order) {
@@ -463,7 +466,8 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { spec: { type: 'object' } }, required: ['spec'] } },
   { name: 'delete_algorithm', description: 'Delete an algorithm storyboard and its review. Persists.',
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' } }, required: ['algorithm'] } },
-  { name: 'save_workflows', description: 'REPLACE-ALL the workflow maps (prefer save_sheet for incremental edits). ' +
+  { name: 'save_workflows', description: 'REPLACE-ALL the workflow maps — this OVERWRITES every sheet; any sheet you omit is DELETED. ' +
+      'Almost always use save_sheet/set_station for edits instead. If you do use this, call get_workflows first and resend the full set. (The previous file is snapshotted to content/workflows.json.bak.) ' +
       'sheets = [ { id (slug), code (SHORT badge string like "WA-01" — NOT pseudocode; an algorithm spec\'s "code" is a different field), name, title, sub, stations[] } ]. ' +
       'A station = { title, sub?, status (done|partial|todo), algorithm?, detail?{in[],out[],note,open[]}, loop?{to (station index OR a target station\'s title), label}, fan?{tracks[]} }. ' +
       'Example sheet: { "id":"checkout", "code":"WF-02", "name":"Checkout", "title":"Order checkout", "sub":"…", "stations":[ {"title":"Validate cart","status":"done","detail":{"in":["cart"],"out":["valid cart"],"open":["allow backorders?"]}} ] }. ' +
@@ -679,6 +683,12 @@ async function dispatch(msg) {
           protocolVersion: msg.params?.protocolVersion || '2025-06-18',
           capabilities: { tools: {} },
           serverInfo: { name: 'workflow-atlas', version: '0.2.0' },
+          instructions:
+            'Workflow Atlas lets you SHOW algorithms/workflows as visuals instead of describing them. ' +
+            'When the user says they have reviewed, commented, or answered the open questions in the app, ' +
+            'call list_open_questions (and get_review / get_workflow_review) to read their decisions back, ' +
+            'then revise the affected storyboards/sheets and summarize what changed — this closes the review loop. ' +
+            'Prefer the per-piece tools (save_sheet, set_station) over save_workflows, which replaces ALL sheets.',
         });
       case 'ping': return ok({});
       case 'tools/list': return ok({ tools: TOOLS });
@@ -744,7 +754,7 @@ try {
   watch(ROOT, { recursive: true }, (_ev, file) => {
     if (!file) return;
     const f = String(file).split(path.sep).join('/');
-    if (f.startsWith('node_modules/') || f.startsWith('.git/') || f.startsWith('content/reviews/')) return;
+    if (f.startsWith('node_modules/') || f.startsWith('.git/') || f.startsWith('content/reviews/') || f.endsWith('.bak')) return;
     clearTimeout(reloadTimer);
     reloadTimer = setTimeout(broadcastReload, 120);
   });
@@ -816,7 +826,7 @@ async function handleStatic(req, res, url) {
   // merely shares the name prefix (e.g. workflow-atlas-backup) can't be reached.
   if (filePath !== ROOT && !filePath.startsWith(ROOT + path.sep)) { res.writeHead(403); return res.end('forbidden'); }
   const top = path.relative(ROOT, filePath).split(path.sep)[0];
-  if (STATIC_DENY.has(top)) { res.writeHead(403); return res.end('forbidden'); }
+  if (STATIC_DENY.has(top) || filePath.endsWith('.bak')) { res.writeHead(403); return res.end('forbidden'); }
   try {
     const data = await fs.readFile(filePath);
     res.writeHead(200, { 'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream',

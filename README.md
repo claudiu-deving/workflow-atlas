@@ -87,6 +87,16 @@ Workflow maps live in **`content/workflows.json`** (`{ sheets: [...] }`):
 - `fan: { tracks: [...] }` renders parallel branches off the spine.
 - `algorithm: '<id>'` links a station to its storyboard.
 
+`save_sheet` / `save_workflows` **reject** a non-slug `id`, a `code` that isn't a
+short string, a bad `status`, and non-string `detail.open/in/out` (and
+`save_workflows` also rejects duplicate sheet ids); the response echoes non-fatal
+**lint warnings** (overlong badge, a sheet with no stations, a `loop.to` title with
+no matching station, an open question whose exact text repeats within a sheet).
+Deleting a sheet **keeps** its recorded decisions, so re-creating the same id later
+recovers them. The destructive `save_workflows` (replace-all) snapshots the prior
+file to `content/workflows.json.bak` first, so an accidental reset is recoverable
+until the next replace-all.
+
 ## Algorithm storyboards
 
 A second view (top-left **Workflows / Algorithms** switch, or open
@@ -158,7 +168,31 @@ it) *and* at `/mcp` over HTTP (for manual testing). Tools:
 
 So the loop is: the assistant proposes an algorithm → it builds the storyboard
 with `save_algorithm` → you watch it run and leave a comment or decision → the
-assistant reads that over MCP and revises. Showing, not just telling.
+assistant reads that over MCP and revises. Showing, not just telling. (The server
+also advertises this in its MCP `instructions`, so when you say you've answered,
+the assistant knows to call `list_open_questions` and read your decisions back.)
+
+### Optional: auto-pickup hook
+
+`scripts/atlas-review-hook.mjs` is a Claude Code **UserPromptSubmit** hook: once
+you've answered every open question on a sheet/storyboard, your next message
+carries those decisions automatically (so the assistant revises without being
+told to re-read). It fires **per unit** — answering one sheet doesn't wait on the
+others, and the bundled demo questions never block it — and only once per
+answered state.
+
+Because you normally run Claude Code in *another* project (the Atlas server is an
+MCP tool), wire it in your **user** settings with the **absolute** path to the
+script — the script finds Atlas's `content/` relative to itself:
+
+```json
+{ "hooks": { "UserPromptSubmit": [ { "hooks": [
+  { "type": "command", "command": "node \"/abs/path/to/workflow-atlas/scripts/atlas-review-hook.mjs\"" }
+] } ] } }
+```
+
+Set `ATLAS_CONTENT_DIR` if your content lives elsewhere, and `ATLAS_HOOK_DEBUG=1`
+to print why it did/didn't fire to stderr. It never blocks your prompt.
 
 **Claude Code manages the process.** A project `.mcp.json` runs the server as a
 stdio MCP server (`node server/server.mjs`), so Claude Code spawns it every
