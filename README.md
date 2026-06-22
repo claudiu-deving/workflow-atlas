@@ -14,9 +14,9 @@ assistant read and write the same tuned parameters and comments.
 Open source under the **MIT License** (see `LICENSE`). No build step, no npm
 install, no framework — plain HTML/CSS/JS and Node built-ins.
 
-> The bundled examples are **demo content** from a structural-modeling domain:
-> an "RC beam milestone" workflow and a "collinear beam run" detection algorithm.
-> Replace `data.js` and `traces/` with your own.
+> The bundled examples are **demo content**: a generic "ship a feature"
+> workflow and classic-algorithm storyboards (binary search, bubble sort,
+> Euclid's GCD). Replace `data.js` and `traces/` with your own.
 
 ## Run
 
@@ -60,18 +60,18 @@ Reload to see changes.
 
 A second view (top-left **Workflows / Algorithms** switch, or open
 `algorithms.html`) animates an algorithm step by step instead of describing it
-in prose. The stage shows the data as a 2D scene, the pseudocode highlights the
-active line, and the narration explains each step — synced to a play / step /
-scrub transport (← → to step, space to play).
+in prose. The stage shows the data (an array of value cells, or a worksheet),
+the pseudocode highlights the active line, and the narration explains each step
+— synced to a play / step / scrub transport (← → to step, space to play).
 
-Each storyboard is a hand-authored **trace** in `traces/*.js`: a `scene`
-(the data), `code` (pseudocode lines), editable `params` (tolerances), and
-ordered `steps` that drive the stage, the highlight, and the narration. Test
-steps carry the raw *measurement* (angle, gap); the editable params decide
-pass/fail at render time, so tuning a tolerance re-evaluates the walk live.
-First one: `traces/collinear-run.js` — auto-detecting a continuous run of
-beams. To add one, write a trace module and register it in the `ALGORITHMS`
-array in `storyboard.js`.
+Each storyboard is a **trace** in `traces/*.js` exposing `meta`, `kind`
+(`'array'` or `'calc'`), `code` (pseudocode lines), editable `params`, and a
+`compute(params)` that returns the ordered frames. Because the frames are
+*computed* from the params, changing a param re-runs the whole walk live — e.g.
+change the search `target` and binary search re-evaluates. A frame may also
+carry an open `question`. First one: `traces/binary-search.js`. To add one,
+write a trace module and register it in the `ALGORITHMS` array in
+`storyboard.js`.
 
 ### Saving tuned params + comments — the `.review.json` overlay
 

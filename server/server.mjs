@@ -52,12 +52,20 @@ async function listAlgorithms() {
 async function readSource(alg) {
   return fs.readFile(path.join(TRACES, `${alg}.js`), 'utf8');
 }
-// dynamically import a trace module to read its authored questions (steps[i].question)
+// dynamically import a trace module to read its authored questions. A trace
+// exposes its steps either statically (`steps`) or via `compute(params)`; in the
+// latter case we evaluate it at its default params to find authored questions.
 async function readQuestions(alg) {
   const url = pathToFileURL(path.join(TRACES, `${alg}.js`)).href + `?t=${Date.now()}`;
   const mod = await import(url);
+  let steps = mod.steps;
+  if (!steps && typeof mod.compute === 'function') {
+    const p = {};
+    (mod.params || []).forEach((x) => { p[x.key] = x.value; });
+    steps = mod.compute(p);
+  }
   const out = [];
-  (mod.steps || []).forEach((st, i) => { if (st.question) out.push({ step: i, question: st.question }); });
+  (steps || []).forEach((st, i) => { if (st && st.question) out.push({ step: i, question: st.question }); });
   return out;
 }
 

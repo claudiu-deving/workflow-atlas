@@ -1,7 +1,7 @@
 /* ============================================================
-   Workflow Atlas — structural shop-drawing aesthetic.
-   Graphite canvas · rebar-steel ochre · status as material state.
-   Signature: a dimension-line spine with engineering ticks.
+   Workflow Atlas — technical-drawing aesthetic.
+   Graphite canvas · amber accent · status as colour state.
+   Signature: a dimension-line spine with ticks.
    ============================================================ */
 :root {
   --bg:       #0f1216;   /* cool graphite canvas        */
@@ -13,10 +13,10 @@
   --muted:    #8b95a3;   /* secondary lettering         */
   --faint:    #5c6573;   /* annotation                  */
 
-  --steel:    #e3a648;   /* rebar-steel ochre — accent  */
-  --done:     #46c8a0;   /* cured concrete (verified)   */
-  --partial:  #e3a648;   /* exposed rebar (in progress) */
-  --todo:     #6ea8e6;   /* blueprint blue (planned)    */
+  --steel:    #e3a648;   /* amber — accent              */
+  --done:     #46c8a0;   /* green (verified / done)     */
+  --partial:  #e3a648;   /* amber (in progress)         */
+  --todo:     #6ea8e6;   /* blue (planned)              */
 
   --display: 'Space Grotesk', system-ui, sans-serif;
   --body: 'Inter', system-ui, sans-serif;
@@ -360,39 +360,30 @@ body {
 .wrow-expr { font-family: var(--mono); font-size: 12.5px; color: var(--muted); margin-top: 7px; }
 .wrow-sub { font-family: var(--mono); font-size: 11.5px; color: var(--faint); margin-top: 4px; }
 
-/* beams */
-.bm { stroke: #46506080; stroke-width: .26; stroke-linecap: round; transition: stroke .4s, stroke-width .4s; }
-.bm.idle { stroke: #46506080; }
-.bm.accepted { stroke: var(--done); stroke-width: .34; }
-.bm.rejected { stroke: #e0594e; stroke-width: .22; stroke-dasharray: .5 .4; opacity: .85; }
-.bm.testing { stroke: var(--steel); stroke-width: .4; }
-.bm.testing.bad { stroke: #e0594e; }
-.bm.seed { stroke: var(--ink); stroke-width: .42; }
-.joint { fill: #5c6573; transition: fill .4s; }
-.joint.accepted { fill: var(--done); }
-.joint.seed { fill: var(--ink); }
-.joint.rejected { fill: #e0594e; }
-.bm-id {
-  font-family: var(--mono); font-size: .58px; fill: var(--faint);
-  text-anchor: middle; transition: fill .4s; pointer-events: none;
+/* array stage — a row of value cells, height tracks value */
+.cells { display: flex; align-items: flex-end; justify-content: center; flex-wrap: wrap;
+  gap: 12px; padding: 28px 20px; width: 100%; min-height: 320px; }
+.cell { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; }
+.cell-bar {
+  width: 46px; height: calc(var(--h, 0) * 1.4px + 30px);
+  display: flex; align-items: flex-start; justify-content: center; padding-top: 7px;
+  border: 1px solid var(--edge); border-radius: 8px; background: var(--panel-2);
+  color: var(--muted); transition: height .35s, background .3s, border-color .3s, box-shadow .3s, opacity .3s;
 }
-.bm-id.accepted { fill: var(--done); } .bm-id.seed { fill: var(--ink); } .bm-id.testing { fill: var(--steel); }
+.cell-val { font-family: var(--mono); font-size: 13px; color: inherit; }
+.cell-ptr { height: 16px; margin-top: 9px; font-family: var(--mono); font-size: 10px;
+  letter-spacing: .05em; text-transform: uppercase; color: var(--steel); white-space: nowrap; }
 
-/* frontier pulse */
-.frontier { fill: none; stroke: var(--steel); stroke-width: .07; transform-box: fill-box; transform-origin: center;
-  animation: ping 1.6s ease-out infinite; }
-@keyframes ping { 0% { r: .2; opacity: .9; } 100% { r: .7; opacity: 0; } }
-
-/* test overlay */
-.arc { fill: none; stroke-width: .07; stroke-dasharray: .25 .18; }
-.arc.ok { stroke: var(--done); } .arc.bad { stroke: #e0594e; }
-.ray { stroke-width: .045; opacity: .55; } .ray.ok { stroke: var(--done); } .ray.bad { stroke: #e0594e; }
-.gapdim { stroke: #e0594e; stroke-width: .05; }
-.badge text { font-family: var(--mono); font-size: .56px; text-anchor: middle; dominant-baseline: central; }
-.badge.ok rect { fill: #122a22; stroke: var(--done); stroke-width: .045; } .badge.ok text { fill: var(--done); }
-.badge.bad rect { fill: #2a1513; stroke: #e0594e; stroke-width: .045; } .badge.bad text { fill: #ef7a70; }
-.stage-svg.is-done .bm.accepted { animation: glow 1.4s ease-in-out infinite alternate; }
-@keyframes glow { from { stroke-width: .34; } to { stroke-width: .46; } }
+.cell.active .cell-bar, .cell.compare .cell-bar {
+  border-color: var(--steel); background: #241d11; color: var(--ink); }
+.cell.mid .cell-bar {
+  border-color: var(--steel); background: #3a2c12; color: var(--ink); box-shadow: 0 0 0 1px var(--steel); }
+.cell.lo .cell-bar, .cell.hi .cell-bar {
+  border-color: var(--todo); background: #15233a; color: #c2d8f6; }
+.cell.eliminated .cell-bar { opacity: .3; border-style: dashed; }
+.cell.found .cell-bar {
+  border-color: var(--done); background: #123227; color: #8fe7c5; box-shadow: 0 0 0 1px var(--done); }
+.cell.sorted .cell-bar { border-color: var(--done); background: #12251f; color: #80ddbc; }
 
 /* side panes */
 .story-side { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
@@ -502,6 +493,5 @@ body {
   .story { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .frontier, .stage-svg.is-done .bm.accepted { animation: none; }
-  .bm, .joint, .bm-id { transition: none; }
+  .cell-bar { transition: none; }
 }

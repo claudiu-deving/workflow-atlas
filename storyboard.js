@@ -1,13 +1,9 @@
-import * as collinear from './traces/collinear-run.js';
-import * as continuity from './traces/continuity-check.js';
-import * as build1d from './traces/build-1d-model.js';
-import * as analysis from './traces/beam-analysis.js';
-import * as flexural from './traces/flexural-design.js';
-import * as shear from './traces/shear-design.js';
-import * as bbs from './traces/bbs-generation.js';
+import * as binarySearch from './traces/binary-search.js';
+import * as bubbleSort from './traces/bubble-sort.js';
+import * as euclid from './traces/euclid-gcd.js';
 
-// order roughly follows the workflow: select & isolate → analyse → design → schedule
-const ALGORITHMS = [collinear, continuity, build1d, analysis, flexural, shear, bbs];
+// add a trace module here to register its storyboard in the index
+const ALGORITHMS = [binarySearch, bubbleSort, euclid];
 const SVGNS = 'http://www.w3.org/2000/svg';
 const $ = (id) => document.getElementById(id);
 
@@ -154,241 +150,107 @@ function buildParamBar() {
   bar.appendChild(reset);
 }
 
-/* ---------- the predicate, evaluated live ---------- */
-function evaluate(m) {
-  if (m.gap > params.eps_pos) return { ok: false, reason: 'gap', line: 5,
-    clause: `joint gap ${m.gap} mm > max ${params.eps_pos} mm — doesn’t touch` };
-  if (m.angle > params.eps_ang) return { ok: false, reason: 'angle', line: 6,
-    clause: `off-axis angle ${m.angle}° > max ${params.eps_ang}° — not parallel` };
-  if (m.perp != null && m.perp > params.eps_perp) return { ok: false, reason: 'kink', line: 7,
-    clause: `lateral offset ${m.perp} mm > max ${params.eps_perp} mm — kink` };
-  if (params.require_section && m.section === false) return { ok: false, reason: 'section', line: 8,
-    clause: `cross-section changes — run must keep one section` };
-  return { ok: true, reason: 'accept', line: 10,
-    clause: `gap ${m.gap} mm ≤ ${params.eps_pos}, angle ${m.angle}° ≤ ${params.eps_ang}° — accept` };
-}
-
-/* ---------- replay state up to step n (with current params) ---------- */
-function stateAt(n) {
-  const s = { seed: null, side: 'right', frontier: null, test: null, runL: [], runR: [],
-    rejected: new Set(), done: false };
-  for (let k = 0; k <= n; k++) {
-    const st = trace.steps[k];
-    switch (st.act) {
-      case 'seed': s.seed = st.beam; break;
-      case 'frontier': case 'switchEnd': s.side = st.side; s.frontier = { at: st.at, dir: st.dir }; s.test = null; break;
-      case 'test': {
-        s.frontier = { at: st.at, dir: st.dir };
-        const v = evaluate(st.m);
-        if (k === n) s.test = { st, v };
-        if (v.ok) {
-          (s.side === 'left' ? s.runL : s.runR).push(st.cand);
-          if (st.advance) s.frontier = st.advance;
-        } else {
-          s.rejected.add(st.cand);
-        }
-        break;
-      }
-      case 'done': s.done = true; s.test = null; break;
-    }
-  }
-  return s;
-}
-function runOrder(s) { return [...[...s.runL].reverse(), s.seed, ...s.runR]; }
-function isAccepted(s, id) { return id === s.seed || s.runL.includes(id) || s.runR.includes(id); }
-
-/* ---------- geometry helpers ---------- */
-const sx = (p) => p[0];
-const sy = (p) => -p[1];               // flip Z so +Z reads as "up"
-function bounds() {
-  let mnx = 1e9, mny = 1e9, mxx = -1e9, mxy = -1e9;
-  for (const bm of trace.scene.beams) for (const p of [bm.a, bm.b]) {
-    mnx = Math.min(mnx, sx(p)); mxx = Math.max(mxx, sx(p));
-    mny = Math.min(mny, sy(p)); mxy = Math.max(mxy, sy(p));
-  }
-  return { mnx, mny, mxx, mxy };
-}
-const near = (bm, p) => (dist(bm.a, p) < dist(bm.b, p) ? bm.a : bm.b);
-const far = (bm, p) => (dist(bm.a, p) < dist(bm.b, p) ? bm.b : bm.a);
-function dist(a, b) { return Math.hypot(sx(a) - sx(b), sy(a) - sy(b)); }
-const byId = (id) => trace.scene.beams.find((b) => b.id === id);
-
-/* ---------- step model (beam: authored steps; calc: computed rows) ---------- */
+/* ---------- step model — every trace exposes compute(params) → rows/frames ---------- */
 const isCalc = () => trace.kind === 'calc';
-function calcRows() { return trace.compute(params) || []; }
-function stepCount() { return isCalc() ? calcRows().length : trace.steps.length; }
-function currentStep() { return isCalc() ? calcRows()[idx] : trace.steps[idx]; }
+function rows() { return trace.compute(params) || []; }
+function stepCount() { return rows().length; }
+function currentStep() { const r = rows(); return r[Math.min(idx, r.length - 1)]; }
 
 /* ---------- render ---------- */
 function render() {
   if (isCalc()) return renderCalc();
-  const s = stateAt(idx);
-  const step = trace.steps[idx];
-
-  // narration + verdict + code + counter
-  $('alg-note').textContent = step.note;
-  const vEl = $('alg-verdict');
-  if (s.test) {
-    vEl.textContent = (s.test.v.ok ? '✓ ' : '✗ ') + s.test.v.clause;
-    vEl.className = 'verdict ' + (s.test.v.ok ? 'ok' : 'bad');
-  } else if (s.done) {
-    // a 'done' step may author its own summary; default to the accumulated run
-    vEl.textContent = step.summary || ('→ run: ' + runOrder(s).join(' – '));
-    vEl.className = 'verdict ' + (step.bad ? 'bad' : 'ok');
-  } else { vEl.textContent = ''; vEl.className = 'verdict'; }
-
-  highlightCode(s.test ? [s.test.v.line] : (step.code || []));
-  $('alg-counter').textContent = `${String(idx + 1).padStart(2, '0')} / ${String(stepCount()).padStart(2, '0')}`;
-  [...$('alg-scrub').children].forEach((d, j) => d.classList.toggle('on', j <= idx));
-  $('alg-play').textContent = playing ? '❚❚' : '▶';
-  syncComment();
-  syncQuestion();
-
-  // svg stage
-  const stage = $('alg-stage');
-  stage.innerHTML = '';
-  const b = bounds(), pad = 2.2;
-  const vb = [b.mnx - pad, b.mny - pad, (b.mxx - b.mnx) + pad * 2, (b.mxy - b.mny) + pad * 2];
-  const svg = document.createElementNS(SVGNS, 'svg');
-  svg.setAttribute('viewBox', vb.join(' '));
-  svg.setAttribute('class', `stage-svg ${s.done ? 'is-done' : ''}`);
-
-  for (const bm of trace.scene.beams) {
-    let cls = 'idle';
-    if (isAccepted(s, bm.id)) cls = 'accepted';
-    if (s.rejected.has(bm.id)) cls = 'rejected';
-    if (s.test && s.test.st.cand === bm.id) cls = s.test.v.ok ? 'testing ok' : 'testing bad';
-    if (bm.id === s.seed) cls += ' seed';
-
-    const line = document.createElementNS(SVGNS, 'line');
-    line.setAttribute('x1', sx(bm.a)); line.setAttribute('y1', sy(bm.a));
-    line.setAttribute('x2', sx(bm.b)); line.setAttribute('y2', sy(bm.b));
-    line.setAttribute('class', `bm ${cls}`);
-    svg.appendChild(line);
-
-    for (const p of [bm.a, bm.b]) {
-      const dot = document.createElementNS(SVGNS, 'circle');
-      dot.setAttribute('cx', sx(p)); dot.setAttribute('cy', sy(p)); dot.setAttribute('r', 0.12);
-      dot.setAttribute('class', `joint ${cls.split(' ')[0]}`);
-      svg.appendChild(dot);
-    }
-    const mid = [(sx(bm.a) + sx(bm.b)) / 2, (sy(bm.a) + sy(bm.b)) / 2];
-    const t = document.createElementNS(SVGNS, 'text');
-    t.setAttribute('x', mid[0]); t.setAttribute('y', mid[1] - 0.35);
-    t.setAttribute('class', `bm-id ${cls.split(' ')[0]}`); t.textContent = bm.id;
-    svg.appendChild(t);
-  }
-
-  if (s.frontier && !s.done) {
-    const f = document.createElementNS(SVGNS, 'circle');
-    f.setAttribute('cx', sx(s.frontier.at)); f.setAttribute('cy', sy(s.frontier.at));
-    f.setAttribute('r', 0.42); f.setAttribute('class', 'frontier');
-    svg.appendChild(f);
-  }
-  if (s.test) drawTest(svg, s.test.st, s.test.v);
-
-  stage.appendChild(svg);
+  return renderArray();
 }
 
-/* ---------- calc stage: a live EC2-style worksheet ---------- */
-function renderCalc() {
-  const rows = calcRows();
-  if (idx > rows.length - 1) idx = rows.length - 1;
-  const cur = rows[idx] || {};
-
+// shared chrome: narration, verdict, code highlight, counter, transport, panes
+function renderChrome(cur, rowCount) {
   $('alg-note').textContent = cur.note || '';
   const vEl = $('alg-verdict');
-  if (idx === rows.length - 1 && trace.summary) {
-    vEl.textContent = trace.summary(params); vEl.className = 'verdict ok';
-  } else if (cur.result != null) {
-    vEl.textContent = `${cur.label} = ${cur.result}${cur.unit ? ` ${cur.unit}` : ''}`;
-    vEl.className = 'verdict ' + (cur.bad ? 'bad' : 'ok');
+  if (cur.verdict && cur.verdict.text) {
+    const ok = cur.verdict.ok;
+    const mark = ok === true ? '✓ ' : ok === false ? '✗ ' : '';
+    vEl.textContent = mark + cur.verdict.text;
+    vEl.className = 'verdict ' + (ok === false ? 'bad' : ok === true ? 'ok' : '');
   } else { vEl.textContent = ''; vEl.className = 'verdict'; }
 
   highlightCode(cur.line != null ? (Array.isArray(cur.line) ? cur.line : [cur.line]) : []);
-  $('alg-counter').textContent = `${String(idx + 1).padStart(2, '0')} / ${String(rows.length).padStart(2, '0')}`;
+  $('alg-counter').textContent = `${String(idx + 1).padStart(2, '0')} / ${String(rowCount).padStart(2, '0')}`;
   [...$('alg-scrub').children].forEach((d, j) => d.classList.toggle('on', j <= idx));
   $('alg-play').textContent = playing ? '❚❚' : '▶';
   syncComment();
   syncQuestion();
+}
+
+/* ---------- array stage: a row of value cells, coloured by per-step state ---------- */
+function renderArray() {
+  const frames = rows();
+  if (idx > frames.length - 1) idx = frames.length - 1;
+  const f = frames[idx] || {};
+  renderChrome(f, frames.length);
+
+  const stage = $('alg-stage');
+  stage.innerHTML = '';
+  const cells = document.createElement('div');
+  cells.className = 'cells';
+
+  const arr = f.array || [];
+  const max = Math.max(1, ...arr.map((v) => Math.abs(Number(v)) || 0));
+  const ptrAt = {};
+  if (f.ptr) for (const lbl in f.ptr) {
+    const i = f.ptr[lbl];
+    if (i == null || i < 0) continue;
+    (ptrAt[i] ||= []).push(lbl);
+  }
+
+  arr.forEach((v, i) => {
+    const cell = document.createElement('div');
+    cell.className = `cell ${(f.cls && f.cls[i]) || 'idle'}`;
+    cell.style.setProperty('--h', Math.round((Math.abs(Number(v)) || 0) / max * 100));
+    cell.innerHTML =
+      `<div class="cell-bar"><span class="cell-val">${esc(String(v))}</span></div>` +
+      `<div class="cell-ptr">${ptrAt[i] ? esc(ptrAt[i].join(' ')) : ''}</div>`;
+    cells.appendChild(cell);
+  });
+  stage.appendChild(cells);
+}
+
+/* ---------- calc stage: a live worksheet, one revealed row per step ---------- */
+function renderCalc() {
+  const r = rows();
+  if (idx > r.length - 1) idx = r.length - 1;
+  const cur = r[idx] || {};
+  renderChrome(cur, r.length);
+
+  // verdict: the running summary on the last row, else this row's result
+  const vEl = $('alg-verdict');
+  if (!cur.verdict) {
+    if (idx === r.length - 1 && trace.summary) {
+      vEl.textContent = trace.summary(params); vEl.className = 'verdict ok';
+    } else if (cur.result != null) {
+      vEl.textContent = `${cur.label} = ${cur.result}${cur.unit ? ` ${cur.unit}` : ''}`;
+      vEl.className = 'verdict ' + (cur.bad ? 'bad' : 'ok');
+    }
+  }
 
   const stage = $('alg-stage');
   stage.innerHTML = '';
   const sheet = document.createElement('div');
   sheet.className = 'worksheet';
-  rows.forEach((r, j) => {
+  r.forEach((row, j) => {
     if (j > idx) return;                       // reveal progressively
-    const row = document.createElement('div');
-    row.className = `wrow${j === idx ? ' cur' : ''}${r.kind ? ` ${r.kind}` : ''}${r.bad ? ' bad' : ''}`;
-    row.innerHTML = `
+    const el = document.createElement('div');
+    el.className = `wrow${j === idx ? ' cur' : ''}${row.kind ? ` ${row.kind}` : ''}${row.bad ? ' bad' : ''}`;
+    el.innerHTML = `
       <div class="wrow-head">
-        <span class="wrow-label">${esc(r.label)}</span>
-        ${r.result != null ? `<span class="wrow-res">${esc(String(r.result))}${r.unit ? ` <i>${esc(r.unit)}</i>` : ''}</span>` : ''}
+        <span class="wrow-label">${esc(row.label)}</span>
+        ${row.result != null ? `<span class="wrow-res">${esc(String(row.result))}${row.unit ? ` <i>${esc(row.unit)}</i>` : ''}</span>` : ''}
       </div>
-      ${r.expr ? `<div class="wrow-expr">${esc(r.expr)}</div>` : ''}
-      ${r.sub ? `<div class="wrow-sub">${esc(r.sub)}</div>` : ''}`;
-    sheet.appendChild(row);
+      ${row.expr ? `<div class="wrow-expr">${esc(row.expr)}</div>` : ''}
+      ${row.sub ? `<div class="wrow-sub">${esc(row.sub)}</div>` : ''}`;
+    sheet.appendChild(el);
   });
   stage.appendChild(sheet);
 }
-
-function drawTest(svg, st, v) {
-  const cand = byId(st.cand);
-  const P = st.at;
-  const cDir = norm([sx(far(cand, P)) - sx(P), sy(far(cand, P)) - sy(P)]);
-  const fDir = norm([st.dir[0], -st.dir[1]]);
-  const a0 = Math.atan2(fDir[1], fDir[0]);
-  const a1 = Math.atan2(cDir[1], cDir[0]);
-  const R = 1.15;
-
-  const arc = document.createElementNS(SVGNS, 'path');
-  arc.setAttribute('d', arcPath(P, R, a0, a1));
-  arc.setAttribute('class', `arc ${v.ok ? 'ok' : 'bad'}`);
-  svg.appendChild(arc);
-  for (const ang of [a0, a1]) {
-    const ray = document.createElementNS(SVGNS, 'line');
-    ray.setAttribute('x1', sx(P)); ray.setAttribute('y1', sy(P));
-    ray.setAttribute('x2', sx(P) + Math.cos(ang) * R); ray.setAttribute('y2', sy(P) + Math.sin(ang) * R);
-    ray.setAttribute('class', `ray ${v.ok ? 'ok' : 'bad'}`);
-    svg.appendChild(ray);
-  }
-
-  const fp = far(cand, P);
-  const bx = sx(fp) + (sx(fp) - sx(P)) * 0.12;
-  const by = sy(fp) + (sy(fp) - sy(P)) * 0.12 - 0.55;
-  const label = v.reason === 'gap' ? `✗  gap ${st.m.gap} mm` : (v.ok ? `✓  ${st.m.angle}°` : `✗  ${st.m.angle}°`);
-  badge(svg, bx, by, label, v.ok);
-
-  if (v.reason === 'gap') {
-    const np = near(cand, P);
-    const dim = document.createElementNS(SVGNS, 'line');
-    dim.setAttribute('x1', sx(P)); dim.setAttribute('y1', sy(P) - 0.6);
-    dim.setAttribute('x2', sx(np)); dim.setAttribute('y2', sy(np) - 0.6);
-    dim.setAttribute('class', 'gapdim');
-    svg.appendChild(dim);
-  }
-}
-
-function badge(svg, x, y, text, ok) {
-  const g = document.createElementNS(SVGNS, 'g');
-  g.setAttribute('class', `badge ${ok ? 'ok' : 'bad'}`);
-  const w = text.length * 0.42 + 0.7, h = 1.0;
-  const r = document.createElementNS(SVGNS, 'rect');
-  r.setAttribute('x', x - w / 2); r.setAttribute('y', y - h / 2);
-  r.setAttribute('width', w); r.setAttribute('height', h); r.setAttribute('rx', 0.28);
-  const t = document.createElementNS(SVGNS, 'text');
-  t.setAttribute('x', x); t.setAttribute('y', y); t.textContent = text;
-  g.append(r, t); svg.appendChild(g);
-}
-function arcPath(P, R, a0, a1) {
-  let d = a1 - a0;
-  while (d > Math.PI) d -= 2 * Math.PI;
-  while (d < -Math.PI) d += 2 * Math.PI;
-  const x0 = sx(P) + Math.cos(a0) * R, y0 = sy(P) + Math.sin(a0) * R;
-  const x1 = sx(P) + Math.cos(a0 + d) * R, y1 = sy(P) + Math.sin(a0 + d) * R;
-  return `M ${x0} ${y0} A ${R} ${R} 0 ${Math.abs(d) > Math.PI ? 1 : 0} ${d > 0 ? 1 : 0} ${x1} ${y1}`;
-}
-function norm(v) { const m = Math.hypot(v[0], v[1]) || 1; return [v[0] / m, v[1] / m]; }
 
 /* ---------- pseudocode pane ---------- */
 function buildCode() {
@@ -471,7 +333,7 @@ function reopen() {
 }
 function today() { return new Date().toISOString().slice(0, 10); }
 function markQuestionTicks() {
-  const steps = isCalc() ? calcRows() : trace.steps;
+  const steps = rows();
   [...$('alg-scrub').children].forEach((d, j) => {
     const has = !!steps[j]?.question;
     d.classList.toggle('asking', has && !decisions[j]);   // open question
