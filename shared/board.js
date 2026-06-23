@@ -13,6 +13,7 @@ export const MAX_DEPTH = 6;                 // legacy hint only — nesting is n
                                             // re-roots, and the validator guards cycles, not depth)
 
 export const STATUSES = new Set(['done', 'partial', 'todo']);
+export const SHAPES = new Set(['rect', 'ellipse', 'diamond']);   // node shape; absent ⇒ 'rect'
 const isSlug = (s) => /^[a-z0-9][a-z0-9-]*$/.test(s || '');
 
 // Next stable id within a sibling list: prefix + (1 + max numeric suffix seen).
@@ -112,6 +113,7 @@ export function validateBoard(b, where, seen, validateDetail) {
     if (n.h != null && n.h <= 0) throw new Error(`${w}.h must be > 0`);
     if (!n.title || typeof n.title !== 'string') throw new Error(`${w}.title is required (a string)`);
     if (n.status != null && !STATUSES.has(n.status)) throw new Error(`${w}.status must be one of: ${[...STATUSES].join(', ')}`);
+    if (n.shape != null && !SHAPES.has(n.shape)) throw new Error(`${w}.shape must be one of: ${[...SHAPES].join(', ')}`);
     if (n.algorithm != null && !isSlug(n.algorithm)) throw new Error(`${w}.algorithm must be a slug`);
     if (typeof validateDetail === 'function') validateDetail(n.detail, w);
     if (n.board != null) validateBoard(n.board, `${w}.board`, seen, validateDetail);   // recurse (cycle-guarded)

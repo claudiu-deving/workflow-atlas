@@ -190,10 +190,12 @@ export function createCanvas(viewportEl, opts = {}) {
     if (el._editing) return;                 // don't blow away the contentEditable title mid-edit
     const open = openCount(node);
     const status = node.status || 'todo';
-    const sig = [node.title, node.sub || '', status, node.algorithm || '', node.board ? 1 : 0, open].join('');
+    const sig = [node.title, node.sub || '', status, node.algorithm || '', node.board ? 1 : 0, open, (node.shape || 'rect')].join('');
     if (el._sig === sig) return;
     el._sig = sig;
     if (el._status !== status) { el.dataset.status = status; el._status = status; }
+    const shp = node.shape || 'rect';
+    if (el._shape !== shp) { el.dataset.shape = shp; el._shape = shp; }
     // "Has a chart inside" is shown by an accented bottom-right border (.has-chart), not a tag.
     const hasChart = !!node.board;
     if (el._hasChart !== hasChart) { el.classList.toggle('has-chart', hasChart); el._hasChart = hasChart; }
@@ -228,7 +230,7 @@ export function createCanvas(viewportEl, opts = {}) {
     let s = sel + '|';
     for (const n of board.nodes) s += n.id + ':' + n.x + ',' + n.y + ',' + (n.w || NODE_W) + ',' + (n.h || NODE_H) + ';';
     s += '|';
-    for (const e of board.edges) s += e.id + e.from + '>' + e.to + (e.kind || 'flow') + (e.label || '') + ';';
+    for (const e of board.edges) s += e.id + e.from + '>' + e.to + (e.kind || 'flow') + (e.fromSide || '') + (e.label || '') + ';';
     return s;
   }
   function drawEdges(board, boardEl) {
@@ -244,7 +246,7 @@ export function createCanvas(viewportEl, opts = {}) {
     for (const e of board.edges) {
       const a = byId.get(e.from), b = byId.get(e.to);
       if (!a || !b) continue;
-      const g = edgeGeom(e.kind || 'flow', a, b);
+      const g = edgeGeom(e.kind || 'flow', a, b, e.fromSide);
       const path = document.createElementNS(SVGNS, 'path');
       path.setAttribute('d', g.d);
       path.setAttribute('class', 'edge ' + (e.kind || 'flow') + (selection && selection.kind === 'edge' && selection.edge.id === e.id ? ' is-selected' : ''));
@@ -260,29 +262,38 @@ export function createCanvas(viewportEl, opts = {}) {
       }
     }
   }
-  function edgeGeom(kind, a, b) {
+  // the connection anchor of one of a node's four sides, with that side's outward unit normal
+  function sideAnchor(n, side) {
+    const w = n.w || NODE_W, h = n.h || NODE_H;
+    switch (side) {
+      case 'top':   return { x: n.x + w / 2, y: n.y,         nx: 0,  ny: -1 };
+      case 'right': return { x: n.x + w,     y: n.y + h / 2, nx: 1,  ny: 0  };
+      case 'left':  return { x: n.x,         y: n.y + h / 2, nx: -1, ny: 0  };
+      default:      return { x: n.x + w / 2, y: n.y + h,     nx: 0,  ny: 1  };  // bottom
+    }
+  }
+  // the side of node n that faces the point (px,py) — dominant axis from the node's center
+  function autoSide(n, px, py) {
+    const w = n.w || NODE_W, h = n.h || NODE_H, dx = px - (n.x + w / 2), dy = py - (n.y + h / 2);
+    if (Math.abs(dy) >= Math.abs(dx)) return dy >= 0 ? 'bottom' : 'top';
+    return dx >= 0 ? 'right' : 'left';
+  }
+  function edgeGeom(kind, a, b, fromSide) {
     const aw = a.w || NODE_W, ah = a.h || NODE_H, bw = b.w || NODE_W, bh = b.h || NODE_H;
-    const acx = a.x + aw / 2, acy = a.y + ah / 2, bcx = b.x + bw / 2, bcy = b.y + bh / 2;
+    const acy = a.y + ah / 2, bcx = b.x + bw / 2, bcy = b.y + bh / 2;
     if (kind === 'loop') {
       // feedback: exit the source's right edge, bow out to the right, re-enter the target's right
       const sx = a.x + aw, sy = acy, ex = b.x + bw, ey = bcy;
       const gx = Math.max(a.x + aw, b.x + bw) + 70;
       return { d: `M ${sx} ${sy} C ${gx} ${sy}, ${gx} ${ey}, ${ex} ${ey}`, mx: gx, my: (sy + ey) / 2 };
     }
-    const dx = bcx - acx, dy = bcy - acy;
-    let sx, sy, ex, ey, c1x, c1y, c2x, c2y;
-    if (Math.abs(dy) >= Math.abs(dx)) {           // vertical-dominant
-      const down = dy >= 0;
-      sx = acx; sy = down ? a.y + ah : a.y; ex = bcx; ey = down ? b.y : b.y + bh;
-      const k = Math.max(40, Math.abs(ey - sy) * 0.4);
-      c1x = sx; c1y = sy + (down ? k : -k); c2x = ex; c2y = ey - (down ? k : -k);
-    } else {                                       // horizontal-dominant
-      const right = dx >= 0;
-      sx = right ? a.x + aw : a.x; sy = acy; ex = right ? b.x : b.x + bw; ey = bcy;
-      const k = Math.max(40, Math.abs(ex - sx) * 0.4);
-      c1x = sx + (right ? k : -k); c1y = sy; c2x = ex - (right ? k : -k); c2y = ey;
-    }
-    return { d: `M ${sx} ${sy} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${ex} ${ey}`, mx: (sx + ex) / 2, my: (sy + ey) / 2 };
+    // leave from the side the user dragged from (fromSide), else the side facing the target;
+    // arrive on the target's side that faces the source anchor. Curve out along each side's normal.
+    const s = sideAnchor(a, fromSide || autoSide(a, bcx, bcy));
+    const t = sideAnchor(b, autoSide(b, s.x, s.y));
+    const k = Math.max(40, Math.hypot(t.x - s.x, t.y - s.y) * 0.4);
+    const c1x = s.x + s.nx * k, c1y = s.y + s.ny * k, c2x = t.x + t.nx * k, c2y = t.y + t.ny * k;
+    return { d: `M ${s.x} ${s.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${t.x} ${t.y}`, mx: (s.x + t.x) / 2, my: (s.y + t.y) / 2 };
   }
 
   /* ---------- element factories ---------- */
@@ -297,12 +308,14 @@ export function createCanvas(viewportEl, opts = {}) {
   }
   function buildNodeEl() {
     const el = document.createElement('div');
-    el.className = 'node'; el.dataset.lod = 'card';
+    el.className = 'node'; el.dataset.lod = 'card'; el.dataset.shape = 'rect';
+    const shape = document.createElement('div'); shape.className = 'node-shape';   // carries the visual (bg/border/clip) so ports/content aren't clipped
     const chrome = document.createElement('div'); chrome.className = 'node-chrome';
     const inner = document.createElement('div'); inner.className = 'node-inner';
     const ports = document.createElement('div'); ports.className = 'node-ports';
-    ports.innerHTML = '<span class="port port-out" data-port="out" title="drag to connect"></span>';
-    el.append(chrome, inner, ports);
+    ports.innerHTML = ['top', 'right', 'bottom', 'left']
+      .map((side) => `<span class="port" data-port="${side}" title="drag to connect"></span>`).join('');
+    el.append(shape, chrome, inner, ports);
     el._shown = true;
     return el;
   }
@@ -442,11 +455,11 @@ export function createCanvas(viewportEl, opts = {}) {
       grabPointer(e); e.preventDefault(); return;
     }
     if (e.button !== 0) return;
-    const portEl = editing && e.target.closest && e.target.closest('.port-out');
+    const portEl = editing && e.target.closest && e.target.closest('.port');
     const nodeEl = e.target.closest && e.target.closest('.node');
     const edgeEl = e.target.classList && e.target.classList.contains('edge') ? e.target : null;
     lastX = e.clientX; lastY = e.clientY; moved = 0; mode = null; pending = null; connect = null;
-    if (portEl && nodeEl) { startConnect(nodeEl); mode = 'connect'; grabPointer(e); e.preventDefault(); return; }
+    if (portEl && nodeEl) { startConnect(nodeEl, portEl.dataset.port); mode = 'connect'; grabPointer(e); e.preventDefault(); return; }
     if (edgeEl) { selectEdge(edgeEl); return; }   // a click on an edge selects it (no drag)
     // NB: do NOT capture the pointer here. Capturing on a mere press redirects the resulting
     // click/dblclick to `.canvas`, breaking node title double-click-to-edit and HUD buttons.
@@ -552,13 +565,13 @@ export function createCanvas(viewportEl, opts = {}) {
     promoteWorld(); requestRender();
   }, { passive: false });
 
-  function startConnect(nodeEl) { connect = { fromNode: nodeEl._node, boardEl: nodeEl.parentElement, pathEl: null }; }
+  function startConnect(nodeEl, side) { connect = { fromNode: nodeEl._node, boardEl: nodeEl.parentElement, side: side || 'bottom', pathEl: null }; }
   function updateConnect(e) {
     const b = connect.boardEl, a = connect.fromNode;
-    const sx = a.x + (a.w || NODE_W) / 2, sy = a.y + (a.h || NODE_H);
+    const s = sideAnchor(a, connect.side);          // rubber leaves the side the user grabbed
     const { lx, ly } = localPoint(b, e.clientX, e.clientY);
     if (!connect.pathEl) { connect.pathEl = document.createElementNS(SVGNS, 'path'); connect.pathEl.setAttribute('class', 'edge rubber'); connect.pathEl.setAttribute('vector-effect', 'non-scaling-stroke'); b._svg.appendChild(connect.pathEl); }
-    connect.pathEl.setAttribute('d', `M ${sx} ${sy} L ${lx} ${ly}`);
+    connect.pathEl.setAttribute('d', `M ${s.x} ${s.y} L ${lx} ${ly}`);
   }
   function finishConnect(e) {
     if (connect.pathEl) connect.pathEl.remove();
@@ -566,14 +579,14 @@ export function createCanvas(viewportEl, opts = {}) {
     const targetEl = el && el.closest && el.closest('.node');
     if (targetEl && targetEl.parentElement === connect.boardEl && targetEl._node !== connect.fromNode) {
       const board = connect.boardEl._board;
-      board.edges.push({ id: nextId(board.edges, 'e'), from: connect.fromNode.id, to: targetEl._node.id, kind: 'flow' });
+      board.edges.push({ id: nextId(board.edges, 'e'), from: connect.fromNode.id, to: targetEl._node.id, kind: 'flow', fromSide: connect.side });
       connect.boardEl._edgeSig = null; onChange(active.id); requestRender();
     } else if (targetEl && targetEl.parentElement !== connect.boardEl) {
       toast('edges stay within one board — nest a node to link levels');
     }
   }
 
-  function createNodeAt(clientX, clientY) {
+  function createNodeAt(clientX, clientY, opts = {}) {
     const boardEl = activeBoardElAt(clientX, clientY);
     if (!boardEl || !boardEl._board || !Number.isFinite(boardEl._eff) || boardEl._eff <= 0) return;  // not painted yet
     const { lx, ly } = localPoint(boardEl, clientX, clientY);
@@ -582,10 +595,13 @@ export function createCanvas(viewportEl, opts = {}) {
     // Clamp into the positive quadrant: boardBBox treats (0,0) as the board's top-left, so a node
     // with negative coords (e.g. dropped in the empty margin ABOVE the content while dived in)
     // would render up into the parent frame's header strip once this board is shown nested.
-    const node = { id: nextId(board.nodes, 'n'), x: Math.max(0, Math.round(lx - NODE_W / 2)), y: Math.max(0, Math.round(ly - NODE_H / 2)), w: NODE_W, h: NODE_H, title: 'New node', status: 'todo' };
+    const node = { id: nextId(board.nodes, 'n'), x: Math.max(0, Math.round(lx - NODE_W / 2)), y: Math.max(0, Math.round(ly - NODE_H / 2)), w: NODE_W, h: NODE_H, title: opts.title || 'New node', status: 'todo' };
+    if (opts.shape && opts.shape !== 'rect') node.shape = opts.shape;
     board.nodes.push(node); invalidateBBox(board); onChange(active.id);
     selectNodeKnown(node, board);
   }
+  // public: drop a node (of a given shape) at client coords — used by the sidebar shape library
+  function dropNodeAt(clientX, clientY, opts = {}) { ensureEditing(); createNodeAt(clientX, clientY, opts); }
 
   /* ---------- focus stack: seamless infinite-zoom navigation ---------- */
   // A "dive" re-roots the renderer onto a node's child board and rebases the camera so the
@@ -798,7 +814,7 @@ export function createCanvas(viewportEl, opts = {}) {
     load, setEditing, refresh, fit, deleteSelected, addSubchart, zoomToNode,
     getSelection: () => selection, clearSelection,
     // infinite-zoom navigation
-    popFocus: popFocusAndFit, getNav, focusPath: focusToPath, createNodeAtViewCenter,
+    popFocus: popFocusAndFit, getNav, focusPath: focusToPath, createNodeAtViewCenter, dropNodeAt,
     // test/debug hooks — drive deterministic dive/climb checks from window.__atlasCanvas
     _frame: frame,
     _cam: () => ({ ...cam }),
