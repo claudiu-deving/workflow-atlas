@@ -559,7 +559,6 @@ body {
   border-radius: 8px; padding: 7px 12px; cursor: pointer; white-space: nowrap;
 }
 .tool:hover { color: var(--ink); border-color: var(--edge); }
-.tool.edit.on { background: var(--steel); color: #1a1206; border-color: var(--steel); }
 
 /* viewport + the one transformed world */
 .canvas {
@@ -588,11 +587,11 @@ body {
 .node[data-status="done"]    { border-left-color: var(--done); }
 .node[data-status="partial"] { border-left-color: var(--partial); }
 .node[data-status="todo"]    { border-left-color: var(--todo); border-left-style: dashed; }
-/* a node with a chart inside: thick L-accent on the bottom-right corner (~25% of each side) */
+/* a node with a chart inside: thick L-accent on the top-right corner (~25% of each side) */
 .node.has-chart::after {
-  content: ""; position: absolute; right: -1px; bottom: -1px; height: 25%; aspect-ratio: 1;
-  border-right: 4px solid var(--todo); border-bottom: 4px solid var(--todo);
-  border-bottom-right-radius: 11px; pointer-events: none;
+  content: ""; position: absolute; right: -1px; top: -1px; height: 25%; aspect-ratio: 1;
+  border-right: 4px solid var(--todo); border-top: 4px solid var(--todo);
+  border-top-right-radius: 11px; pointer-events: none;
 }
 .node.is-selected { border-color: var(--steel); box-shadow: 0 0 0 1px var(--steel), 0 10px 30px -18px #000; }
 .canvas.editing .node { cursor: grab; }
@@ -662,16 +661,42 @@ body {
 .port[data-port="left"]   { left: -7px;  top: 50%;     transform: translateY(-50%); }
 .port[data-port="right"]  { right: -7px; top: 50%;     transform: translateY(-50%); }
 
+/* drag-to-resize grip (bottom-right corner) — same L-accent motif as the has-chart marker, but
+   smaller. Hidden by default; canvas.js fades it in/out via --grip based on how close the cursor
+   is to this corner, so the handle surfaces only as you reach for it. */
+.node-resize {
+  position: absolute; right: -1px; bottom: -1px; width: 16px; height: 16px;
+  border-right: 4px solid var(--steel); border-bottom: 4px solid var(--steel);
+  border-bottom-right-radius: 11px; cursor: nwse-resize; z-index: 4;
+  opacity: 0; transition: opacity .12s ease;
+}
+.canvas.editing .node-resize { opacity: var(--grip, 0); }
+.node[data-lod="dot"] .node-resize { display: none; }   /* too small to grab when zoomed out */
+
+/* snap alignment guides — a thin line flashed at the x/y a node snapped to (canvas.js positions them) */
+.snap-guide { position: absolute; z-index: 5; pointer-events: none; display: none; background: var(--steel); opacity: .9; }
+.snap-guide.v { top: 0; left: 0; width: 1px; height: 100%; }
+.snap-guide.h { top: 0; left: 0; width: 100%; height: 1px; }
+
 
 /* edges — one svg per board, in that board's own (scaled) coordinate system */
 .edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
-.edges path.edge { fill: none; stroke: var(--muted); stroke-width: 1.5; opacity: .7; pointer-events: stroke; cursor: pointer; }
+.edges path.edge { fill: none; stroke: var(--muted); stroke-width: 1.5; opacity: .7; pointer-events: none; }
+.edges path.edge.hit { stroke: transparent; stroke-width: 16; opacity: 1; pointer-events: stroke; cursor: pointer; }
 .edges path.flow { stroke: var(--muted); }
 .edges path.loop { stroke: var(--steel); stroke-dasharray: 5 4; }
 .edges path.dep  { stroke: var(--todo); stroke-dasharray: 2 4; }
 .edges path.edge.is-selected { stroke: var(--ink); stroke-width: 2.4; opacity: 1; }
 .edges path.rubber { stroke: var(--steel); stroke-dasharray: 4 4; opacity: .9; fill: none; }
-.edge-label { fill: var(--steel); font-family: var(--mono); font-size: 10px; }
+/* edge label tooltip — appears at the cursor on hover (canvas.js positions it) */
+.edge-tip {
+  position: absolute; z-index: 8; pointer-events: none; white-space: nowrap;
+  font-family: var(--mono); font-size: 13px; letter-spacing: .04em;
+  color: var(--ink); background: var(--panel-2); border: 1px solid var(--edge);
+  padding: 3px 8px; border-radius: 6px; box-shadow: 0 6px 18px -8px #000;
+  opacity: 0; transition: opacity .1s;
+}
+.edge-tip.show { opacity: 1; }
 
 /* toast (e.g. "edges stay within one board") */
 .canvas-toast {

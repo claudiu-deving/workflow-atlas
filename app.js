@@ -145,6 +145,7 @@ async function boot() {
     onEditingChange: syncEditUI,   // canvas may auto-enable edit (dbl-click / context-menu add) → keep the UI in sync
   });
   window.__atlasCanvas = canvas;   // handle for power-user debugging / automated checks
+  canvas.setEditing(true);         // edit mode is always on (no toggle) → fires onEditingChange → syncEditUI
   // dirty-aware live reload: our own autosave is hash-suppressed server-side, so a
   // message here means a genuine MCP/other-session change — flush any pending edit first.
   try {
@@ -240,16 +241,11 @@ function renderBreadcrumb(nav) {
 // so the button reflects edit mode whether the user toggled it or the canvas auto-enabled it.
 function syncEditUI(on) {
   editing = on;
-  const editBtn = $('edit-toggle');
-  if (editBtn) { editBtn.classList.toggle('on', on); editBtn.textContent = on ? '✓ Editing' : 'Edit'; }
   document.body.classList.toggle('is-editing', on);
   setHeaderEditable(on);
   if (lastSel) openInspector(lastSel);    // re-render inspector in the new mode
 }
 function wireChrome() {
-  // The button just asks the canvas to flip; canvas calls back onEditingChange → syncEditUI,
-  // so toggling from the button and the canvas auto-enabling edit go through the same path.
-  $('edit-toggle').addEventListener('click', () => canvas.setEditing(!editing));
   $('fit-btn').addEventListener('click', () => canvas.fit());
   $('new-sheet').addEventListener('click', createSheet);
   // keyboard: Esc closes the callout; Delete/Backspace deletes the selection (edit mode) or,
@@ -280,7 +276,6 @@ async function createSheet() {
   SHEETS.push(sheet);
   buildIndex();
   select(SHEETS.length - 1);
-  if (!editing) $('edit-toggle').click();
   scheduleSave(id);
 }
 

@@ -16,9 +16,9 @@ async function settle(page, timeout = 5000) {
 const nav = (page) => page.evaluate(() => window.__atlasCanvas.getNav());
 const zoom = (page) => page.evaluate(() => window.__atlasCanvas._cam().zoom);
 const nodeCount = (page) => page.evaluate(() => window.__atlasCanvas._nodeCount());
-// Enter edit mode via the REAL toggle so BOTH the app's and the canvas's edit state sync
-// (canvas.setEditing alone would leave app.js's keyboard handlers thinking edit mode is off).
-const enableEdit = (page) => page.locator('#edit-toggle').click();
+// Edit mode is always on (app.js calls canvas.setEditing(true) at boot — there's no toggle button),
+// so this is now a no-op kept for call-site readability.
+const enableEdit = async () => {};
 
 async function gotoSheet(page, hash = SHEET) {
   // Block persistence so tests never mutate the seeded project, AND hard-block the live-reload
