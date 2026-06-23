@@ -7,6 +7,9 @@ Two tools for thinking and communicating about software, in one tiny app:
    behaves, with editable parameters and per-step comments, so an idea lands as a
    moving picture instead of a wall of prose.
 
+[Demo video](Demo.mp4)
+
+
 A **zero-dependency local server** serves the app and gives any AI assistant — over
 **MCP**, so it's not tied to one provider — an authoring surface: it can create and
 edit the algorithm storyboards, the workflow maps, and even the CSS/HTML styling,
