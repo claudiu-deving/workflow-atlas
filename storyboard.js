@@ -22,6 +22,7 @@ let decisions = {};      // step → { answer, by, at } resolving an authored op
 let review = { params: {}, comments: {}, decisions: {} };  // baseline overlay loaded from server or sidecar
 let hasServer = false;   // is the autosave server reachable?
 let saveTimer = null;
+let loadSeq = 0;         // bumped per loadAlg() so a slow review fetch can't overwrite a newer load
 const STEP_MS = 1900;
 const nav = $('alg-index');
 
@@ -65,6 +66,7 @@ async function boot() {
   setTabTitle(PROJECT, 'Algorithms');
   renderSwitcher($('proj'), info);
   wireSwitchLinks(PROJECT);
+  startLiveReload();
   let ids = [];
   try {
     const res = await fetch(`${API()}/index`, { cache: 'no-store' });
@@ -72,7 +74,7 @@ async function boot() {
   } catch { /* server down */ }
   const specs = await Promise.all(ids.map(async (id) => {
     try {
-      const r = await fetch(`${API()}/algorithm/${id}`, { cache: 'no-store' });
+      const r = await fetch(`${API()}/algorithm/${encodeURIComponent(id)}`, { cache: 'no-store' });
       return r.ok ? specToTrace(await r.json()) : null;
     } catch { return null; }
   }));
@@ -89,6 +91,7 @@ async function boot() {
 }
 
 async function loadAlg(i) {
+  const myLoad = ++loadSeq;
   trace = ALGORITHMS[i];
   if (location.hash.slice(1) !== trace.meta.id) location.hash = trace.meta.id;
   [...nav.children].forEach((b, j) => b.classList.toggle('active', j === i));
@@ -105,6 +108,7 @@ async function loadAlg(i) {
   } else { back.hidden = true; }
 
   await loadReview();
+  if (myLoad !== loadSeq) return;   // a newer loadAlg superseded this one mid-fetch
   loadParams();
   buildParamBar();
   buildCode();
@@ -123,13 +127,16 @@ async function loadAlg(i) {
 // baseline overlay (tuned params + comments) — from the server, or this browser's
 // local draft as a fallback when the server isn't running.
 async function loadReview() {
+  const seqAtStart = loadSeq;            // a newer loadAlg started during our fetch → don't clobber its state
+  const id = trace.meta.id;              // pin the id so a mid-flight trace switch can't cross URLs
   review = { params: {}, comments: {}, decisions: {} };
   hasServer = false;
   const take = (j) => { review.params = j.params || {}; review.comments = j.comments || {}; review.decisions = j.decisions || {}; };
   try {
-    const res = await fetch(`${API()}/review/${trace.meta.id}`, { cache: 'no-store' });
+    const res = await fetch(`${API()}/review/${encodeURIComponent(id)}`, { cache: 'no-store' });
     if (res.ok) { take(await res.json()); hasServer = true; }
   } catch { /* server not running */ }
+  if (seqAtStart !== loadSeq) return;    // superseded — leave globals for the latest load to set
   if (!hasServer) {
     try { const d = JSON.parse(localStorage.getItem(overlayKey()) || 'null'); if (d) review = { params: d.params || {}, comments: d.comments || {}, decisions: d.decisions || {} }; }
     catch { /* ignore */ }
@@ -145,13 +152,20 @@ function buildOverlay() {
   return { $schema: 'storyboard-review', algorithm: trace.meta.id, params: p, comments: c, decisions: { ...decisions } };
 }
 function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(persist, 450); status('saving…'); }
+// Land a pending (debounced) save now — used before a live-reload or tab unload so an
+// in-flight decision/comment isn't lost to the 450ms debounce window.
+function flushPending() {
+  if (!saveTimer) return Promise.resolve();
+  clearTimeout(saveTimer); saveTimer = null;
+  return persist();
+}
 async function persist() {
   const overlay = buildOverlay();
   try { localStorage.setItem(overlayKey(), JSON.stringify(overlay)); } catch { /* ignore */ }
   if (hasServer) {
     try {
-      const res = await fetch(`${API()}/review/${trace.meta.id}`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(overlay),
+      const res = await fetch(`${API()}/review/${encodeURIComponent(trace.meta.id)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(overlay), keepalive: true,
       });
       status(res.ok ? 'Saved ✓ — the assistant can read it via MCP.' : 'Save failed — is the server up?');
     } catch { status('Save failed — server unreachable. Edits kept in this browser.'); }
@@ -224,6 +238,11 @@ function currentStep() { const r = rows(); return r[Math.min(idx, r.length - 1)]
 
 /* ---------- render ---------- */
 function render() {
+  // Keep idx in range BEFORE any chrome/question/decision reads it. Params can change the
+  // frame count between renders; without this, currentStep() (which clamps) and decisions[idx]
+  // (which doesn't) could point at different steps and mis-stamp a decision.
+  const n = stepCount();
+  idx = n ? Math.min(Math.max(idx, 0), n - 1) : 0;
   if (isCalc()) return renderCalc();
   return renderArray();
 }
@@ -361,7 +380,7 @@ function syncQuestion() {
   if (!q) { pane.hidden = true; return; }
   pane.hidden = false;
   $('alg-question-step').textContent = `step ${String(idx + 1).padStart(2, '0')}`;
-  $('alg-question-text').textContent = q;
+  $('alg-question-text').textContent = (q && typeof q === 'object') ? q.text : q;
   renderDecision();
 }
 function renderDecision() {
@@ -434,6 +453,20 @@ function pause() { playing = false; clearInterval(timer); render(); }
 function toggle() { playing ? pause() : play(); }
 
 function status(msg) { const el = $('alg-status'); if (el) el.textContent = msg; }
+
+// Live-reload: refresh when THIS project reports a file change (scoped by ?p= so an edit in
+// another project doesn't reload us), flushing any pending decision/comment first so the
+// 450ms save debounce can't lose it. No-op without the server.
+function startLiveReload() {
+  try {
+    new EventSource('/api/livereload?p=' + encodeURIComponent(PROJECT)).onmessage = async () => {
+      await flushPending();
+      location.reload();
+    };
+  } catch { /* no server: no live-reload */ }
+}
+// Belt-and-braces: a hard navigation/close also flushes (keepalive PUT survives unload).
+window.addEventListener('beforeunload', () => { flushPending(); });
 
 /* ---------- wiring ---------- */
 $('alg-prev').addEventListener('click', () => { pause(); step(-1); });

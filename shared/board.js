@@ -9,8 +9,6 @@ export const COL_X = 80, ROW_DY = 200;    // legacy-spine auto-layout: column x,
 export const FAN_DX = 280;                 // x pitch between migrated fan tracks
 export const PAD = 40;                      // bbox padding + inset of a child board inside its parent
 export const HEADER = 44;                   // title strip reserved at the top of a "frame" node (fits a 2-line title)
-export const MAX_DEPTH = 6;                 // legacy hint only — nesting is now UNBOUNDED (the renderer
-                                            // re-roots, and the validator guards cycles, not depth)
 
 export const STATUSES = new Set(['done', 'partial', 'todo']);
 const isSlug = (s) => /^[a-z0-9][a-z0-9-]*$/.test(s || '');
@@ -43,20 +41,6 @@ export function boardBBox(board) {
   return { w: Math.max(maxX + PAD, 1), h: Math.max(maxY + PAD, 1) };
 }
 
-// Resolve a node by a path of node ids that walks nested boards. Returns the node,
-// the board that directly contains it, and the path's owning chain — or null.
-export function findNodeByPath(rootBoard, path) {
-  let board = rootBoard, node = null;
-  const p = path || [];
-  for (let i = 0; i < p.length; i++) {
-    if (!board || !Array.isArray(board.nodes)) return null;
-    node = board.nodes.find((n) => n && n.id === p[i]);
-    if (!node) return null;
-    if (i !== p.length - 1) board = node.board;   // descend for the next segment (gate on POSITION,
-  }                                                // not id value — ids are only board-local-unique)
-  return node ? { node, board } : null;
-}
-
 // The BOARD a path points INTO (the child board of the path's last node), or the
 // deepest board still resolvable if the path was pruned. Used by the renderer to
 // re-derive the focus board after a live reload, and to validate a focus stack.
@@ -83,19 +67,19 @@ export function pathChain(rootBoard, path) {
   return out;
 }
 
-export function incidentEdges(board, nodeId) {
-  return ((board && board.edges) || []).filter((e) => e && (e.from === nodeId || e.to === nodeId));
-}
-
 // Recursive structural validation — REJECTS unknown / dangling / over-deep shapes at
 // every level, so the renderer never meets a missing node and the file can't rot.
 // `validateDetail` is injected (the server passes its own, so detail rules stay in
 // one place); pass a noop to skip detail checks on the client.
+const MAX_BOARD_DEPTH = 256;   // re-rooting keeps the live tree shallow; this only caps the stored spec
 export function validateBoard(b, where, seen, validateDetail) {
   // `seen` tracks the ANCESTOR chain so a board nesting one of its own ancestors (an
   // infinite-recursion cycle) is rejected — depth itself is unbounded. Back-compat: the
   // server passes a numeric 0 here, so coerce any non-Set into a fresh traversal set.
   seen = seen instanceof Set ? seen : new Set();
+  // A distinct-object board chained thousands deep passes the ancestor-cycle check below
+  // but would still overflow the stack on this (and every other) recursive walk — cap it.
+  if (seen.size >= MAX_BOARD_DEPTH) throw new Error(`${where}: board nested too deep (max ${MAX_BOARD_DEPTH})`);
   if (!b || typeof b !== 'object' || Array.isArray(b) || !Array.isArray(b.nodes) || !Array.isArray(b.edges))
     throw new Error(`${where} must be { nodes: [], edges: [] }`);
   if (seen.has(b)) throw new Error(`${where}: board cycle detected (a board nests one of its ancestors)`);
@@ -129,6 +113,7 @@ export function validateBoard(b, where, seen, validateDetail) {
       throw new Error(`${w}: endpoint must be a node id in THIS board (from="${e.from}", to="${e.to}")`);
     if (e.from === e.to) throw new Error(`${w}: self-edge not allowed (from === to === "${e.from}")`);
     if (e.kind != null && !['flow', 'loop', 'dep'].includes(e.kind)) throw new Error(`${w}.kind must be flow, loop, or dep`);
+    if (e.fromSide != null && !['top', 'right', 'bottom', 'left'].includes(e.fromSide)) throw new Error(`${w}.fromSide must be top, right, bottom, or left`);
   });
   seen.delete(b);   // leave the chain so a board may legitimately recur in a SIBLING subtree; only ANCESTOR cycles throw
 }

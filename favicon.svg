@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!-- ▚ mark: upper-left + lower-right quadrants, transparent background -->
+  <rect x="2" y="2" width="13" height="13" rx="1.5" fill="#ffc24a"/>
+  <rect x="17" y="17" width="13" height="13" rx="1.5" fill="#ffc24a"/>
+</svg>

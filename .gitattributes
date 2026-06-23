@@ -1,0 +1,14 @@
+# Normalize line endings: store text as LF in the repo, regardless of the
+# contributor's core.autocrlf setting. Keeps shell scripts and the bin shebang
+# working on Linux/macOS.
+* text=auto eol=lf
+
+# Source files are always text (defend against a stray binary misdetection,
+# e.g. a control byte in a string literal flipping git to binary mode).
+*.mjs text eol=lf
+*.js  text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.md  text eol=lf
+*.svg text eol=lf

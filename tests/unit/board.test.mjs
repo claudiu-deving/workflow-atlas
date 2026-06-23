@@ -1,10 +1,11 @@
 // Unit tests for the pure model layer (shared/board.js). Run with: node --test
-// Focus: the depth-cap removal + cycle guard, and the path helpers the focus stack/breadcrumb rely on.
+// Focus: deep nesting allowed up to a high safety cap, the cycle guard, and the path
+// helpers the focus stack/breadcrumb rely on.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  validateBoard, boardAtPath, pathChain, findNodeByPath, nextId, boardBBox,
+  validateBoard, boardAtPath, pathChain, nextId, boardBBox,
 } from '../../shared/board.js';
 
 const node = (id, extra = {}) => ({ id, title: id, x: 0, y: 0, w: 240, h: 96, ...extra });
@@ -15,12 +16,19 @@ test('validateBoard accepts a normal shallow board', () => {
   assert.doesNotThrow(() => validateBoard(b, 'board', 0, () => {}));
 });
 
-test('validateBoard accepts DEEP linear nesting (no depth cap anymore)', () => {
+test('validateBoard accepts DEEP linear nesting (well past any real board)', () => {
   let leaf = board();
   let root = leaf;
   for (let i = 0; i < 40; i++) root = board([node('n1', { board: root })]);   // 40 levels deep
   assert.doesNotThrow(() => validateBoard(root, 'board', new Set(), () => {}),
     '40-level nesting must validate (old build threw past 6)');
+});
+
+test('validateBoard REJECTS pathologically deep nesting (stack-overflow guard)', () => {
+  let root = board();
+  for (let i = 0; i < 400; i++) root = board([node('n1', { board: root })]);  // 400 distinct levels, no cycle
+  assert.throws(() => validateBoard(root, 'board', new Set(), () => {}), /too deep/i,
+    'a thousands-deep payload must be rejected before it overflows the recursive walk');
 });
 
 test('validateBoard REJECTS an ancestor cycle (a board nesting itself)', () => {
@@ -49,6 +57,13 @@ test('validateBoard still rejects malformed shapes and dangling edges', () => {
   assert.throws(() => validateBoard(board([{ id: 'n1' }]), 'board', 0, () => {}), /title/);
 });
 
+test('validateBoard checks edge.fromSide (accepts a valid side, rejects a bogus one)', () => {
+  const ok = board([node('n1'), node('n2')], [{ id: 'e1', from: 'n1', to: 'n2', fromSide: 'right' }]);
+  assert.doesNotThrow(() => validateBoard(ok, 'board', 0, () => {}));
+  const bad = board([node('n1'), node('n2')], [{ id: 'e1', from: 'n1', to: 'n2', fromSide: 'north' }]);
+  assert.throws(() => validateBoard(bad, 'board', 0, () => {}), /fromSide/);
+});
+
 test('server-style numeric 3rd arg is treated as a fresh traversal (back-compat)', () => {
   const b = board([node('n1', { board: board([node('m1')]) })]);
   assert.doesNotThrow(() => validateBoard(b, 'board', 0, () => {}));   // server calls validateBoard(x,'board',0,...)
@@ -72,13 +87,6 @@ test('pathChain yields {id,title,node} for each step and stops at a break', () =
   assert.deepEqual(chain.map((c) => c.title), ['Root', 'Mid']);
   assert.equal(chain[0].node, root.nodes[0]);
   assert.deepEqual(pathChain(root, ['n1', 'nope']).map((c) => c.title), ['Root']);
-});
-
-test('findNodeByPath resolves nested nodes and returns null on a bad path', () => {
-  const mid = board([node('m1')]);
-  const root = board([node('n1', { board: mid })]);
-  assert.equal(findNodeByPath(root, ['n1', 'm1']).node, mid.nodes[0]);
-  assert.equal(findNodeByPath(root, ['n1', 'XX']), null);
 });
 
 test('nextId never reuses a deleted suffix', () => {

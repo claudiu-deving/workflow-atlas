@@ -18,6 +18,12 @@ each session to its own project automatically (see [Projects](#projects)).
 Open source under the **MIT License** (see `LICENSE`). No build step, no npm
 install, no framework — plain HTML/CSS/JS and Node built-ins.
 
+> **A fully AI-driven project — by AI, for AI.** Every line of code, every
+> storyboard, and these docs were authored by AI assistants through the very MCP
+> surface described below; humans only steer and review. The app exists to give
+> an AI a place to *show* its thinking, not just describe it. Expect the quirks
+> that come with that, and read the code before you trust it.
+
 > New projects start **empty**, so demos never mix with real work. To populate a
 > fresh project with the bundled **demo content** (the authoring-loop and boot &
 > serve maps, plus binary search / bubble sort / Euclid's GCD storyboards), run the
@@ -175,7 +181,7 @@ Each storyboard is a **JSON spec** (authored with `save_algorithm`, auto-discove
 A **frame** (`kind: "array"`) is `{ array[], cls{index:state}, ptr{label:index},
 note, line, verdict{ok?,text}, question? }`, where `state` is one of
 `idle·active·compare·lo·hi·mid·eliminated·found·sorted`. A **row**
-(`kind: "calc"`) is `{ label, result?, expr?, sub?, note, line, question? }`.
+(`kind: "calc"`) is `{ label, result?, unit?, expr?, sub?, kind?(input|result), bad?, line, note, question? }`.
 
 Instead of `steps`, a spec may set `"builtin": "<name>"` + `"data"` to be driven
 live by a built-in generator in `shared/generators.js` (the bundled binary
@@ -217,8 +223,8 @@ acts on the session's project. Tools:
 - **Review / decisions** — `set_param`, `set_comment`, `set_decision`,
   `reopen_question` (algorithms); `set_workflow_decision`,
   `reopen_workflow_question` (workflow open questions)
-- **The look** — `list_files`, `get_file`, `set_file` → read/overwrite the raw
-  CSS / HTML / JS that style the app (project data is edited with the content tools)
+- **The look** — `list_files`, `get_file`, `set_file` → read/overwrite raw app
+  files (CSS / HTML / JS / JSON / SVG / MD / TXT) to style the app (project data is edited with the content tools)
 
 So the loop is: the assistant proposes an algorithm → it builds the storyboard
 with `save_algorithm` → you watch it run and leave a comment or decision → the
