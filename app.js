@@ -23,6 +23,8 @@ let current = null;
 let editing = false;
 let lastSel = null;          // the canvas selection currently shown in the inspector
 let canvas = null;
+let suppressHashWrite = false;   // true while we drive nav FROM the URL, so onNav doesn't write it back
+let pendingSheetHist = 'replace';// how the next sheet load records in history: 'push' | 'replace'
 
 /* ---------- workflow review (decisions on node open[] questions) ---------- */
 let wfReview = { decisions: {} };       // sheetId → { [question text]: { answer, by, at } }
@@ -135,7 +137,11 @@ async function boot() {
     onChange: (id) => { scheduleSave(id); refreshHeaderCount(); },
     onSelect: (sel) => { lastSel = sel; if (sel) openInspector(sel); else closeCallout(); },
     openCount: nodeOpenCount,
-    onNav: renderBreadcrumb,
+    onNav: (nav, cause) => {       // mirror the nesting position into the URL hash (deep-linkable)
+      renderBreadcrumb(nav);
+      const mode = cause === 'load' ? pendingSheetHist : (cause === 'user' ? 'push' : 'replace');
+      syncHash(nav.path, mode);
+    },
     onEditingChange: syncEditUI,   // canvas may auto-enable edit (dbl-click / context-menu add) → keep the UI in sync
   });
   window.__atlasCanvas = canvas;   // handle for power-user debugging / automated checks
@@ -155,23 +161,54 @@ async function boot() {
       : 'Run the Atlas server so the assistant can author maps for this project.';
     return;
   }
-  const start = SHEETS.findIndex((s) => s.id === location.hash.slice(1));
-  select(start >= 0 ? start : 0);
+  navigateToHash();   // open the sheet (and nested focus) the URL points at, else the first sheet
+}
+
+/* ---------- URL ↔ focus path (deep-linkable nesting: #sheetId/nodeId/nodeId…) ---------- */
+function parseHash() {
+  const parts = location.hash.replace(/^#/, '').split('/').map(decodeURIComponent).filter(Boolean);
+  return { sheetId: parts[0] || '', path: parts.slice(1) };
+}
+function buildHash(sheetId, path) {
+  return '#' + [sheetId, ...(path || [])].filter(Boolean).map(encodeURIComponent).join('/');
+}
+// Write the current sheet+focus to the URL. pushState/replaceState don't fire hashchange, so this
+// never loops back into navigateToHash; mode 'push' adds a Back-step, 'replace' just keeps it current.
+function syncHash(path, mode) {
+  if (suppressHashWrite || !current) return;
+  const h = buildHash(current.id, path);
+  if (h === location.hash) return;
+  if (mode === 'push') history.pushState(null, '', h);
+  else history.replaceState(null, '', h);
+}
+// Drive the app FROM the URL (boot, back/forward, deep link, manual edit). Idempotent.
+function navigateToHash() {
+  const { sheetId, path } = parseHash();
+  let i = SHEETS.findIndex((s) => s.id === sheetId);
+  if (i < 0) { if (!sheetId && SHEETS.length) i = 0; else return; }   // empty hash → first sheet
+  const sameSheet = current && current.id === SHEETS[i].id;
+  if (sameSheet && JSON.stringify(canvas.getNav().path) === JSON.stringify(path)) return;  // already there
+  suppressHashWrite = true;
+  try {
+    if (!sameSheet) select(i, { focus: path });
+    else canvas.focusPath(path, { instant: true });
+  } finally { suppressHashWrite = false; }
+  syncHash(canvas.getNav().path, 'replace');   // canonicalize (e.g. if the path was pruned)
 }
 
 /* ---------- render a sheet ---------- */
-function select(i) {
+function select(i, opts = {}) {
   const s = SHEETS[i];
   if (!s) return;
+  pendingSheetHist = opts.hist || 'push';   // a sheet switch is a Back-step; boot/hash nav suppress this
   current = migrateSheet(s);
-  location.hash = s.id;
   [...indexNav.children].forEach((b, j) => b.classList.toggle('active', j === i));
   $('sh-code').textContent = s.code || '';
   $('sh-title').textContent = s.title || s.name || s.id;
   $('sh-sub').textContent = s.sub || '';
   refreshHeaderCount();
   closeCallout();
-  canvas.load(current);
+  canvas.load(current, { focus: opts.focus });   // hash is written by onNav, not here
 }
 
 function refreshHeaderCount() {
@@ -422,9 +459,7 @@ function block(h, inner) { return `<div class="co-block"><div class="co-h">${h}<
 /* ---------- wiring ---------- */
 $('callout-close').addEventListener('click', closeCallout);
 scrim.addEventListener('click', closeCallout);
-window.addEventListener('hashchange', () => {
-  const i = SHEETS.findIndex((s) => s.id === location.hash.slice(1));
-  if (i >= 0 && SHEETS[i] !== current) select(i);
-});
+window.addEventListener('popstate', navigateToHash);   // Back/Forward move through the nesting + sheets
+window.addEventListener('hashchange', navigateToHash);  // manual hash edits / external deep links
 
 boot();

@@ -194,6 +194,9 @@ export function createCanvas(viewportEl, opts = {}) {
     if (el._sig === sig) return;
     el._sig = sig;
     if (el._status !== status) { el.dataset.status = status; el._status = status; }
+    // "Has a chart inside" is shown by an accented bottom-right border (.has-chart), not a tag.
+    const hasChart = !!node.board;
+    if (el._hasChart !== hasChart) { el.classList.toggle('has-chart', hasChart); el._hasChart = hasChart; }
     el.querySelector('.node-chrome').innerHTML =
       `<div class="node-top"><span class="node-dot"></span>` +
       `<h3 class="node-title">${esc(node.title)}</h3>` +
@@ -201,7 +204,6 @@ export function createCanvas(viewportEl, opts = {}) {
       (node.sub ? `<p class="node-sub">${esc(node.sub)}</p>` : '') +
       `<div class="node-foot">` +
       (node.algorithm ? `<span class="node-tag algo">▶ storyboard</span>` : '') +
-      (node.board ? `<span class="node-tag nest">▦ chart inside</span>` : '') +
       (open ? `<span class="node-tag q">${open} open</span>` : '') +
       `</div>`;
   }
@@ -614,7 +616,7 @@ export function createCanvas(viewportEl, opts = {}) {
     const bb = bboxOf(focusBoard);
     return bb.w * cam.zoom <= POP_FIT * viewW && bb.h * cam.zoom <= POP_FIT * viewH;
   }
-  function pushFocus(node, ownerEl) {            // dive one level (node must be a direct child of focusBoard)
+  function pushFocus(node, ownerEl, cause = 'auto') {   // dive one level (node must be a direct child of focusBoard)
     if (!node || !node.board) return;
     if (ownerEl && ownerEl.parentElement !== rootBoardEl) return;
     if (focusPath.includes(node.id) && focusBoard.nodes.indexOf(node) < 0) return;  // paranoia vs cycles
@@ -622,9 +624,9 @@ export function createCanvas(viewportEl, opts = {}) {
     focusStack.push({ board: focusBoard, path: focusPath.slice(), node, px, py, innerScale });
     cam.x = cam.x + px * z; cam.y = cam.y + py * z; cam.zoom = z * innerScale;
     focusBoard = node.board; focusPath = focusPath.concat(node.id);
-    clearRoot(); emitNav();
+    clearRoot(); emitNav(cause);
   }
-  function popFocus() {                           // climb one level, re-deriving the parent camera
+  function popFocus(cause = 'auto') {             // climb one level, re-deriving the parent camera
     if (!focusStack.length) return false;
     const fr = focusStack.pop();
     // Prefer LIVE geometry: if the owner node was edited (or its child board grew) while we were
@@ -637,7 +639,7 @@ export function createCanvas(viewportEl, opts = {}) {
     const parentZoom = cam.zoom / s;
     cam.x = cam.x - px * parentZoom; cam.y = cam.y - py * parentZoom; cam.zoom = parentZoom;
     focusBoard = fr.board; focusPath = fr.path.slice();
-    clearRoot(); emitNav();
+    clearRoot(); emitNav(cause);
     return true;
   }
   // Jump to an arbitrary path from the sheet root (breadcrumb crumb click). Rebuilds the stack
@@ -655,25 +657,17 @@ export function createCanvas(viewportEl, opts = {}) {
       board = n.board; acc.push(id);
     }
     focusBoard = board; focusPath = acc;
-    clearRoot(); emitNav();
+    clearRoot(); emitNav((opts && opts.cause) || 'user');
     if (opts && opts.instant) fit();              // restore (e.g. after reload): land instantly, no glide
     else zoomToFitFocus(0.9);                     // sync → sets `tween`, blocking premature auto-nav in the gap
   }
   function getNav() {
     return { depth: focusPath.length, path: focusPath.slice(), chain: active ? pathChain(active.board, focusPath) : [], canPop: focusStack.length > 0 };
   }
-  // Persist the focus path per-sheet so a live/MCP reload (location.reload) doesn't yank you back
-  // to the root from deep nesting — you reappear where you were. Per-tab (sessionStorage).
-  const focusKey = () => 'atlas-focus:' + (active && active.id);
-  function persistFocus() { try { sessionStorage.setItem(focusKey(), JSON.stringify(focusPath)); } catch { /* ignore */ } }
-  function readSavedFocus() {
-    try { const s = JSON.parse(sessionStorage.getItem(focusKey()) || '[]'); return Array.isArray(s) ? s : []; } catch { return []; }
-  }
-  function restoreFocus(saved) {
-    // only restore if the saved path still resolves into a real nested board (graceful if pruned)
-    if (saved.length && boardAtPath(active.board, saved) !== active.board) focusToPath(saved, { instant: true });
-  }
-  function emitNav() { persistFocus(); onNav(getNav()); }
+  // The current focus path is mirrored to the URL hash by app.js (via onNav), so it survives reload
+  // AND back/forward/deep links. `cause` lets app.js choose pushState (deliberate dive/pop/jump) vs
+  // replaceState (the auto re-root/pop on a zoom gesture, and the initial sheet load).
+  function emitNav(cause) { onNav(getNav(), cause); }
 
   /* ---------- camera moves ---------- */
   function zoomToNode(node, nodeEl) {
@@ -682,7 +676,7 @@ export function createCanvas(viewportEl, opts = {}) {
     // The fit tween MUST start synchronously: it sets `tween`, which blocks the auto-pop from
     // firing in the gap before the child is zoomed in (the child is briefly small → "fits").
     if (node.board && nodeEl.parentElement === rootBoardEl && !tween && !mode) {
-      pushFocus(node, nodeEl);
+      pushFocus(node, nodeEl, 'user');   // deliberate dive (double-click) → a history entry
       zoomToFitFocus(0.9);
       return;
     }
@@ -751,14 +745,15 @@ export function createCanvas(viewportEl, opts = {}) {
     for (const n of nodes) if (n.board && normalizeBoards(n.board)) changed = true;
     return changed;
   }
-  function load(sheet) {
+  function load(sheet, opts = {}) {
     active = sheet; selection = null; onSelect(null);
     const healed = normalizeBoards(sheet.board);   // heal any out-of-bounds (negative) coords from old data
-    const saved = readSavedFocus();   // read BEFORE the root emitNav() overwrites the stored path
     focusBoard = sheet.board; focusPath = []; focusStack.length = 0;   // start at the sheet root
     clearRoot();
-    frame(); fit(); emitNav();
-    restoreFocus(saved);   // re-enter the depth this sheet was last viewed at (survives reload)
+    frame(); fit(); emitNav('load');
+    // Re-enter a deep focus carried by the URL (back/forward, deep link, reload) — graceful if pruned.
+    const focus = opts.focus || [];
+    if (focus.length && boardAtPath(active.board, focus) !== active.board) focusToPath(focus, { instant: true, cause: 'load' });
     if (healed) onChange(sheet.id);   // persist the healed coordinates
   }
   function setEditing(b) { if (editing === b) return; editing = b; viewportEl.classList.toggle('editing', b); onEditingChange(b); requestRender(); }
@@ -795,7 +790,7 @@ export function createCanvas(viewportEl, opts = {}) {
     return selection && selection.node;
   }
   // Public climb: pop one level and glide the parent into view (the auto-pop path stays seamless).
-  function popFocusAndFit() { if (popFocus()) { zoomToFitFocus(0.9); return true; } return false; }
+  function popFocusAndFit() { if (popFocus('user')) { zoomToFitFocus(0.9); return true; } return false; }
 
   window.addEventListener('resize', requestRender);
 

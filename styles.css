@@ -589,6 +589,13 @@ body {
 .node[data-status="done"]    { border-left-color: var(--done); }
 .node[data-status="partial"] { border-left-color: var(--partial); }
 .node[data-status="todo"]    { border-left-color: var(--todo); border-left-style: dashed; }
+/* "chart inside" is signalled by a thick L-accent hugging the bottom-right corner (≈25% of each
+   side), instead of a footer tag. A pseudo-element does it since a CSS border can't be partial. */
+.node.has-chart::after {
+  content: ""; position: absolute; right: -1px; bottom: -1px; height: 25%; aspect-ratio: 1;
+  border-right: 4px solid var(--todo); border-bottom: 4px solid var(--todo);
+  border-bottom-right-radius: 11px; pointer-events: none;
+}
 .node.is-selected { border-color: var(--steel); box-shadow: 0 0 0 1px var(--steel), 0 10px 30px -18px #000; }
 .canvas.editing .node { cursor: grab; }
 
