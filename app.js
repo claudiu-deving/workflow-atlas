@@ -108,35 +108,6 @@ window.addEventListener('beforeunload', () => {
 });
 
 /* ---------- sheet index (title block) ---------- */
-/* ---------- shape library: drag a swatch onto the canvas to drop that shape ---------- */
-const SHAPE_DEFS = [{ id: 'rect', label: 'Box' }, { id: 'ellipse', label: 'Ellipse' }, { id: 'diamond', label: 'Diamond' }];
-function buildShapeLib() {
-  const host = $('shape-lib');
-  if (!host) return;
-  host.innerHTML = '<div class="shape-lib-h">Shapes — drag onto canvas</div><div class="shape-lib-row">' +
-    SHAPE_DEFS.map((s) => `<button class="shape-swatch" type="button" data-shape="${s.id}" title="${s.label} — drag onto the canvas"><i></i></button>`).join('') + '</div>';
-  host.querySelectorAll('.shape-swatch').forEach((sw) => sw.addEventListener('pointerdown', (e) => startShapeDrag(e, sw.dataset.shape)));
-}
-function startShapeDrag(e, shape) {
-  e.preventDefault();
-  const ghost = document.createElement('div');
-  ghost.className = 'shape-ghost'; ghost.dataset.shape = shape;
-  ghost.style.left = e.clientX + 'px'; ghost.style.top = e.clientY + 'px';
-  document.body.appendChild(ghost);
-  const move = (ev) => { ghost.style.left = ev.clientX + 'px'; ghost.style.top = ev.clientY + 'px'; };
-  const up = (ev) => {
-    document.removeEventListener('pointermove', move);
-    document.removeEventListener('pointerup', up);
-    ghost.remove();
-    const r = $('canvas').getBoundingClientRect();
-    if (canvas && ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom) {
-      canvas.dropNodeAt(ev.clientX, ev.clientY, { shape });   // drop where released, in the focused board
-    }
-  };
-  document.addEventListener('pointermove', move);
-  document.addEventListener('pointerup', up);
-}
-
 function buildIndex() {
   indexNav.innerHTML = '';
   SHEETS.forEach((s, i) => {
@@ -161,7 +132,6 @@ async function boot() {
   } catch { /* server down */ }
   await loadWorkflowReview();
   buildIndex();
-  buildShapeLib();
   wireChrome();
   canvas = createCanvas($('canvas'), {
     onChange: (id) => { scheduleSave(id); refreshHeaderCount(); },
@@ -364,8 +334,6 @@ function renderNodeEditor(node, board) {
       <input class="ed-in" id="ed-sub" value="${esc(node.sub || '')}" />
       <label class="ed-l">Status</label>
       <div class="seg-row" id="ed-status">${seg}</div>
-      <label class="ed-l">Shape</label>
-      <div class="seg-row" id="ed-shape">${SHAPE_DEFS.map((s) => `<button type="button" class="seg ${(node.shape || 'rect') === s.id ? 'on' : ''}" data-shape="${s.id}">${s.label}</button>`).join('')}</div>
       <label class="ed-l">Note</label>
       <textarea class="ed-ta" id="ed-note" rows="3">${esc(d.note || '')}</textarea>
       <label class="ed-l">Takes in <i>(one per line)</i></label>
@@ -414,11 +382,6 @@ function renderNodeEditor(node, board) {
   b.querySelectorAll('#ed-status .seg').forEach((btn) => btn.addEventListener('click', () => {
     node.status = btn.dataset.st;
     b.querySelectorAll('#ed-status .seg').forEach((x) => x.classList.toggle('on', x === btn));
-    save();
-  }));
-  b.querySelectorAll('#ed-shape .seg').forEach((btn) => btn.addEventListener('click', () => {
-    node.shape = btn.dataset.shape === 'rect' ? undefined : btn.dataset.shape;   // omit default for clean JSON
-    b.querySelectorAll('#ed-shape .seg').forEach((x) => x.classList.toggle('on', x === btn));
     save();
   }));
   b.querySelector('#ed-sub-chart').addEventListener('click', () => canvas.addSubchart());

@@ -578,55 +578,23 @@ body {
 .board { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
 
 /* a node — reuses the card visual language; status drives the left rule + dot + chip */
-.node { position: absolute; user-select: none; -webkit-user-select: none; }   /* a transparent box; .node-shape draws the visual */
-/* the visual layer — kept SEPARATE from .node so a clip-path/ellipse shape never clips the ports or content */
-.node-shape {
-  position: absolute; inset: 0; box-sizing: border-box; z-index: 0;
+.node {
+  position: absolute;
   background: var(--panel-2); border: 1px solid var(--hair); border-left: 3px solid var(--edge);
   border-radius: 11px; box-shadow: 0 10px 30px -22px #000;
+  user-select: none; -webkit-user-select: none;
 }
-.node-chrome, .node-inner { position: relative; z-index: 1; }   /* above the shape layer */
-/* NB: .node-ports stays unpositioned so its absolute ports anchor to .node (the bbox), not the
-   ports container; the ports' own z-index keeps them above the shape. */
-/* …except the title while it's being edited inline */
 .node-title[contenteditable="true"] { user-select: text; -webkit-user-select: text; cursor: text; outline: none; }
-.node[data-status="done"]    .node-shape { border-left-color: var(--done); }
-.node[data-status="partial"] .node-shape { border-left-color: var(--partial); }
-.node[data-status="todo"]    .node-shape { border-left-color: var(--todo); border-left-style: dashed; }
-/* "chart inside" is signalled by a thick L-accent hugging the bottom-right corner (≈25% of each
-   side), instead of a footer tag. A pseudo-element does it since a CSS border can't be partial. */
+.node[data-status="done"]    { border-left-color: var(--done); }
+.node[data-status="partial"] { border-left-color: var(--partial); }
+.node[data-status="todo"]    { border-left-color: var(--todo); border-left-style: dashed; }
+/* a node with a chart inside: thick L-accent on the bottom-right corner (~25% of each side) */
 .node.has-chart::after {
-  content: ""; position: absolute; right: -1px; bottom: -1px; height: 25%; aspect-ratio: 1; z-index: 2;
+  content: ""; position: absolute; right: -1px; bottom: -1px; height: 25%; aspect-ratio: 1;
   border-right: 4px solid var(--todo); border-bottom: 4px solid var(--todo);
   border-bottom-right-radius: 11px; pointer-events: none;
 }
-.node.is-selected .node-shape { border-color: var(--steel); box-shadow: 0 0 0 1px var(--steel), 0 10px 30px -18px #000; }
-
-/* ---- node shapes (the visual lives on .node-shape so ports/content stay unclipped) ---- */
-.node[data-shape="ellipse"] .node-shape { border-radius: 50%; }
-/* diamond: clip the layer to a rhombus; a slightly larger clipped ::before peeks out as the outline
-   (clip-path eats a normal border). The bbox side-midpoints land on the diamond's four points. */
-.node[data-shape="diamond"] .node-shape {
-  border: 0; border-radius: 0; box-shadow: none; background: var(--hair);   /* outline color */
-  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
-}
-.node[data-shape="diamond"] .node-shape::before {   /* fill, inset so the outline peeks around it */
-  content: ""; position: absolute; inset: 1.5px; background: var(--panel-2);
-  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
-}
-.node[data-shape="diamond"].is-selected .node-shape { background: var(--steel); }
-/* shaped nodes center a trimmed label (sub/foot/chip/corner-accent don't fit a non-rect outline) */
-.node[data-shape="ellipse"] .node-chrome,
-.node[data-shape="diamond"] .node-chrome {
-  height: 100%; box-sizing: border-box; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; text-align: center;
-}
-.node[data-shape="ellipse"] .node-top, .node[data-shape="diamond"] .node-top { justify-content: center; width: 100%; }
-.node[data-shape="ellipse"] .node-chrome { padding: 8px 14%; }
-.node[data-shape="diamond"] .node-chrome { padding: 8px 24%; }
-.node[data-shape="ellipse"] .node-sub, .node[data-shape="ellipse"] .node-foot, .node[data-shape="ellipse"] .node-chip,
-.node[data-shape="diamond"] .node-sub, .node[data-shape="diamond"] .node-foot, .node[data-shape="diamond"] .node-chip { display: none; }
-.node[data-shape="ellipse"].has-chart::after, .node[data-shape="diamond"].has-chart::after { display: none; }
+.node.is-selected { border-color: var(--steel); box-shadow: 0 0 0 1px var(--steel), 0 10px 30px -18px #000; }
 .canvas.editing .node { cursor: grab; }
 
 .node-chrome { padding: 12px 14px; }
@@ -694,26 +662,6 @@ body {
 .port[data-port="left"]   { left: -7px;  top: 50%;     transform: translateY(-50%); }
 .port[data-port="right"]  { right: -7px; top: 50%;     transform: translateY(-50%); }
 
-/* shape library (sidebar) — drag a swatch onto the canvas to drop that shape */
-.shape-lib { padding: 16px 16px 6px; }
-.shape-lib-h { font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); margin-bottom: 10px; }
-.shape-lib-row { display: flex; gap: 12px; }
-.shape-swatch {
-  width: 50px; height: 38px; padding: 0; cursor: grab; background: none; border: 0;
-  display: grid; place-items: center; touch-action: none;
-}
-.shape-swatch i { width: 40px; height: 28px; background: var(--panel-2); border: 1.5px solid var(--edge); display: block; }
-.shape-swatch[data-shape="rect"]    i { border-radius: 6px; }
-.shape-swatch[data-shape="ellipse"] i { border-radius: 50%; }
-.shape-swatch[data-shape="diamond"] i { border-radius: 0; clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
-.shape-swatch:hover i { border-color: var(--steel); background: var(--panel); }
-.shape-ghost {
-  position: fixed; z-index: 50; width: 64px; height: 42px; pointer-events: none;
-  background: color-mix(in srgb, var(--panel-2) 88%, transparent); border: 1.5px solid var(--steel);
-  border-radius: 8px; opacity: .9; transform: translate(-50%, -50%);
-}
-.shape-ghost[data-shape="ellipse"] { border-radius: 50%; }
-.shape-ghost[data-shape="diamond"] { border-radius: 0; clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
 
 /* edges — one svg per board, in that board's own (scaled) coordinate system */
 .edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }

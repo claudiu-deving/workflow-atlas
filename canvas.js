@@ -190,12 +190,10 @@ export function createCanvas(viewportEl, opts = {}) {
     if (el._editing) return;                 // don't blow away the contentEditable title mid-edit
     const open = openCount(node);
     const status = node.status || 'todo';
-    const sig = [node.title, node.sub || '', status, node.algorithm || '', node.board ? 1 : 0, open, (node.shape || 'rect')].join('');
+    const sig = [node.title, node.sub || '', status, node.algorithm || '', node.board ? 1 : 0, open].join('');
     if (el._sig === sig) return;
     el._sig = sig;
     if (el._status !== status) { el.dataset.status = status; el._status = status; }
-    const shp = node.shape || 'rect';
-    if (el._shape !== shp) { el.dataset.shape = shp; el._shape = shp; }
     // "Has a chart inside" is shown by an accented bottom-right border (.has-chart), not a tag.
     const hasChart = !!node.board;
     if (el._hasChart !== hasChart) { el.classList.toggle('has-chart', hasChart); el._hasChart = hasChart; }
@@ -308,14 +306,13 @@ export function createCanvas(viewportEl, opts = {}) {
   }
   function buildNodeEl() {
     const el = document.createElement('div');
-    el.className = 'node'; el.dataset.lod = 'card'; el.dataset.shape = 'rect';
-    const shape = document.createElement('div'); shape.className = 'node-shape';   // carries the visual (bg/border/clip) so ports/content aren't clipped
+    el.className = 'node'; el.dataset.lod = 'card';
     const chrome = document.createElement('div'); chrome.className = 'node-chrome';
     const inner = document.createElement('div'); inner.className = 'node-inner';
     const ports = document.createElement('div'); ports.className = 'node-ports';
     ports.innerHTML = ['top', 'right', 'bottom', 'left']
       .map((side) => `<span class="port" data-port="${side}" title="drag to connect"></span>`).join('');
-    el.append(shape, chrome, inner, ports);
+    el.append(chrome, inner, ports);
     el._shown = true;
     return el;
   }
@@ -596,12 +593,10 @@ export function createCanvas(viewportEl, opts = {}) {
     // with negative coords (e.g. dropped in the empty margin ABOVE the content while dived in)
     // would render up into the parent frame's header strip once this board is shown nested.
     const node = { id: nextId(board.nodes, 'n'), x: Math.max(0, Math.round(lx - NODE_W / 2)), y: Math.max(0, Math.round(ly - NODE_H / 2)), w: NODE_W, h: NODE_H, title: opts.title || 'New node', status: 'todo' };
-    if (opts.shape && opts.shape !== 'rect') node.shape = opts.shape;
     board.nodes.push(node); invalidateBBox(board); onChange(active.id);
     selectNodeKnown(node, board);
   }
   // public: drop a node (of a given shape) at client coords — used by the sidebar shape library
-  function dropNodeAt(clientX, clientY, opts = {}) { ensureEditing(); createNodeAt(clientX, clientY, opts); }
 
   /* ---------- focus stack: seamless infinite-zoom navigation ---------- */
   // A "dive" re-roots the renderer onto a node's child board and rebases the camera so the
@@ -814,7 +809,7 @@ export function createCanvas(viewportEl, opts = {}) {
     load, setEditing, refresh, fit, deleteSelected, addSubchart, zoomToNode,
     getSelection: () => selection, clearSelection,
     // infinite-zoom navigation
-    popFocus: popFocusAndFit, getNav, focusPath: focusToPath, createNodeAtViewCenter, dropNodeAt,
+    popFocus: popFocusAndFit, getNav, focusPath: focusToPath, createNodeAtViewCenter,
     // test/debug hooks — drive deterministic dive/climb checks from window.__atlasCanvas
     _frame: frame,
     _cam: () => ({ ...cam }),
