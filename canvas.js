@@ -590,16 +590,18 @@ export function createCanvas(viewportEl, opts = {}) {
   // child occupies the EXACT pixels it had while nested — then `cam.zoom` is back to O(1),
   // so the effScale chain can never underflow no matter how deep you go. A "pop" inverts it
   // from the LIVE camera (not a stored one), so it stays seamless however much you zoomed.
-  // Fit-and-CENTER a node's child board inside its frame body: scale to fit the available area
-  // (w − 2·PAD wide, h − HEADER − PAD tall), then shift by half the leftover slack so the nested
-  // chart sits centered under the header instead of jammed into the top-left corner. ONE source of
-  // truth — the render transform AND the seamless dive/pop camera math both read it, so they can
-  // never disagree (any mismatch would seam the infinite-zoom).
+  // Fit-and-CENTER a node's child board inside its frame body. The node KEEPS its (small) size —
+  // we only set the child's internal zoom so the chart shrinks to fit. The body uses a thin gutter
+  // (FRAME_PAD) rather than the fat PAD=40 bbox margin: on a default 96-tall node, HEADER(44)+PAD(40)
+  // left only 12px of body and the chart fit to a 0.03 speck — the thin gutter reclaims it so the
+  // small preview actually fills the frame. ONE source of truth: the render transform AND the
+  // seamless dive/pop camera math both read this, so they can never disagree (a mismatch would seam).
+  const FRAME_PAD = 12;   // gutter between a frame's border and its embedded child board
   function frameLayout(node) {
     const w = node.w || NODE_W, h = node.h || NODE_H, cb = bboxOf(node.board);
-    const availW = w - 2 * PAD, availH = h - HEADER - PAD;
+    const availW = w - 2 * FRAME_PAD, availH = h - HEADER - FRAME_PAD;
     const s = Math.max(1e-4, Math.min(availW / cb.w, availH / cb.h));
-    const ox = PAD + Math.max(0, (availW - cb.w * s) / 2);
+    const ox = FRAME_PAD + Math.max(0, (availW - cb.w * s) / 2);
     const oy = HEADER + Math.max(0, (availH - cb.h * s) / 2);
     return { s, ox, oy };
   }
