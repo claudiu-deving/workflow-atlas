@@ -14,6 +14,15 @@ export function binarySearch(p, data) {
       verdict: { ok: false, text: 'Target must be a number.' },
       note: 'No numeric target to search for — set the target param.' }];
   }
+  // Binary search assumes ascending input; on unsorted data it would "confidently" miss a
+  // value that is present. Catch that and explain it instead of drawing a wrong trace.
+  for (let i = 1; i < ARR.length; i++) {
+    if (ARR[i] < ARR[i - 1]) {
+      return [{ array: ARR.slice(), cls: {}, line: [1],
+        verdict: { ok: false, text: 'Input is not sorted ascending.' },
+        note: `Binary search needs a sorted array — a[${i}] = ${ARR[i]} is less than a[${i - 1}] = ${ARR[i - 1]}. Sort the data first.` }];
+    }
+  }
   const win = (lo, hi) => {
     const c = {};
     for (let i = 0; i < ARR.length; i++) c[i] = (i < lo || i > hi) ? 'eliminated' : 'idle';

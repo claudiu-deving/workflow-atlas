@@ -62,7 +62,8 @@ free (the e2e suite dives 25 levels). Zoom out to pop; the breadcrumb and the UR
   `{ nodes, edges }` shape, recursively).
 - **edge** — `{ id, from, to, kind, label?, fromSide? }`. `from`/`to` MUST be node ids
   **in the SAME board** — express a cross-level link by containment (nest the node),
-  never by an edge. `kind` ∈ `flow·loop·dep`.
+  never by an edge. `kind` ∈ `flow·loop·dep`; `fromSide` ∈ `top·right·bottom·left`
+  is the side the edge leaves the source node.
 
 Author the `board` directly to build nesting. A flat `stations: [...]` spine still
 works (auto-migrated: fan → a nested child board, loop → a `loop` edge) — reach for it

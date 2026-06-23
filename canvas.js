@@ -630,7 +630,11 @@ export function createCanvas(viewportEl, opts = {}) {
   function pushFocus(node, ownerEl, cause = 'auto') {   // dive one level (node must be a direct child of focusBoard)
     if (!node || !node.board) return;
     if (ownerEl && ownerEl.parentElement !== rootBoardEl) return;
-    if (focusPath.includes(node.id) && focusBoard.nodes.indexOf(node) < 0) return;  // paranoia vs cycles
+    // Refuse to re-root into an ancestor board (a true cycle). Object-identity match (like
+    // board.js's validator) so legitimate id reuse across sibling subtrees still dives fine.
+    // The old id-based guard was inert: a direct child is always in focusBoard.nodes, so the
+    // `&& indexOf < 0` clause was never true.
+    if (node.board === focusBoard || focusStack.some((f) => f.board === node.board)) return;
     const fl = frameLayout(node), innerScale = fl.s, px = node.x + fl.ox, py = node.y + fl.oy, z = cam.zoom;
     focusStack.push({ board: focusBoard, path: focusPath.slice(), node, px, py, innerScale });
     cam.x = cam.x + px * z; cam.y = cam.y + py * z; cam.zoom = z * innerScale;
