@@ -39,6 +39,7 @@ export function createCanvas(viewportEl, opts = {}) {
   const onSelect = opts.onSelect || (() => {});
   const openCount = opts.openCount || (() => 0);
   const onNav = opts.onNav || (() => {});       // breadcrumb / depth HUD callback
+  const onEditingChange = opts.onEditingChange || (() => {});   // fires when edit mode flips (incl. auto-enable)
   ensureArrowDefs();
 
   const world = viewportEl.querySelector('.world');
@@ -132,6 +133,7 @@ export function createCanvas(viewportEl, opts = {}) {
       positionNode(el, node, w, h);
       paintNode(el, node);
       setTier(el, sw);
+      if (el._tier === 'card') fitCardHeight(el, node, w);
       if (el._sel !== !!selected) { el.classList.toggle('is-selected', !!selected); el._sel = !!selected; }
 
       const apparent = sw;   // node.w * eff
@@ -142,10 +144,12 @@ export function createCanvas(viewportEl, opts = {}) {
       if (want && !mounted) mountChild(el);
       else if (!want && mounted) unmountChild(el);
       if (el._childEl) {
-        const cb = bboxOf(node.board);
-        const innerScale = Math.max(0.0001, Math.min((w - 2 * PAD) / cb.w, (h - HEADER - PAD) / cb.h));
-        if (el._innerScale !== innerScale) { el._childEl.style.transform = `translate(${PAD}px, ${HEADER}px) scale(${r5(innerScale)})`; el._innerScale = innerScale; }
-        renderBoard(node.board, el._childEl, sx + PAD * eff, sy + HEADER * eff, eff * innerScale, depth + 1, path.concat(node.id));
+        const fl = frameLayout(node), innerScale = fl.s;
+        if (el._innerScale !== innerScale || el._cox !== fl.ox || el._coy !== fl.oy) {
+          el._childEl.style.transform = `translate(${r3(fl.ox)}px, ${r3(fl.oy)}px) scale(${r5(innerScale)})`;
+          el._innerScale = innerScale; el._cox = fl.ox; el._coy = fl.oy;
+        }
+        renderBoard(node.board, el._childEl, sx + fl.ox * eff, sy + fl.oy * eff, eff * innerScale, depth + 1, path.concat(node.id));
         // A direct child of the focus root that has grown to FULLY cover the viewport becomes
         // the new render root (seamless re-root), so the scale chain never lengthens unboundedly.
         if (depth === 0 && coversViewport(sx, sy, sw, sh)) rerootCandidate = { node, el };
@@ -158,6 +162,28 @@ export function createCanvas(viewportEl, opts = {}) {
     if (el._lx === node.x && el._ly === node.y && el._lw === w && el._lh === h) return;
     el.style.left = node.x + 'px'; el.style.top = node.y + 'px'; el.style.width = w + 'px'; el.style.height = h + 'px';
     el._lx = node.x; el._ly = node.y; el._lw = w; el._lh = h;
+  }
+
+  // Card tier stacks title + subtitle + a footer of markers ("▦ chart inside", "▶ storyboard",
+  // "N open"). A long subtitle used to push that footer past the node's fixed height and the
+  // `overflow:hidden` chrome clipped it — so the "chart inside" marker vanished. Grow node.h to
+  // the content's natural height so the footer always shows (cards may end up different sizes).
+  // Grow-only: never shrink below the authored/default height, so deliberate sizing is kept.
+  // Gated by a content+width signature so the scrollHeight reflow happens only when text changes.
+  function fitCardHeight(el, node, w) {
+    if (el._editing) return;                       // mid inline-title edit → don't remeasure/jump
+    const key = el._sig + '|' + w;
+    if (el._fitKey === key) return;
+    el._fitKey = key;
+    const chrome = el.querySelector('.node-chrome');
+    if (!chrome) return;
+    const needed = Math.ceil(chrome.scrollHeight) + 2;   // +2 guards the last line against the border
+    if (needed > (node.h || NODE_H) + 1) {
+      node.h = needed;
+      el.style.height = needed + 'px'; el._lh = needed;
+      invalidateBBox(el.parentElement._board);          // bbox + edges depend on node.h
+      onChange(active.id); requestRender();
+    }
   }
 
   function paintNode(el, node) {
@@ -315,6 +341,84 @@ export function createCanvas(viewportEl, opts = {}) {
   }
   function clearSelection() { if (!selection) return; const b = selection.board; selection = null; if (b) { const be = boardElOf(b); if (be) be._edgeSig = null; } onSelect(null); requestRender(); }
 
+  /* ---------- right-click context menu (canvas + node actions) ---------- */
+  let ctxEl = null;
+  function hideCtx() {
+    if (!ctxEl) return;
+    ctxEl.remove(); ctxEl = null;
+    document.removeEventListener('pointerdown', onCtxAway, true);
+    document.removeEventListener('keydown', onCtxKey, true);
+  }
+  function onCtxAway(e) { if (ctxEl && !ctxEl.contains(e.target)) hideCtx(); }
+  function onCtxKey(e) { if (e.key === 'Escape') hideCtx(); }
+  function buildCtx(clientX, clientY, items) {
+    hideCtx();
+    ctxEl = document.createElement('div');
+    ctxEl.className = 'ctx-menu';
+    for (const it of items) {
+      if (it.sep) { const s = document.createElement('div'); s.className = 'ctx-sep'; ctxEl.appendChild(s); continue; }
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'ctx-item' + (it.danger ? ' danger' : '');
+      b.innerHTML = it.label;
+      b.addEventListener('click', () => { hideCtx(); it.run(); });
+      ctxEl.appendChild(b);
+    }
+    viewportEl.appendChild(ctxEl);
+    // anchor at the cursor, then nudge back inside the viewport if it would overflow an edge
+    const r = canvasRect();
+    let lx = clientX - r.left, ly = clientY - r.top;
+    if (lx + ctxEl.offsetWidth > r.width) lx = Math.max(0, r.width - ctxEl.offsetWidth - 4);
+    if (ly + ctxEl.offsetHeight > r.height) ly = Math.max(0, r.height - ctxEl.offsetHeight - 4);
+    ctxEl.style.left = lx + 'px'; ctxEl.style.top = ly + 'px';
+    document.addEventListener('pointerdown', onCtxAway, true);
+    document.addEventListener('keydown', onCtxKey, true);
+    viewportEl.addEventListener('wheel', hideCtx, { once: true });
+  }
+  function setStatus(node, board, s) {
+    if (node.status === s) return;
+    node.status = s;
+    const el = nodeElFor(node); if (el) el._sig = null;          // force a repaint of the chip + dot
+    const be = boardElOf(board); if (be) be._edgeSig = null;
+    onChange(active.id);
+    if (selection && selection.node === node) onSelect(selection);   // refresh the inspector if it's open
+    requestRender();
+  }
+  function deleteNode(node, board) {
+    const i = board.nodes.indexOf(node); if (i >= 0) board.nodes.splice(i, 1);
+    board.edges = board.edges.filter((e) => e.from !== node.id && e.to !== node.id);
+    invalidateBBox(board);
+    const be = boardElOf(board); if (be) be._edgeSig = null;
+    if (selection && selection.node === node) { selection = null; onSelect(null); }
+    onChange(active.id); requestRender();
+  }
+  viewportEl.addEventListener('contextmenu', (e) => {
+    if (e.target && e.target.isContentEditable) return;          // leave the native menu for inline text editing
+    if (e.target.closest && !e.target.closest('.world') && e.target !== viewportEl) return;   // HUD overlays keep theirs
+    e.preventDefault();
+    const cx = e.clientX, cy = e.clientY;
+    const nodeEl = e.target.closest && e.target.closest('.node');
+    if (nodeEl && nodeEl._node) {
+      const node = nodeEl._node, board = nodeEl.parentElement._board;
+      const items = [];
+      if (node.board) items.push({ label: '⤢ Dive into chart', run: () => zoomToNode(node, nodeEl) });
+      else items.push({ label: '＋ Add chart inside', run: () => { ensureEditing(); selectNodeKnown(node, board); addSubchart(); } });
+      items.push({ label: '✎ Rename', run: () => { ensureEditing(); const t = nodeEl.querySelector('.node-title'); if (t) beginTitleEdit(t, node, nodeEl); } });
+      items.push({ sep: true });
+      for (const s of ['done', 'partial', 'todo'])
+        items.push({ label: ((node.status || 'todo') === s ? '● ' : '○ ') + esc(STATUS_LABEL[s] || s), run: () => { ensureEditing(); setStatus(node, board, s); } });
+      items.push({ sep: true });
+      items.push({ label: '🗑 Delete node', danger: true, run: () => { ensureEditing(); deleteNode(node, board); } });
+      buildCtx(cx, cy, items);
+    } else {
+      const items = [
+        { label: '＋ Add node here', run: () => { ensureEditing(); createNodeAt(cx, cy); } },
+        { label: '⤢ Fit to view', run: () => fit() },
+      ];
+      if (focusStack.length) items.push({ sep: true }, { label: '↑ Climb out one level', run: () => popFocusAndFit() });
+      buildCtx(cx, cy, items);
+    }
+  });
+
   /* ---------- pointer: pan / drag / connect / click ---------- */
   let mode = null, pending = null, moved = 0, lastX = 0, lastY = 0, connect = null, spaceHeld = false;
   let navIntent = 0;            // set by the wheel handler (+1 in / -1 out), consumed once by frame()
@@ -371,7 +475,8 @@ export function createCanvas(viewportEl, opts = {}) {
     try { viewportEl.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
     if (mode === 'connect') finishConnect(e);
     else if (mode === 'drag' && pending) {           // snap to integer local coords on drop (clean JSON)
-      pending.node.x = Math.round(pending.node.x); pending.node.y = Math.round(pending.node.y);
+      // keep nodes in the positive quadrant — negative coords render into a parent frame's header when nested
+      pending.node.x = Math.max(0, Math.round(pending.node.x)); pending.node.y = Math.max(0, Math.round(pending.node.y));
       invalidateBBox(pending.boardEl._board); onChange(active.id); requestRender();
     } else if (mode === null) {                      // a click, not a drag
       if (pending && pending.node) selectNode(pending.node, pending.nodeEl);
@@ -392,7 +497,9 @@ export function createCanvas(viewportEl, opts = {}) {
     const titleEl = e.target.closest && e.target.closest('.node-title');
     if (editing && nodeEl && titleEl) { beginTitleEdit(titleEl, nodeEl._node, nodeEl); return; }
     if (nodeEl) { zoomToNode(nodeEl._node, nodeEl); return; }   // dive into the node (re-roots if it has a chart)
-    if (editing) createNodeAt(e.clientX, e.clientY);
+    // Empty canvas → drop a node right where you clicked, in the focused board, at any zoom and even
+    // outside the board's tight bounds. Auto-enables edit so you can immediately drag/rename it.
+    ensureEditing(); createNodeAt(e.clientX, e.clientY);
   });
   // Track Space for space-to-pan (ignored while typing). preventDefault stops the page scroll.
   document.addEventListener('keydown', (e) => {
@@ -470,7 +577,10 @@ export function createCanvas(viewportEl, opts = {}) {
     const { lx, ly } = localPoint(boardEl, clientX, clientY);
     if (!Number.isFinite(lx) || !Number.isFinite(ly)) return;
     const board = boardEl._board;
-    const node = { id: nextId(board.nodes, 'n'), x: Math.round(lx - NODE_W / 2), y: Math.round(ly - NODE_H / 2), w: NODE_W, h: NODE_H, title: 'New node', status: 'todo' };
+    // Clamp into the positive quadrant: boardBBox treats (0,0) as the board's top-left, so a node
+    // with negative coords (e.g. dropped in the empty margin ABOVE the content while dived in)
+    // would render up into the parent frame's header strip once this board is shown nested.
+    const node = { id: nextId(board.nodes, 'n'), x: Math.max(0, Math.round(lx - NODE_W / 2)), y: Math.max(0, Math.round(ly - NODE_H / 2)), w: NODE_W, h: NODE_H, title: 'New node', status: 'todo' };
     board.nodes.push(node); invalidateBBox(board); onChange(active.id);
     selectNodeKnown(node, board);
   }
@@ -480,10 +590,19 @@ export function createCanvas(viewportEl, opts = {}) {
   // child occupies the EXACT pixels it had while nested — then `cam.zoom` is back to O(1),
   // so the effScale chain can never underflow no matter how deep you go. A "pop" inverts it
   // from the LIVE camera (not a stored one), so it stays seamless however much you zoomed.
-  const innerScaleOf = (node) => {
+  // Fit-and-CENTER a node's child board inside its frame body: scale to fit the available area
+  // (w − 2·PAD wide, h − HEADER − PAD tall), then shift by half the leftover slack so the nested
+  // chart sits centered under the header instead of jammed into the top-left corner. ONE source of
+  // truth — the render transform AND the seamless dive/pop camera math both read it, so they can
+  // never disagree (any mismatch would seam the infinite-zoom).
+  function frameLayout(node) {
     const w = node.w || NODE_W, h = node.h || NODE_H, cb = bboxOf(node.board);
-    return Math.max(1e-4, Math.min((w - 2 * PAD) / cb.w, (h - HEADER - PAD) / cb.h));
-  };
+    const availW = w - 2 * PAD, availH = h - HEADER - PAD;
+    const s = Math.max(1e-4, Math.min(availW / cb.w, availH / cb.h));
+    const ox = PAD + Math.max(0, (availW - cb.w * s) / 2);
+    const oy = HEADER + Math.max(0, (availH - cb.h * s) / 2);
+    return { s, ox, oy };
+  }
   function coversViewport(sx, sy, sw, sh) {     // an on-screen rect fully spans the viewport
     if (!(Number.isFinite(sx) && Number.isFinite(sy) && Number.isFinite(sw) && Number.isFinite(sh))) return false;
     return sx <= 1 && sy <= 1 && sx + sw >= viewW - 1 && sy + sh >= viewH - 1;
@@ -497,7 +616,7 @@ export function createCanvas(viewportEl, opts = {}) {
     if (!node || !node.board) return;
     if (ownerEl && ownerEl.parentElement !== rootBoardEl) return;
     if (focusPath.includes(node.id) && focusBoard.nodes.indexOf(node) < 0) return;  // paranoia vs cycles
-    const innerScale = innerScaleOf(node), px = node.x + PAD, py = node.y + HEADER, z = cam.zoom;
+    const fl = frameLayout(node), innerScale = fl.s, px = node.x + fl.ox, py = node.y + fl.oy, z = cam.zoom;
     focusStack.push({ board: focusBoard, path: focusPath.slice(), node, px, py, innerScale });
     cam.x = cam.x + px * z; cam.y = cam.y + py * z; cam.zoom = z * innerScale;
     focusBoard = node.board; focusPath = focusPath.concat(node.id);
@@ -511,7 +630,7 @@ export function createCanvas(viewportEl, opts = {}) {
     // snapshot if the node was deleted. For an unchanged dive/pop pair this is the exact inverse.
     let px = fr.px, py = fr.py, s = fr.innerScale;
     if (fr.node && fr.board.nodes.indexOf(fr.node) >= 0 && fr.node.board) {
-      px = fr.node.x + PAD; py = fr.node.y + HEADER; s = innerScaleOf(fr.node);
+      const fl = frameLayout(fr.node); px = fr.node.x + fl.ox; py = fr.node.y + fl.oy; s = fl.s;
     }
     const parentZoom = cam.zoom / s;
     cam.x = cam.x - px * parentZoom; cam.y = cam.y - py * parentZoom; cam.zoom = parentZoom;
@@ -529,7 +648,8 @@ export function createCanvas(viewportEl, opts = {}) {
     for (const id of path) {
       const n = board.nodes && board.nodes.find((x) => x && x.id === id);
       if (!n || !n.board) break;
-      focusStack.push({ board, path: acc.slice(), node: n, px: n.x + PAD, py: n.y + HEADER, innerScale: innerScaleOf(n) });
+      const fl = frameLayout(n);
+      focusStack.push({ board, path: acc.slice(), node: n, px: n.x + fl.ox, py: n.y + fl.oy, innerScale: fl.s });
       board = n.board; acc.push(id);
     }
     focusBoard = board; focusPath = acc;
@@ -613,15 +733,34 @@ export function createCanvas(viewportEl, opts = {}) {
     for (const [, el] of rootBoardEl._nodes) el.remove();
     rootBoardEl._nodes.clear(); rootBoardEl._edgeSig = null; rootBoardEl._board = null;
   }
+  // boardBBox anchors a board at (0,0), so any node with a negative coordinate (e.g. one created
+  // long ago in the empty margin above the content) renders ABOVE the body — up into a parent
+  // frame's header — once the board is shown nested. Shift each board back into the positive
+  // quadrant on load so old data heals itself; new edits are already clamped to ≥ 0.
+  function normalizeBoards(board) {
+    let changed = false;
+    const nodes = (board && board.nodes) || [];
+    if (nodes.length) {
+      let minX = Infinity, minY = Infinity;
+      for (const n of nodes) { const nx = n.x || 0, ny = n.y || 0; if (nx < minX) minX = nx; if (ny < minY) minY = ny; }
+      const dx = minX < 0 ? -minX : 0, dy = minY < 0 ? -minY : 0;
+      if (dx || dy) { for (const n of nodes) { n.x = (n.x || 0) + dx; n.y = (n.y || 0) + dy; } invalidateBBox(board); changed = true; }
+    }
+    for (const n of nodes) if (n.board && normalizeBoards(n.board)) changed = true;
+    return changed;
+  }
   function load(sheet) {
     active = sheet; selection = null; onSelect(null);
+    const healed = normalizeBoards(sheet.board);   // heal any out-of-bounds (negative) coords from old data
     const saved = readSavedFocus();   // read BEFORE the root emitNav() overwrites the stored path
     focusBoard = sheet.board; focusPath = []; focusStack.length = 0;   // start at the sheet root
     clearRoot();
     frame(); fit(); emitNav();
     restoreFocus(saved);   // re-enter the depth this sheet was last viewed at (survives reload)
+    if (healed) onChange(sheet.id);   // persist the healed coordinates
   }
-  function setEditing(b) { editing = b; viewportEl.classList.toggle('editing', b); requestRender(); }
+  function setEditing(b) { if (editing === b) return; editing = b; viewportEl.classList.toggle('editing', b); onEditingChange(b); requestRender(); }
+  function ensureEditing() { if (!editing) setEditing(true); }   // mutating actions (add/rename) imply edit mode
   function refresh() {                                   // after an inspector edit mutated the selected node
     if (selection && selection.board) { invalidateBBox(selection.board); const be = boardElOf(selection.board); if (be) be._edgeSig = null; }
     requestRender();

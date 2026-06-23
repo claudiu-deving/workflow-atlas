@@ -8,7 +8,7 @@ export const NODE_W = 240, NODE_H = 96;   // default node box
 export const COL_X = 80, ROW_DY = 200;    // legacy-spine auto-layout: column x, row pitch
 export const FAN_DX = 280;                 // x pitch between migrated fan tracks
 export const PAD = 40;                      // bbox padding + inset of a child board inside its parent
-export const HEADER = 30;                   // title strip reserved at the top of a "frame" node
+export const HEADER = 44;                   // title strip reserved at the top of a "frame" node (fits a 2-line title)
 export const MAX_DEPTH = 6;                 // legacy hint only — nesting is now UNBOUNDED (the renderer
                                             // re-roots, and the validator guards cycles, not depth)
 

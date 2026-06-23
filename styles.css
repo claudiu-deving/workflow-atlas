@@ -632,8 +632,15 @@ body {
 
 .node-inner { position: absolute; left: 0; top: 0; width: 100%; height: 100%; overflow: hidden; border-radius: 11px; display: none; transition: opacity .14s ease; }
 .node[data-lod="frame"] .node-inner { display: block; }
-.node[data-lod="frame"] .node-chrome { height: 30px; padding: 5px 12px; overflow: hidden; border-bottom: 1px solid var(--hair); }
-.node[data-lod="frame"] .node-title { font-size: 13px; }
+/* frame header = a fixed strip == HEADER (board.js) where the child board begins; keep them in sync.
+   The title clamps to 2 lines + ellipsis so a long label stays inside the strip instead of being
+   clipped mid-word, and the chip is top-aligned so a 2-line title can't push it past the strip. */
+.node[data-lod="frame"] .node-chrome { height: 44px; padding: 6px 12px; overflow: hidden; border-bottom: 1px solid var(--hair); }
+.node[data-lod="frame"] .node-top { align-items: flex-start; }
+.node[data-lod="frame"] .node-title {
+  font-size: 13px; line-height: 1.18;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+}
 .node[data-lod="frame"] .node-sub, .node[data-lod="frame"] .node-foot { display: none; }
 .node[data-lod="frame"] .node-inner .board { background:
   radial-gradient(circle at 1px 1px, var(--hair) 1px, transparent 0) 0 0 / 26px 26px; }
@@ -665,6 +672,23 @@ body {
   opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 7;
 }
 .canvas-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* right-click context menu (canvas + node actions) */
+.ctx-menu {
+  position: absolute; z-index: 9; min-width: 184px; padding: 5px;
+  background: color-mix(in srgb, var(--panel-2) 94%, transparent);
+  border: 1px solid var(--hair); border-radius: 10px;
+  box-shadow: 0 18px 50px -22px #000; backdrop-filter: blur(8px);
+  font-family: var(--mono); font-size: 11.5px; user-select: none;
+}
+.ctx-menu .ctx-item {
+  display: block; width: 100%; text-align: left; cursor: pointer;
+  background: none; border: 0; color: var(--muted); font: inherit;
+  padding: 7px 10px; border-radius: 7px; white-space: nowrap;
+}
+.ctx-menu .ctx-item:hover { background: var(--hair); color: var(--ink); }
+.ctx-menu .ctx-item.danger:hover { background: rgba(224, 108, 108, .14); color: #e06c6c; }
+.ctx-menu .ctx-sep { height: 1px; margin: 4px 6px; background: var(--hair); }
 
 /* breadcrumb / depth navigator — appears top-left of the canvas once you dive in */
 .atlas-breadcrumb {

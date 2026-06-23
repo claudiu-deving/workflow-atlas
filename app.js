@@ -136,6 +136,7 @@ async function boot() {
     onSelect: (sel) => { lastSel = sel; if (sel) openInspector(sel); else closeCallout(); },
     openCount: nodeOpenCount,
     onNav: renderBreadcrumb,
+    onEditingChange: syncEditUI,   // canvas may auto-enable edit (dbl-click / context-menu add) → keep the UI in sync
   });
   window.__atlasCanvas = canvas;   // handle for power-user debugging / automated checks
   // dirty-aware live reload: our own autosave is hash-suppressed server-side, so a
@@ -198,17 +199,20 @@ function renderBreadcrumb(nav) {
 }
 
 /* ---------- chrome: edit toggle, fit, new map, editable header ---------- */
-function wireChrome() {
+// Single source of truth for edit-mode UI. Driven by canvas.setEditing (via onEditingChange),
+// so the button reflects edit mode whether the user toggled it or the canvas auto-enabled it.
+function syncEditUI(on) {
+  editing = on;
   const editBtn = $('edit-toggle');
-  editBtn.addEventListener('click', () => {
-    editing = !editing;
-    editBtn.classList.toggle('on', editing);
-    editBtn.textContent = editing ? '✓ Editing' : 'Edit';
-    document.body.classList.toggle('is-editing', editing);
-    canvas.setEditing(editing);
-    if (lastSel) openInspector(lastSel);    // re-render inspector in the new mode
-    setHeaderEditable(editing);
-  });
+  if (editBtn) { editBtn.classList.toggle('on', on); editBtn.textContent = on ? '✓ Editing' : 'Edit'; }
+  document.body.classList.toggle('is-editing', on);
+  setHeaderEditable(on);
+  if (lastSel) openInspector(lastSel);    // re-render inspector in the new mode
+}
+function wireChrome() {
+  // The button just asks the canvas to flip; canvas calls back onEditingChange → syncEditUI,
+  // so toggling from the button and the canvas auto-enabling edit go through the same path.
+  $('edit-toggle').addEventListener('click', () => canvas.setEditing(!editing));
   $('fit-btn').addEventListener('click', () => canvas.fit());
   $('new-sheet').addEventListener('click', createSheet);
   // keyboard: Esc closes the callout; Delete/Backspace deletes the selection (edit mode) or,
