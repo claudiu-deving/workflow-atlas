@@ -23,6 +23,7 @@ const MOUNT_PX = 460, UNMOUNT_PX = 340;   // hysteresis gap kills threshold flic
 const DOT_PX = 86;                         // below this a node is just a status dot + clipped title
 const MIN_VISIBLE_PX = 2.5;                // smaller than this on screen → don't paint at all
 const CULL_MARGIN = 240;                   // keep nodes mounted this many px beyond the viewport
+const SNAP_PX = 6;                          // screen-px gravity for snapping a dragged/resized node to siblings' x/y lines
 // Infinite-depth navigation: re-root into a child board once its owner FULLY covers the
 // viewport, and pop back out once the focus board shrinks under POP_FIT of the viewport.
 // The wide hysteresis gap (a board that fully covers vs. one that fits in ~55%) prevents
@@ -194,7 +195,7 @@ export function createCanvas(viewportEl, opts = {}) {
     if (el._sig === sig) return;
     el._sig = sig;
     if (el._status !== status) { el.dataset.status = status; el._status = status; }
-    // "Has a chart inside" is shown by an accented bottom-right border (.has-chart), not a tag.
+    // "Has a chart inside" is shown by an accented top-right border (.has-chart), not a tag.
     const hasChart = !!node.board;
     if (el._hasChart !== hasChart) { el.classList.toggle('has-chart', hasChart); el._hasChart = hasChart; }
     el.querySelector('.node-chrome').innerHTML =
@@ -245,6 +246,15 @@ export function createCanvas(viewportEl, opts = {}) {
       const a = byId.get(e.from), b = byId.get(e.to);
       if (!a || !b) continue;
       const g = edgeGeom(e.kind || 'flow', a, b, e.fromSide);
+      // a fat, transparent "hit" path tracing the same curve makes the 1.5px edge easy to click —
+      // non-scaling-stroke keeps the target a constant ~16 screen px at any zoom. It carries class
+      // 'edge' + the same eid, so the existing pointer/selectEdge path treats a hit on it as the edge.
+      const hit = document.createElementNS(SVGNS, 'path');
+      hit.setAttribute('d', g.d);
+      hit.setAttribute('class', 'edge hit');
+      hit.setAttribute('vector-effect', 'non-scaling-stroke');
+      hit.dataset.eid = e.id;
+      svg.appendChild(hit);
       const path = document.createElementNS(SVGNS, 'path');
       path.setAttribute('d', g.d);
       path.setAttribute('class', 'edge ' + (e.kind || 'flow') + (selection && selection.kind === 'edge' && selection.edge.id === e.id ? ' is-selected' : ''));
@@ -252,12 +262,8 @@ export function createCanvas(viewportEl, opts = {}) {
       path.setAttribute('marker-end', 'url(#atlas-arrow)');
       path.dataset.eid = e.id;
       svg.appendChild(path);
-      if (e.label) {
-        const t = document.createElementNS(SVGNS, 'text');
-        t.setAttribute('x', g.mx); t.setAttribute('y', g.my - 4); t.setAttribute('class', 'edge-label'); t.setAttribute('text-anchor', 'middle');
-        t.textContent = e.label;
-        svg.appendChild(t);
-      }
+      // the label is NOT drawn inline (it floated off the curve and overlapped) — it shows as a
+      // cursor-following tooltip on hover instead; see the mousemove handler below.
     }
   }
   // the connection anchor of one of a node's four sides, with that side's outward unit normal
@@ -283,7 +289,7 @@ export function createCanvas(viewportEl, opts = {}) {
       // feedback: exit the source's right edge, bow out to the right, re-enter the target's right
       const sx = a.x + aw, sy = acy, ex = b.x + bw, ey = bcy;
       const gx = Math.max(a.x + aw, b.x + bw) + 70;
-      return { d: `M ${sx} ${sy} C ${gx} ${sy}, ${gx} ${ey}, ${ex} ${ey}`, mx: gx, my: (sy + ey) / 2 };
+      return { d: `M ${sx} ${sy} C ${gx} ${sy}, ${gx} ${ey}, ${ex} ${ey}` };
     }
     // leave from the side the user dragged from (fromSide), else the side facing the target;
     // arrive on the target's side that faces the source anchor. Curve out along each side's normal.
@@ -291,7 +297,7 @@ export function createCanvas(viewportEl, opts = {}) {
     const t = sideAnchor(b, autoSide(b, s.x, s.y));
     const k = Math.max(40, Math.hypot(t.x - s.x, t.y - s.y) * 0.4);
     const c1x = s.x + s.nx * k, c1y = s.y + s.ny * k, c2x = t.x + t.nx * k, c2y = t.y + t.ny * k;
-    return { d: `M ${s.x} ${s.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${t.x} ${t.y}`, mx: (s.x + t.x) / 2, my: (s.y + t.y) / 2 };
+    return { d: `M ${s.x} ${s.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${t.x} ${t.y}` };
   }
 
   /* ---------- element factories ---------- */
@@ -312,7 +318,8 @@ export function createCanvas(viewportEl, opts = {}) {
     const ports = document.createElement('div'); ports.className = 'node-ports';
     ports.innerHTML = ['top', 'right', 'bottom', 'left']
       .map((side) => `<span class="port" data-port="${side}" title="drag to connect"></span>`).join('');
-    el.append(chrome, inner, ports);
+    const grip = document.createElement('span'); grip.className = 'node-resize'; grip.title = 'drag to resize';
+    el.append(chrome, inner, ports, grip);
     el._shown = true;
     return el;
   }
@@ -432,7 +439,7 @@ export function createCanvas(viewportEl, opts = {}) {
   });
 
   /* ---------- pointer: pan / drag / connect / click ---------- */
-  let mode = null, pending = null, moved = 0, lastX = 0, lastY = 0, connect = null, spaceHeld = false;
+  let mode = null, pending = null, moved = 0, lastX = 0, lastY = 0, connect = null, spaceHeld = false, resize = null, pendingEdge = null;
   let navIntent = 0;            // set by the wheel handler (+1 in / -1 out), consumed once by frame()
   const grabPointer = (e) => { try { viewportEl.setPointerCapture(e.pointerId); } catch { /* ignore */ } };
   viewportEl.addEventListener('pointerdown', (e) => {
@@ -453,11 +460,15 @@ export function createCanvas(viewportEl, opts = {}) {
     }
     if (e.button !== 0) return;
     const portEl = editing && e.target.closest && e.target.closest('.port');
+    const gripEl = editing && e.target.closest && e.target.closest('.node-resize');
     const nodeEl = e.target.closest && e.target.closest('.node');
     const edgeEl = e.target.classList && e.target.classList.contains('edge') ? e.target : null;
-    lastX = e.clientX; lastY = e.clientY; moved = 0; mode = null; pending = null; connect = null;
+    lastX = e.clientX; lastY = e.clientY; moved = 0; mode = null; pending = null; connect = null; resize = null; pendingEdge = null;
     if (portEl && nodeEl) { startConnect(nodeEl, portEl.dataset.port); mode = 'connect'; grabPointer(e); e.preventDefault(); return; }
-    if (edgeEl) { selectEdge(edgeEl); return; }   // a click on an edge selects it (no drag)
+    if (gripEl && nodeEl) { startResize(nodeEl, e); mode = 'resize'; grabPointer(e); e.preventDefault(); return; }
+    // defer edge selection to pointerup (like a node click) — selecting on pointerDOWN let the
+    // pointerup "click, no pending" branch immediately clearSelection() and close the panel.
+    if (edgeEl) { pendingEdge = edgeEl; return; }
     // NB: do NOT capture the pointer here. Capturing on a mere press redirects the resulting
     // click/dblclick to `.canvas`, breaking node title double-click-to-edit and HUD buttons.
     // We capture lazily below, only once a real drag/pan actually starts.
@@ -470,31 +481,44 @@ export function createCanvas(viewportEl, opts = {}) {
       moved += Math.abs(dx) + Math.abs(dy);
       if (moved <= 4) { lastX = e.clientX; lastY = e.clientY; return; }
       mode = (editing && pending) ? 'drag' : 'pan';
+      if (mode === 'drag') { pending.rawX = pending.node.x; pending.rawY = pending.node.y; }   // unsnapped anchor
       grabPointer(e);                              // the gesture is real now → capture so it tracks off-element
       if (mode === 'pan') viewportEl.classList.add('grabbing');
     }
     if (mode === 'pan') { cam.x += dx; cam.y += dy; promoteWorld(); requestRender(); }
     else if (mode === 'drag') {
       const eff = pending.boardEl._eff || cam.zoom;
-      pending.node.x += dx / eff; pending.node.y += dy / eff;
+      pending.rawX += dx / eff; pending.rawY += dy / eff;       // accumulate the true position…
+      pending.node.x = pending.rawX; pending.node.y = pending.rawY;
+      const g = snapDrag(pending.boardEl._board, pending.node, eff);   // …then pull onto sibling x/y lines
       invalidateBBox(pending.boardEl._board);
       requestRender(); onChange(active.id);
+      showGuides(pending.boardEl, g.x, g.y);                    // draw the line(s) it snapped to
     } else if (mode === 'connect') updateConnect(e);
+    else if (mode === 'resize') updateResize(e);
     lastX = e.clientX; lastY = e.clientY;
   });
   viewportEl.addEventListener('pointerup', (e) => {
     viewportEl.classList.remove('grabbing');
     try { viewportEl.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
     if (mode === 'connect') finishConnect(e);
+    else if (mode === 'resize') finishResize();
     else if (mode === 'drag' && pending) {           // snap to integer local coords on drop (clean JSON)
-      // keep nodes in the positive quadrant — negative coords render into a parent frame's header when nested
-      pending.node.x = Math.max(0, Math.round(pending.node.x)); pending.node.y = Math.max(0, Math.round(pending.node.y));
+      pending.node.x = Math.round(pending.node.x); pending.node.y = Math.round(pending.node.y);
+      // Let a node drag UP/LEFT past the origin: rebase the whole ROOT board back into the positive
+      // quadrant (boardBBox anchors at 0,0) and shift the camera to match, so the content doesn't jump.
+      // A NESTED board has no clean camera mapping and its negatives would render into the parent
+      // frame's header strip — so there, clamp just this node instead.
+      if (pending.boardEl === rootBoardEl) rebaseRoot(pending.boardEl._board);
+      else { pending.node.x = Math.max(0, pending.node.x); pending.node.y = Math.max(0, pending.node.y); }
       invalidateBBox(pending.boardEl._board); onChange(active.id); requestRender();
     } else if (mode === null) {                      // a click, not a drag
       if (pending && pending.node) selectNode(pending.node, pending.nodeEl);
+      else if (pendingEdge) selectEdge(pendingEdge);
       else clearSelection();
     }
-    mode = null; pending = null; connect = null;
+    hideGuides();
+    mode = null; pending = null; connect = null; resize = null; pendingEdge = null;
   });
   // a system-cancelled gesture (touch takeover, etc.) never reaches pointerup — tear
   // down cleanly so a half-drawn connection edge and a stuck 'connect' mode don't linger.
@@ -502,7 +526,8 @@ export function createCanvas(viewportEl, opts = {}) {
   viewportEl.addEventListener('pointercancel', () => {
     if (connect && connect.pathEl) connect.pathEl.remove();
     viewportEl.classList.remove('grabbing');
-    mode = null; pending = null; connect = null;
+    hideGuides();
+    mode = null; pending = null; connect = null; resize = null; pendingEdge = null;
   });
   viewportEl.addEventListener('dblclick', (e) => {
     const nodeEl = e.target.closest && e.target.closest('.node');
@@ -581,6 +606,69 @@ export function createCanvas(viewportEl, opts = {}) {
     } else if (targetEl && targetEl.parentElement !== connect.boardEl) {
       toast('edges stay within one board — nest a node to link levels');
     }
+  }
+
+  /* ---------- alignment snapping (drag + resize) ---------- */
+  // Pull a dragged/resized node's edges & center onto any sibling's matching x/y line when within
+  // SNAP_PX (screen px → local via eff), so cards line up cleanly. Same-board nodes only.
+  function alignLines(board, exclude) {
+    const xs = [], ys = [];
+    for (const n of (board.nodes || [])) {
+      if (n === exclude) continue;
+      const w = n.w || NODE_W, h = n.h || NODE_H;
+      xs.push(n.x, n.x + w / 2, n.x + w);          // left, center, right
+      ys.push(n.y, n.y + h / 2, n.y + h);          // top, center, bottom
+    }
+    return { xs, ys };
+  }
+  function snapAxis(anchors, lines, thresh) {       // -> { delta, line } for the nearest within thresh, else null
+    let best = null, bestDist = thresh;
+    for (const a of anchors) for (const c of lines) {
+      const d = c - a, ad = Math.abs(d);
+      if (ad <= bestDist) { bestDist = ad; best = { delta: d, line: c }; }
+    }
+    return best;
+  }
+  function snapDrag(board, node, eff) {             // align any of the moving node's 3 x/y anchors; report the guide lines
+    const thresh = SNAP_PX / eff, w = node.w || NODE_W, h = node.h || NODE_H;
+    const { xs, ys } = alignLines(board, node);
+    const sx = snapAxis([node.x, node.x + w / 2, node.x + w], xs, thresh);
+    const sy = snapAxis([node.y, node.y + h / 2, node.y + h], ys, thresh);
+    if (sx) node.x += sx.delta;
+    if (sy) node.y += sy.delta;
+    return { x: sx && sx.line, y: sy && sy.line };
+  }
+  function snapResize(board, node, w, h, eff) {     // only the right/bottom edges move during a resize
+    const thresh = SNAP_PX / eff;
+    const { xs, ys } = alignLines(board, node);
+    const sx = snapAxis([node.x + w], xs, thresh);
+    const sy = snapAxis([node.y + h], ys, thresh);
+    return { w: w + (sx ? sx.delta : 0), h: h + (sy ? sy.delta : 0), x: sx && sx.line, y: sy && sy.line };
+  }
+
+  // drag-to-resize from the bottom-right grip: convert the screen-space drag into local units via the
+  // board's eff (so it tracks the cursor at any zoom/nesting depth) and clamp to the same minimums the
+  // inspector enforces. A frame node's embedded child board refits automatically (frameLayout reads w/h).
+  function startResize(nodeEl, e) {
+    const node = nodeEl._node;
+    resize = { node, boardEl: nodeEl.parentElement, startW: node.w || NODE_W, startH: node.h || NODE_H, startX: e.clientX, startY: e.clientY };
+  }
+  function updateResize(e) {
+    const eff = resize.boardEl._eff || cam.zoom;        // screen px per local unit at this board's depth
+    const w = Math.max(80, resize.startW + (e.clientX - resize.startX) / eff);
+    const h = Math.max(48, resize.startH + (e.clientY - resize.startY) / eff);
+    const s = snapResize(resize.boardEl._board, resize.node, w, h, eff);   // align right/bottom to siblings
+    resize.node.w = Math.max(80, Math.round(s.w));
+    resize.node.h = Math.max(48, Math.round(s.h));
+    invalidateBBox(resize.boardEl._board);              // bbox + edge geometry depend on node w/h
+    onChange(active.id); requestRender();
+    showGuides(resize.boardEl, s.x, s.y);              // draw the line(s) the edge snapped to
+  }
+  function finishResize() {
+    if (!resize) return;
+    invalidateBBox(resize.boardEl._board);
+    if (selection && selection.node === resize.node) onSelect(selection);   // refresh the inspector's W/H inputs
+    onChange(active.id); requestRender();
   }
 
   function createNodeAt(clientX, clientY, opts = {}) {
@@ -739,6 +827,64 @@ export function createCanvas(viewportEl, opts = {}) {
     clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2200);
   }
 
+  /* ---------- edge label tooltip (hover → follows the cursor) ---------- */
+  let edgeTipEl = null;
+  function showEdgeTip(text, clientX, clientY) {
+    if (!edgeTipEl) { edgeTipEl = document.createElement('div'); edgeTipEl.className = 'edge-tip'; viewportEl.appendChild(edgeTipEl); }
+    if (edgeTipEl.textContent !== text) edgeTipEl.textContent = text;
+    const r = canvasRect();
+    edgeTipEl.style.left = (clientX - r.left + 14) + 'px';   // offset off the cursor so it isn't covered
+    edgeTipEl.style.top = (clientY - r.top + 14) + 'px';
+    edgeTipEl.classList.add('show');
+  }
+  function hideEdgeTip() { if (edgeTipEl) edgeTipEl.classList.remove('show'); }
+
+  /* ---------- snap alignment guides (shown while dragging/resizing) ---------- */
+  // A vertical + horizontal line drawn at the local x/y a node just snapped to, converted to
+  // canvas-relative px via the board's _ox/_oy/_eff (same mapping the renderer uses).
+  let guideV = null, guideH = null;
+  function showGuides(boardEl, xLine, yLine) {
+    if (!guideV) {
+      guideV = document.createElement('div'); guideV.className = 'snap-guide v';
+      guideH = document.createElement('div'); guideH.className = 'snap-guide h';
+      viewportEl.append(guideV, guideH);
+    }
+    const eff = boardEl && boardEl._eff;
+    if (xLine != null && eff) { guideV.style.transform = `translateX(${r3(boardEl._ox + xLine * eff)}px)`; guideV.style.display = 'block'; }
+    else guideV.style.display = 'none';
+    if (yLine != null && eff) { guideH.style.transform = `translateY(${r3(boardEl._oy + yLine * eff)}px)`; guideH.style.display = 'block'; }
+    else guideH.style.display = 'none';
+  }
+  function hideGuides() { if (guideV) guideV.style.display = 'none'; if (guideH) guideH.style.display = 'none'; }
+  // Hover an edge (its fat hit path) → show its label at the cursor. Cheap and read-only; bails during
+  // any gesture so the tip never lingers mid pan/drag/connect/resize.
+  viewportEl.addEventListener('mousemove', (e) => {
+    if (mode) return hideEdgeTip();
+    const pathEl = e.target.classList && e.target.classList.contains('edge') ? e.target : null;
+    if (!pathEl) return hideEdgeTip();
+    const boardEl = pathEl.closest('.board'), board = boardEl && boardEl._board;
+    const edge = board && board.edges.find((x) => x.id === pathEl.dataset.eid);
+    if (edge && edge.label) showEdgeTip(edge.label, e.clientX, e.clientY); else hideEdgeTip();
+  });
+  viewportEl.addEventListener('mouseleave', hideEdgeTip);
+
+  /* ---------- resize-grip proximity fade ---------- */
+  // Fade the bottom-right resize grip in as the cursor nears that corner (full at GRIP_FULL px,
+  // gone past GRIP_NEAR px), so the handle surfaces only when you reach for it. We set a --grip
+  // custom property on the hovered node; CSS maps it to the grip's opacity.
+  let gripNodeEl = null;
+  const GRIP_NEAR = 110, GRIP_FULL = 18;   // screen px from the corner
+  viewportEl.addEventListener('mousemove', (e) => {
+    const nodeEl = (!mode && e.target.closest) ? e.target.closest('.node') : null;
+    if (gripNodeEl && gripNodeEl !== nodeEl) { gripNodeEl.style.removeProperty('--grip'); gripNodeEl = null; }
+    if (!nodeEl || nodeEl.dataset.lod === 'dot') return;
+    const r = nodeEl.getBoundingClientRect();
+    const dist = Math.hypot(e.clientX - r.right, e.clientY - r.bottom);
+    nodeEl.style.setProperty('--grip', clamp((GRIP_NEAR - dist) / (GRIP_NEAR - GRIP_FULL), 0, 1).toFixed(3));
+    gripNodeEl = nodeEl;
+  });
+  viewportEl.addEventListener('mouseleave', () => { if (gripNodeEl) { gripNodeEl.style.removeProperty('--grip'); gripNodeEl = null; } });
+
   /* ---------- public API (driven by app.js) ---------- */
   function clearRoot() {                          // tear down the mounted tree so frame() rebuilds focusBoard
     for (const [, el] of rootBoardEl._nodes) el.remove();
@@ -759,6 +905,19 @@ export function createCanvas(viewportEl, opts = {}) {
     }
     for (const n of nodes) if (n.board && normalizeBoards(n.board)) changed = true;
     return changed;
+  }
+  // Shift a RENDER-ROOT board's nodes back into the positive quadrant and move the camera by the
+  // same amount, so dragging a node above/left of the origin grows the board that way with no visible
+  // jump. Root-only: the camera maps 1:1 to the render-root board's local units (eff === cam.zoom).
+  function rebaseRoot(board) {
+    const nodes = (board && board.nodes) || [];
+    let minX = 0, minY = 0;
+    for (const n of nodes) { minX = Math.min(minX, n.x || 0); minY = Math.min(minY, n.y || 0); }
+    if (minX >= 0 && minY >= 0) return;
+    const sx = -minX, sy = -minY;                    // ≥ 0 (min is floored at 0)
+    for (const n of nodes) { n.x = (n.x || 0) + sx; n.y = (n.y || 0) + sy; }
+    cam.x -= sx * cam.zoom; cam.y -= sy * cam.zoom;  // keep on-screen pixels fixed
+    invalidateBBox(board);
   }
   function load(sheet, opts = {}) {
     active = sheet; selection = null; onSelect(null);
