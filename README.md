@@ -78,29 +78,68 @@ and parallel sessions stay isolated.
 - **Seeding.** New projects start empty; `WORKFLOW_ATLAS_SEED=1` copies the bundled
   demos into a fresh project.
 
+## The infinite-nested canvas
+
+A workflow map is a list of **sheets**; each sheet is an infinite-zoom **board** —
+a free-laid set of **nodes** connected by **edges**. The defining idea: **any node
+can itself contain a board** (`node.board`), so a chart can hold a chart can hold a
+chart, to **unbounded depth**.
+
+- **Semantic zoom (level-of-detail).** A node renders at the detail its on-screen
+  size warrants: a status **dot** when tiny → a **card** (title · status · markers)
+  → a **frame** that mounts its child board *in place* once it's large enough. Only
+  what is both visible *and* big enough is in the DOM, so a deep tree stays cheap.
+- **Seamless re-rooting — why it's truly infinite.** Zoom into a node until it fills
+  the viewport and the renderer **re-roots** onto that node's child board, rebasing
+  the camera so `cam.zoom` returns to ~1. Because the zoom resets at every level, the
+  scale chain never underflows floating point — so nesting depth has no practical
+  limit (the e2e test dives **25 levels** with the camera scale staying O(1)). Zoom
+  back out and it **pops** one level. A **breadcrumb** (top-left) shows the path, and
+  the **URL hash mirrors it** (`#<sheet>/<nodeId>/<nodeId>…`) so a nested view is
+  deep-linkable, survives reload, and Back/Forward walk the nesting.
+- **Edges live within one board.** An edge connects two nodes in the **same** board;
+  a cross-level relationship is expressed by **containment** (nest the node inside the
+  other's board), never by an edge — that keystone invariant is what lets a board be
+  rendered, dived into, and validated at any depth. Drag a connection from any of a
+  node's four sides and the edge leaves that side toward the target.
+- **Direct manipulation.** Turn on **Edit** to drag nodes, double-click empty canvas
+  to drop one, double-click a node to dive in, inline-edit a title, and right-click
+  for a context menu — all over the same plain JSON.
+
+### Data shapes
+
+A sheet is `{ id, code, name, title, sub, schema: 2, board }`:
+
+- **board** — `{ nodes: [], edges: [], view: { x, y, zoom } }`.
+- **node** — `{ id, x, y, w, h, title, status, sub?, detail?, algorithm?, board? }`.
+  `status` ∈ `done · partial · todo`; `detail` is `{ in[], out[], note, open[] }`
+  (shown in the inspector); `algorithm: '<id>'` links a storyboard; and **`board`
+  nests a child chart** — the same `{ nodes, edges }` shape, recursively.
+- **edge** — `{ id, from, to, kind, label?, fromSide? }`. `from`/`to` are **node ids
+  in this same board**; `kind` ∈ `flow · loop · dep`; `fromSide` ∈
+  `top · right · bottom · left` is the side it leaves.
+
+The validator rejects an edge whose endpoints aren't both in its board, a self-edge,
+and a board that nests one of its own ancestors (an infinite-recursion cycle) —
+depth itself is unbounded.
+
+> **Legacy shorthand.** A sheet may instead carry a flat `stations: [...]` spine
+> (each `{ title, sub, status, detail }`, with `loop: { to, label }` for a feedback
+> arc and `fan: { tracks: [...] }` for parallel branches). It's **auto-migrated** into
+> the board model on load — fan → a nested child board, loop → a `loop` edge — and the
+> server commits the v2 `board` on the first write. New work should author `board`
+> directly; reach for `stations` only for a quick linear spine.
+
 ## Edit
 
 All content is **JSON** — no diagram syntax, no code — stored per project under
 `$WORKFLOW_ATLAS_HOME` (see [Projects](#projects)) and edited through the **MCP
 tools** (the assistant authors it; changes show on reload). For workflows, prefer
-the **per-sheet/per-station** tools (`save_sheet`, `delete_sheet`, `reorder_sheets`,
-`set_station`, `delete_station`) over the replace-all `save_workflows` — they edit
-one piece without resending the rest.
-
-A workflow map is a set of sheets (`{ sheets: [...] }`):
-
-- A **sheet** is `{ id, code, name, title, sub, stations: [...] }`; add one and
-  it appears in the left index automatically. `code` is a **short badge**
-  (e.g. `"WA-01"`), not the pseudocode an algorithm spec carries.
-- A **station** is `{ title, sub, status, detail }`. `detail` holds
-  `{ in[], out[], note, open[] }` — shown in the callout. Each `open[]` question
-  can be **answered in the callout** (recorded as a decision); the assistant can
-  read and resolve them over MCP, same as algorithm questions.
-- `loop: { to, label }` draws a dashed feedback arc back to an earlier station.
-  `to` is a station index **or** a target station's title (a title survives
-  reordering).
-- `fan: { tracks: [...] }` renders parallel branches off the spine.
-- `algorithm: '<id>'` links a station to its storyboard.
+the **per-sheet** tools (`save_sheet`, `delete_sheet`, `reorder_sheets`) over the
+replace-all `save_workflows` — they edit one piece without resending the rest.
+`save_sheet` takes a whole sheet including its nested `board` (see
+[the data shapes](#data-shapes) above); `set_station` / `delete_station` upsert one
+station in the **legacy spine** shorthand.
 
 `save_sheet` / `save_workflows` **reject** a non-slug `id`, a `code` that isn't a
 short string, a bad `status`, and non-string `detail.open/in/out` (and
@@ -221,9 +260,13 @@ stdio servers.
 workflow-atlas/
   index.html             workflows shell (title block · sheet · callout)
   algorithms.html        storyboard shell (stage · pseudocode · narration)
-  styles.css             design system — palette, type, spine, stage
-  app.js                 workflow renderer (sheets, stations, loops, callout)
+  styles.css             design system — palette, type, nodes/edges, stage
+  app.js                 workflow app shell — sheet index, inspector, autosave, URL↔focus sync
+  canvas.js              the infinite-nested canvas engine: semantic zoom (dot/card/frame),
+                         focus-stack re-rooting, in-browser editing, four-side connections
   storyboard.js          algorithm player (loads specs, replay, transport)
+  shared/board.js        the node/edge/board MODEL — geometry, ids, recursive (cycle-guarded) validation
+  shared/migrate.js      legacy stations-spine → v2 board (nodes/edges); runs in browser AND server
   shared/generators.js   built-in algorithm generators (browser + server)
   shared/project.js      active-project resolution + switcher (browser)
   scripts/

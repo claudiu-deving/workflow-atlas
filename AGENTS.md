@@ -47,17 +47,38 @@ A communication channel: when you propose an algorithm, **build a storyboard for
 it over MCP** so the user can watch it run, rather than parsing prose. Author
 the visuals; don't just describe them.
 
+## The workflow model: an infinite-nested canvas
+
+A workflow map is **sheets**; each sheet is a **board** = `{ nodes: [], edges: [] }`
+laid out freely (not a fixed spine). The key move: **a node can contain its own
+board** (`node.board`), so charts nest to **unbounded depth** — the canvas zooms into
+a node, re-roots onto its child board, and resets its scale at each level, so depth is
+free (the e2e suite dives 25 levels). Zoom out to pop; the breadcrumb and the URL hash
+(`#<sheet>/<nodeId>/…`) track where you are.
+
+- **node** — `{ id, x, y, w, h, title, status, sub?, detail?, algorithm?, board? }`.
+  `status` ∈ `done·partial·todo`; `detail` = `{ in[], out[], note, open[] }` (the
+  inspector); `algorithm` links a storyboard; **`board` nests a child chart** (same
+  `{ nodes, edges }` shape, recursively).
+- **edge** — `{ id, from, to, kind, label?, fromSide? }`. `from`/`to` MUST be node ids
+  **in the SAME board** — express a cross-level link by containment (nest the node),
+  never by an edge. `kind` ∈ `flow·loop·dep`.
+
+Author the `board` directly to build nesting. A flat `stations: [...]` spine still
+works (auto-migrated: fan → a nested child board, loop → a `loop` edge) — reach for it
+only for a quick linear flow.
+
 ## MCP tools
 
 - **Read** — `list_algorithms`, `get_algorithm`, `get_workflows`, `get_sheet`,
   `get_review`, `get_workflow_review`, `list_open_questions`
 - **Author algorithms** — `save_algorithm` (create/replace a storyboard from a
   JSON spec), `delete_algorithm`
-- **Author workflows** — `save_sheet`/`delete_sheet`/`reorder_sheets` and
-  `set_station`/`delete_station` upsert ONE piece by id/index (preferred); or
-  `save_workflows` replaces all sheets. A sheet's `code` is a SHORT badge
-  (`"WA-01"`), not pseudocode; `loop.to` may be a station index or a target
-  station's title.
+- **Author workflows** — `save_sheet` writes a whole sheet **with its nested `board`**
+  of nodes/edges (see the model above); `delete_sheet`/`reorder_sheets` manage the set;
+  `save_workflows` replaces all sheets. `set_station`/`delete_station` upsert one
+  station in the legacy linear-spine shorthand (`loop.to` = station index or target
+  title). A sheet's `code` is a SHORT badge (`"WA-01"`), not pseudocode.
 - **Review / decisions** — `set_param`, `set_comment`, `set_decision`,
   `reopen_question` (algorithms); `set_workflow_decision`,
   `reopen_workflow_question` answer a station's `open[]` question (by sheet id +
