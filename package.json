@@ -5,14 +5,48 @@
   "type": "module",
   "license": "MIT",
   "author": "Workflow Atlas contributors",
-  "repository": { "type": "git", "url": "git+https://github.com/claudiu-deving/workflow-atlas.git" },
-  "homepage": "https://github.com/claudiu-deving/workflow-atlas#readme",
-  "bugs": { "url": "https://github.com/claudiu-deving/workflow-atlas/issues" },
-  "engines": { "node": ">=20" },
-  "bin": { "workflow-atlas": "server/server.mjs" },
-  "scripts": {
-    "start": "node server/server.mjs"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/claudiu-deving/workflow-atlas.git"
   },
-  "keywords": ["mcp", "workflow", "algorithm-visualization", "storyboard", "diagrams", "claude-code"],
-  "files": ["*.html", "*.js", "*.css", "content/", "shared/", "server/", "AGENTS.md", "README.md", "LICENSE"]
+  "homepage": "https://github.com/claudiu-deving/workflow-atlas#readme",
+  "bugs": {
+    "url": "https://github.com/claudiu-deving/workflow-atlas/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "workflow-atlas": "server/server.mjs"
+  },
+  "scripts": {
+    "start": "node server/server.mjs",
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "node --test \"tests/unit/**/*.test.mjs\"",
+    "pretest:e2e": "node -e \"require('node:fs').rmSync('.atlas-e2e-home',{recursive:true,force:true})\"",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed"
+  },
+  "keywords": [
+    "mcp",
+    "workflow",
+    "algorithm-visualization",
+    "storyboard",
+    "diagrams",
+    "claude-code"
+  ],
+  "files": [
+    "*.html",
+    "*.js",
+    "*.css",
+    "content/",
+    "shared/",
+    "server/",
+    "AGENTS.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {
+    "@playwright/test": "^1.61.0"
+  }
 }

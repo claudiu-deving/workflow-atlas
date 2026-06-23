@@ -217,6 +217,89 @@
           }
         }
       ]
+    },
+    {
+      "id": "pick-algorithm",
+      "code": "WA-02",
+      "name": "Pick an algorithm",
+      "title": "Choosing the right algorithm for the data",
+      "sub": "A decision map from the shape of your input to the technique that fits — each branch links to a runnable storyboard.",
+      "stations": [
+        {
+          "title": "Look at the input",
+          "sub": "shape decides the technique",
+          "status": "done",
+          "detail": {
+            "in": [
+              "An array, or a pair of integers"
+            ],
+            "out": [
+              "A sense of structure: sorted? numeric? large?"
+            ],
+            "note": "The data's shape is the biggest lever on which algorithm wins."
+          }
+        },
+        {
+          "title": "Branch on the data's shape",
+          "sub": "three common cases — dive into any branch",
+          "status": "done",
+          "fan": {
+            "tracks": [
+              {
+                "title": "Unsorted array → linear scan, comparing every element until a match",
+                "status": "done",
+                "algorithm": "linear-search"
+              },
+              {
+                "title": "Sorted array → binary search, halving the live range on each comparison",
+                "status": "done",
+                "algorithm": "binary-search"
+              },
+              {
+                "title": "A pair of integers → Euclid's GCD by repeated remainder until zero",
+                "status": "partial",
+                "algorithm": "euclid-gcd"
+              }
+            ]
+          },
+          "detail": {
+            "note": "Each branch is a runnable storyboard — zoom into this chart to watch the long branch titles, then dive into one to animate it.",
+            "open": [
+              "Add a hashing branch for O(1) average-case membership?"
+            ]
+          }
+        },
+        {
+          "title": "Need a derived quantity?",
+          "sub": "a worksheet, not a search",
+          "status": "partial",
+          "algorithm": "factorial",
+          "detail": {
+            "in": [
+              "A formula and its inputs"
+            ],
+            "out": [
+              "A traced calculation"
+            ],
+            "note": "Calc-kind storyboards show the arithmetic row by row instead of an array."
+          }
+        },
+        {
+          "title": "Watch, tune, decide",
+          "sub": "feed the result back",
+          "status": "todo",
+          "loop": {
+            "to": "Look at the input",
+            "label": "revise the map"
+          },
+          "detail": {
+            "out": [
+              "A recorded decision"
+            ],
+            "note": "Per-step comments and decisions autosave, then come back to the assistant over MCP."
+          }
+        }
+      ]
     }
   ]
 }

@@ -9,7 +9,8 @@ export const COL_X = 80, ROW_DY = 200;    // legacy-spine auto-layout: column x,
 export const FAN_DX = 280;                 // x pitch between migrated fan tracks
 export const PAD = 40;                      // bbox padding + inset of a child board inside its parent
 export const HEADER = 30;                   // title strip reserved at the top of a "frame" node
-export const MAX_DEPTH = 6;                 // hard nesting cap — enforced in the renderer AND the validator
+export const MAX_DEPTH = 6;                 // legacy hint only — nesting is now UNBOUNDED (the renderer
+                                            // re-roots, and the validator guards cycles, not depth)
 
 export const STATUSES = new Set(['done', 'partial', 'todo']);
 const isSlug = (s) => /^[a-z0-9][a-z0-9-]*$/.test(s || '');
@@ -56,6 +57,32 @@ export function findNodeByPath(rootBoard, path) {
   return node ? { node, board } : null;
 }
 
+// The BOARD a path points INTO (the child board of the path's last node), or the
+// deepest board still resolvable if the path was pruned. Used by the renderer to
+// re-derive the focus board after a live reload, and to validate a focus stack.
+export function boardAtPath(rootBoard, path) {
+  let board = rootBoard;
+  for (const id of (path || [])) {
+    const n = board && Array.isArray(board.nodes) && board.nodes.find((x) => x && x.id === id);
+    if (!n || !n.board) return board;            // pruned: stop at the deepest board that still resolves
+    board = n.board;
+  }
+  return board;
+}
+
+// The chain of { id, title, node } a path walks — feeds the breadcrumb navigator.
+export function pathChain(rootBoard, path) {
+  const out = []; let board = rootBoard;
+  for (const id of (path || [])) {
+    const n = board && Array.isArray(board.nodes) && board.nodes.find((x) => x && x.id === id);
+    if (!n) break;
+    out.push({ id, title: n.title, node: n });
+    board = n.board;
+    if (!board) break;
+  }
+  return out;
+}
+
 export function incidentEdges(board, nodeId) {
   return ((board && board.edges) || []).filter((e) => e && (e.from === nodeId || e.to === nodeId));
 }
@@ -64,10 +91,15 @@ export function incidentEdges(board, nodeId) {
 // every level, so the renderer never meets a missing node and the file can't rot.
 // `validateDetail` is injected (the server passes its own, so detail rules stay in
 // one place); pass a noop to skip detail checks on the client.
-export function validateBoard(b, where, depth, validateDetail) {
-  if (depth > MAX_DEPTH) throw new Error(`${where}: nesting is deeper than ${MAX_DEPTH} levels`);
+export function validateBoard(b, where, seen, validateDetail) {
+  // `seen` tracks the ANCESTOR chain so a board nesting one of its own ancestors (an
+  // infinite-recursion cycle) is rejected — depth itself is unbounded. Back-compat: the
+  // server passes a numeric 0 here, so coerce any non-Set into a fresh traversal set.
+  seen = seen instanceof Set ? seen : new Set();
   if (!b || typeof b !== 'object' || Array.isArray(b) || !Array.isArray(b.nodes) || !Array.isArray(b.edges))
     throw new Error(`${where} must be { nodes: [], edges: [] }`);
+  if (seen.has(b)) throw new Error(`${where}: board cycle detected (a board nests one of its ancestors)`);
+  seen.add(b);
   const ids = new Set();
   b.nodes.forEach((n, i) => {
     const w = `${where}.nodes[${i}]`;
@@ -82,7 +114,7 @@ export function validateBoard(b, where, depth, validateDetail) {
     if (n.status != null && !STATUSES.has(n.status)) throw new Error(`${w}.status must be one of: ${[...STATUSES].join(', ')}`);
     if (n.algorithm != null && !isSlug(n.algorithm)) throw new Error(`${w}.algorithm must be a slug`);
     if (typeof validateDetail === 'function') validateDetail(n.detail, w);
-    if (n.board != null) validateBoard(n.board, `${w}.board`, depth + 1, validateDetail);   // recurse
+    if (n.board != null) validateBoard(n.board, `${w}.board`, seen, validateDetail);   // recurse (cycle-guarded)
   });
   const eids = new Set();
   b.edges.forEach((e, i) => {
@@ -98,4 +130,5 @@ export function validateBoard(b, where, depth, validateDetail) {
     if (e.from === e.to) throw new Error(`${w}: self-edge not allowed (from === to === "${e.from}")`);
     if (e.kind != null && !['flow', 'loop', 'dep'].includes(e.kind)) throw new Error(`${w}.kind must be flow, loop, or dep`);
   });
+  seen.delete(b);   // leave the chain so a board may legitimately recur in a SIBLING subtree; only ANCESTOR cycles throw
 }

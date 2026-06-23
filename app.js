@@ -135,6 +135,7 @@ async function boot() {
     onChange: (id) => { scheduleSave(id); refreshHeaderCount(); },
     onSelect: (sel) => { lastSel = sel; if (sel) openInspector(sel); else closeCallout(); },
     openCount: nodeOpenCount,
+    onNav: renderBreadcrumb,
   });
   window.__atlasCanvas = canvas;   // handle for power-user debugging / automated checks
   // dirty-aware live reload: our own autosave is hash-suppressed server-side, so a
@@ -180,6 +181,22 @@ function refreshHeaderCount() {
   $('sh-count').textContent = `${nodes.length} NODES · ${c.done} DONE · ${c.partial} PARTIAL · ${c.todo} TO BUILD`;
 }
 
+/* ---------- breadcrumb / depth navigator (driven by the canvas focus stack) ---------- */
+function renderBreadcrumb(nav) {
+  const el = document.getElementById('breadcrumb');
+  if (!el) return;
+  if (!nav || !nav.depth) { el.innerHTML = ''; el.classList.remove('show'); return; }
+  el.classList.add('show');
+  const rootTitle = (current && (current.title || current.name || current.id)) || 'map';
+  const crumbs = [{ title: rootTitle }, ...nav.chain];
+  el.innerHTML = crumbs
+    .map((c, i) => `<button class="bc" type="button" data-i="${i}">${esc(c.title || c.id || '?')}</button>`)
+    .join('<span class="bc-sep">›</span>')
+    + `<span class="bc-depth" title="nesting depth">${nav.depth} level${nav.depth > 1 ? 's' : ''} deep</span>`;
+  el.querySelectorAll('.bc').forEach((b) =>
+    b.addEventListener('click', () => canvas.focusPath(nav.path.slice(0, +b.dataset.i))));   // crumb i → first i ids
+}
+
 /* ---------- chrome: edit toggle, fit, new map, editable header ---------- */
 function wireChrome() {
   const editBtn = $('edit-toggle');
@@ -194,12 +211,15 @@ function wireChrome() {
   });
   $('fit-btn').addEventListener('click', () => canvas.fit());
   $('new-sheet').addEventListener('click', createSheet);
-  // delete the selected node/edge with the keyboard (edit mode, not while typing)
+  // keyboard: Esc closes the callout; Delete/Backspace deletes the selection (edit mode) or,
+  // when nothing's selected, climbs one nesting level out (works at any depth, any mode).
   document.addEventListener('keydown', (e) => {
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
     if (e.key === 'Escape') { closeCallout(); return; }
-    if (!editing) return;
-    if ((e.key === 'Delete' || e.key === 'Backspace') && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) && !e.target.isContentEditable) {
-      if (canvas.getSelection()) { e.preventDefault(); canvas.deleteSelected(); }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (editing && canvas.getSelection()) { e.preventDefault(); canvas.deleteSelected(); return; }
+      const nav = canvas.getNav && canvas.getNav();
+      if (nav && nav.canPop) { e.preventDefault(); canvas.popFocus(); }
     }
   });
 }

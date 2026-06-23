@@ -1,0 +1,112 @@
+{
+  "id": "linear-search",
+  "tag": "ALG-04",
+  "name": "Linear search",
+  "title": "Linear search",
+  "sub": "Scan an unsorted array left to right, comparing each element until the target appears.",
+  "kind": "array",
+  "code": [
+    "linearSearch(a, x):",
+    "  for i = 0 .. n-1:",
+    "    if a[i] == x: return i",
+    "  return -1            // absent"
+  ],
+  "steps": [
+    {
+      "array": [
+        4,
+        8,
+        15,
+        16,
+        23,
+        42
+      ],
+      "cls": {},
+      "note": "Scan left → right for x = 16.",
+      "line": 0
+    },
+    {
+      "array": [
+        4,
+        8,
+        15,
+        16,
+        23,
+        42
+      ],
+      "cls": {
+        "0": "compare"
+      },
+      "ptr": {
+        "i": 0
+      },
+      "note": "a[0] = 4 ≠ 16 — keep going.",
+      "line": 2
+    },
+    {
+      "array": [
+        4,
+        8,
+        15,
+        16,
+        23,
+        42
+      ],
+      "cls": {
+        "0": "eliminated",
+        "1": "compare"
+      },
+      "ptr": {
+        "i": 1
+      },
+      "note": "a[1] = 8 ≠ 16.",
+      "line": 2
+    },
+    {
+      "array": [
+        4,
+        8,
+        15,
+        16,
+        23,
+        42
+      ],
+      "cls": {
+        "0": "eliminated",
+        "1": "eliminated",
+        "2": "compare"
+      },
+      "ptr": {
+        "i": 2
+      },
+      "note": "a[2] = 15 ≠ 16.",
+      "line": 2
+    },
+    {
+      "array": [
+        4,
+        8,
+        15,
+        16,
+        23,
+        42
+      ],
+      "cls": {
+        "0": "eliminated",
+        "1": "eliminated",
+        "2": "eliminated",
+        "3": "found"
+      },
+      "ptr": {
+        "i": 3
+      },
+      "note": "a[3] = 16 = x ✓",
+      "line": 2,
+      "verdict": {
+        "ok": true,
+        "text": "Found 16 at index 3 after 4 comparisons."
+      },
+      "question": "Unsorted scan is O(n). When is that still the right call over sorting first?"
+    }
+  ]
+}

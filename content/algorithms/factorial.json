@@ -1,0 +1,69 @@
+{
+  "id": "factorial",
+  "tag": "ALG-05",
+  "name": "Factorial",
+  "title": "Factorial — n!",
+  "sub": "Multiply the running product by each k from 1 to n. A calc-kind worksheet traced row by row.",
+  "kind": "calc",
+  "code": [
+    "factorial(n):",
+    "  result = 1",
+    "  for k = 1 .. n:",
+    "    result = result * k",
+    "  return result"
+  ],
+  "steps": [
+    {
+      "label": "n",
+      "result": 5,
+      "kind": "input",
+      "line": 0,
+      "note": "Compute 5!."
+    },
+    {
+      "label": "result",
+      "result": 1,
+      "kind": "result",
+      "expr": "1",
+      "line": 1
+    },
+    {
+      "label": "k = 1",
+      "result": 1,
+      "expr": "1 × 1",
+      "line": 3
+    },
+    {
+      "label": "k = 2",
+      "result": 2,
+      "expr": "1 × 2",
+      "line": 3
+    },
+    {
+      "label": "k = 3",
+      "result": 6,
+      "expr": "2 × 3",
+      "line": 3
+    },
+    {
+      "label": "k = 4",
+      "result": 24,
+      "expr": "6 × 4",
+      "line": 3
+    },
+    {
+      "label": "k = 5",
+      "result": 120,
+      "expr": "24 × 5",
+      "line": 3
+    },
+    {
+      "label": "5!",
+      "result": 120,
+      "kind": "result",
+      "line": 4,
+      "note": "Final product.",
+      "question": "Where does this overflow a 64-bit integer — and how should the storyboard show that?"
+    }
+  ]
+}

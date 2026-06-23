@@ -582,7 +582,10 @@ body {
   position: absolute;
   background: var(--panel-2); border: 1px solid var(--hair); border-left: 3px solid var(--edge);
   border-radius: 11px; box-shadow: 0 10px 30px -22px #000;
+  user-select: none; -webkit-user-select: none;   /* no text-highlight when dragging a node */
 }
+/* …except the title while it's being edited inline */
+.node-title[contenteditable="true"] { user-select: text; -webkit-user-select: text; cursor: text; outline: none; }
 .node[data-status="done"]    { border-left-color: var(--done); }
 .node[data-status="partial"] { border-left-color: var(--partial); }
 .node[data-status="todo"]    { border-left-color: var(--todo); border-left-style: dashed; }
@@ -617,6 +620,15 @@ body {
 .node[data-lod="dot"] .node-sub, .node[data-lod="dot"] .node-foot, .node[data-lod="dot"] .node-chip { display: none; }
 .node[data-lod="dot"] .node-chrome { padding: 0; height: 100%; display: flex; align-items: center; }
 .node[data-lod="dot"] .node-title { font-size: 15px; padding: 0 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* card tier: long nested-node titles must stay inside the box — shrink, clamp to 3 lines, clip */
+.node[data-lod="card"] .node-chrome { overflow: hidden; max-height: 100%; box-sizing: border-box; }
+.node[data-lod="card"] .node-top { align-items: flex-start; }
+.node[data-lod="card"] .node-title {
+  font-size: 14px; line-height: 1.28;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;
+}
+.node[data-lod="card"] .node-chip { margin-top: 1px; }
 
 .node-inner { position: absolute; left: 0; top: 0; width: 100%; height: 100%; overflow: hidden; border-radius: 11px; display: none; transition: opacity .14s ease; }
 .node[data-lod="frame"] .node-inner { display: block; }
@@ -653,6 +665,30 @@ body {
   opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 7;
 }
 .canvas-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* breadcrumb / depth navigator — appears top-left of the canvas once you dive in */
+.atlas-breadcrumb {
+  position: absolute; left: 14px; top: 14px; z-index: 8;
+  display: none; align-items: center; gap: 2px; max-width: calc(100% - 28px); flex-wrap: wrap;
+  padding: 5px 7px; border-radius: 9px;
+  background: color-mix(in srgb, var(--panel-2) 86%, transparent);
+  border: 1px solid var(--hair); backdrop-filter: blur(6px);
+  font-family: var(--mono); font-size: 11px; box-shadow: 0 8px 24px -18px #000;
+}
+.atlas-breadcrumb.show { display: flex; }
+.atlas-breadcrumb .bc {
+  background: none; border: 0; cursor: pointer; color: var(--muted);
+  font: inherit; padding: 2px 6px; border-radius: 6px; max-width: 200px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.atlas-breadcrumb .bc:hover { color: var(--ink); background: var(--hair); }
+.atlas-breadcrumb .bc:last-of-type { color: var(--ink); font-weight: 600; }
+.atlas-breadcrumb .bc-sep { color: var(--faint); padding: 0 1px; user-select: none; }
+.atlas-breadcrumb .bc-depth {
+  margin-left: 6px; padding: 2px 7px; border-radius: 999px;
+  background: var(--hair); color: var(--steel); font-size: 9.5px;
+  letter-spacing: .06em; text-transform: uppercase; white-space: nowrap;
+}
 
 /* inspector — edit form (reuses the callout drawer) */
 .co-enter {

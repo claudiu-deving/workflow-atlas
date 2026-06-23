@@ -15,6 +15,22 @@ Requires Node ≥ 20. Override the port with `PORT=…`. If that port is taken b
 unrelated process the server steps to the next free one; if another atlas
 instance holds it, this one reuses that UI and runs as an MCP/stdio worker.
 
+## Tests
+
+The runtime ships zero dependencies; tests use dev-only deps (`npm install` first).
+
+- `npm run test:unit` — pure-model unit tests (`shared/board.js`: validation, the
+  cycle guard, path helpers). Fast, no browser.
+- `npm run test:e2e` — Playwright drives the **real** server + Chromium against an
+  isolated seeded project (`.atlas-e2e-home`, wiped each run). Covers the infinite
+  nested zoom (dive 25 levels with the cam-scale staying O(1), seamless re-root,
+  auto-reroot/pop on continuous wheel), the breadcrumb navigator, focus-depth
+  persistence across reload, and direct-manipulation editing (inline title, drag,
+  create, delete, space-pan). `npm test` runs both.
+
+The canvas exposes `window.__atlasCanvas` (e.g. `getNav()`, `popFocus()`,
+`focusPath()`, `_cam()`, `_settled()`) as the test/automation handle.
+
 **Projects.** Each session works on ONE project — by default the directory the
 server was launched in (so opening repo `acme` authors the `acme` project), or set
 `$WORKFLOW_ATLAS_PROJECT`. Data lives under `$WORKFLOW_ATLAS_HOME`

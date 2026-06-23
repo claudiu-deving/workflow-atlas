@@ -3,6 +3,8 @@
   "algorithms": [
     "binary-search",
     "bubble-sort",
-    "euclid-gcd"
+    "euclid-gcd",
+    "factorial",
+    "linear-search"
   ]
 }

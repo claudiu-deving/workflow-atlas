@@ -12,7 +12,7 @@
 // recursion; it drives the mount decision AND the drag math, with no matrix walking.
 
 import { esc } from './shared/esc.js';
-import { boardBBox, nextId, NODE_W, NODE_H, PAD, HEADER, MAX_DEPTH } from './shared/board.js';
+import { boardBBox, nextId, NODE_W, NODE_H, PAD, HEADER, pathChain, boardAtPath } from './shared/board.js';
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 const STATUS_LABEL = { done: 'done', partial: 'partial', todo: 'to build' };
@@ -23,6 +23,12 @@ const MOUNT_PX = 460, UNMOUNT_PX = 340;   // hysteresis gap kills threshold flic
 const DOT_PX = 86;                         // below this a node is just a status dot + clipped title
 const MIN_VISIBLE_PX = 2.5;                // smaller than this on screen → don't paint at all
 const CULL_MARGIN = 240;                   // keep nodes mounted this many px beyond the viewport
+// Infinite-depth navigation: re-root into a child board once its owner FULLY covers the
+// viewport, and pop back out once the focus board shrinks under POP_FIT of the viewport.
+// The wide hysteresis gap (a board that fully covers vs. one that fits in ~55%) prevents
+// ping-pong, and re-rooting resets `cam.zoom` to O(1) so the effScale chain never
+// underflows — nesting is unbounded with no float-precision collapse.
+const POP_FIT = 0.55;
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const r3 = (n) => Math.round(n * 1000) / 1000;
@@ -32,6 +38,7 @@ export function createCanvas(viewportEl, opts = {}) {
   const onChange = opts.onChange || (() => {});
   const onSelect = opts.onSelect || (() => {});
   const openCount = opts.openCount || (() => 0);
+  const onNav = opts.onNav || (() => {});       // breadcrumb / depth HUD callback
   ensureArrowDefs();
 
   const world = viewportEl.querySelector('.world');
@@ -39,10 +46,19 @@ export function createCanvas(viewportEl, opts = {}) {
   world.appendChild(rootBoardEl);
 
   const cam = { x: 0, y: 0, zoom: 1 };
-  let active = null;            // the sheet being shown
+  let active = null;            // the sheet being shown (the ABSOLUTE root of the whole tree)
+  // Focus stack = the infinite-zoom navigation state. `focusBoard` is the board currently
+  // mounted at the render root; `focusPath` is its node-id path from active.board; the stack
+  // holds the parents we dove through, each remembering the geometry needed to invert the
+  // dive seamlessly (no stored camera — a pop re-derives the parent camera from the live one).
+  let focusBoard = null;
+  let focusPath = [];
+  const focusStack = [];        // [{ board, path, node, px, py, innerScale }]
   let editing = false;
   let selection = null;         // { kind:'node'|'edge', node|edge, board }
   let viewW = 0, viewH = 0;
+  let titleEditing = false;     // an inline node-title edit is in flight → suppress repaint/nav
+  let rerootCandidate = null;   // set by renderBoard during a walk, applied after it returns
 
   /* ---------- bbox cache (kept off the model so JSON stays clean) ---------- */
   const bboxCache = new WeakMap();
@@ -64,12 +80,30 @@ export function createCanvas(viewportEl, opts = {}) {
     clearTimeout(wcTimer);
     wcTimer = setTimeout(() => { world.style.willChange = 'auto'; requestRender(); }, 180);
   }
+  function paintRoot() {
+    world.style.transform = `translate(${r3(cam.x)}px, ${r3(cam.y)}px) scale(${r5(cam.zoom)})`;
+    renderBoard(focusBoard, rootBoardEl, cam.x, cam.y, cam.zoom, 0, focusPath);
+  }
   function frame() {
     rafPending = false;
-    if (!active) return;
+    if (!active || !focusBoard) return;
     viewW = viewportEl.clientWidth; viewH = viewportEl.clientHeight;
-    world.style.transform = `translate(${r3(cam.x)}px, ${r3(cam.y)}px) scale(${r5(cam.zoom)})`;
-    renderBoard(active.board, rootBoardEl, cam.x, cam.y, cam.zoom, 0, []);
+    rerootCandidate = null;
+    paintRoot();
+    // Auto-navigation is deferred OUT of the per-node render walk (mutating focus mid-walk is
+    // unsafe). It fires ONLY in response to a wheel-zoom gesture (navIntent), in that gesture's
+    // direction, and never during a drag/tween/title edit — so programmatic dives never trip it
+    // and a single wheel can't both re-root and pop. We consume the intent once, then repaint.
+    const intent = navIntent; navIntent = 0;
+    if (intent && !mode && !tween && !titleEditing) {
+      if (intent > 0 && rerootCandidate && rerootCandidate.el.parentElement === rootBoardEl) {
+        pushFocus(rerootCandidate.node, rerootCandidate.el); paintRoot();   // dive: child now fills the view
+      } else if (intent < 0 && focusStack.length && (focusFitsViewport() || cam.zoom <= ZOOM_MIN * 1.25)) {
+        // pop when the focus board has shrunk under POP_FIT — OR when we're pinned at the zoom
+        // floor (a board too wide to ever "fit" still climbs out when you keep scrolling out).
+        popFocus(); paintRoot();
+      }
+    }
   }
 
   // ox/oy = screen (canvas-relative) position of this board's local (0,0); eff = px/unit.
@@ -102,7 +136,9 @@ export function createCanvas(viewportEl, opts = {}) {
 
       const apparent = sw;   // node.w * eff
       const mounted = !!el._childEl;
-      const want = node.board && depth < MAX_DEPTH && onScreen && (mounted ? apparent >= UNMOUNT_PX : apparent >= MOUNT_PX);
+      // No depth cap: re-rooting (below) keeps the mounted subtree shallow, so mounting is
+      // gated purely on apparent size + visibility, at any absolute nesting depth.
+      const want = node.board && onScreen && (mounted ? apparent >= UNMOUNT_PX : apparent >= MOUNT_PX);
       if (want && !mounted) mountChild(el);
       else if (!want && mounted) unmountChild(el);
       if (el._childEl) {
@@ -110,6 +146,9 @@ export function createCanvas(viewportEl, opts = {}) {
         const innerScale = Math.max(0.0001, Math.min((w - 2 * PAD) / cb.w, (h - HEADER - PAD) / cb.h));
         if (el._innerScale !== innerScale) { el._childEl.style.transform = `translate(${PAD}px, ${HEADER}px) scale(${r5(innerScale)})`; el._innerScale = innerScale; }
         renderBoard(node.board, el._childEl, sx + PAD * eff, sy + HEADER * eff, eff * innerScale, depth + 1, path.concat(node.id));
+        // A direct child of the focus root that has grown to FULLY cover the viewport becomes
+        // the new render root (seamless re-root), so the scale chain never lengthens unboundedly.
+        if (depth === 0 && coversViewport(sx, sy, sw, sh)) rerootCandidate = { node, el };
       }
     }
     for (const [id, el] of map) if (!present.has(id)) { el.remove(); map.delete(id); }
@@ -122,6 +161,7 @@ export function createCanvas(viewportEl, opts = {}) {
   }
 
   function paintNode(el, node) {
+    if (el._editing) return;                 // don't blow away the contentEditable title mid-edit
     const open = openCount(node);
     const status = node.status || 'todo';
     const sig = [node.title, node.sub || '', status, node.algorithm || '', node.board ? 1 : 0, open].join('');
@@ -276,16 +316,35 @@ export function createCanvas(viewportEl, opts = {}) {
   function clearSelection() { if (!selection) return; const b = selection.board; selection = null; if (b) { const be = boardElOf(b); if (be) be._edgeSig = null; } onSelect(null); requestRender(); }
 
   /* ---------- pointer: pan / drag / connect / click ---------- */
-  let mode = null, pending = null, moved = 0, lastX = 0, lastY = 0, connect = null;
+  let mode = null, pending = null, moved = 0, lastX = 0, lastY = 0, connect = null, spaceHeld = false;
+  let navIntent = 0;            // set by the wheel handler (+1 in / -1 out), consumed once by frame()
+  const grabPointer = (e) => { try { viewportEl.setPointerCapture(e.pointerId); } catch { /* ignore */ } };
   viewportEl.addEventListener('pointerdown', (e) => {
+    if (e.target && e.target.isContentEditable) return;     // let an inline title edit take the click
+    // HUD overlays (breadcrumb, etc.) live OUTSIDE `.world` — ignore them here so their own
+    // click handlers fire. (Capturing the pointer would steal their click/dblclick target.)
+    // BUT the canvas background IS the viewport element itself (`.world` is a 0×0 transform
+    // box, so empty canvas hits the viewport, not `.world`) — and it's the primary PAN surface.
+    // Letting it through is essential: otherwise we'd return before recording lastX/lastY, and
+    // the first pan move would diff against a stale anchor, making the layout leap to the cursor.
+    if (e.target !== viewportEl && e.target.closest && !e.target.closest('.world')) return;
+    // Space-drag or middle-button always PANS — the only way to slide the canvas when a
+    // node fills the screen (exactly the deep-zoom state) without moving the node.
+    if (e.button === 1 || (e.button === 0 && spaceHeld)) {
+      lastX = e.clientX; lastY = e.clientY; mode = 'pan'; pending = null; connect = null;
+      viewportEl.classList.add('grabbing');
+      grabPointer(e); e.preventDefault(); return;
+    }
     if (e.button !== 0) return;
     const portEl = editing && e.target.closest && e.target.closest('.port-out');
     const nodeEl = e.target.closest && e.target.closest('.node');
     const edgeEl = e.target.classList && e.target.classList.contains('edge') ? e.target : null;
     lastX = e.clientX; lastY = e.clientY; moved = 0; mode = null; pending = null; connect = null;
-    try { viewportEl.setPointerCapture(e.pointerId); } catch { /* ignore */ }
-    if (portEl && nodeEl) { startConnect(nodeEl); mode = 'connect'; e.preventDefault(); return; }
+    if (portEl && nodeEl) { startConnect(nodeEl); mode = 'connect'; grabPointer(e); e.preventDefault(); return; }
     if (edgeEl) { selectEdge(edgeEl); return; }   // a click on an edge selects it (no drag)
+    // NB: do NOT capture the pointer here. Capturing on a mere press redirects the resulting
+    // click/dblclick to `.canvas`, breaking node title double-click-to-edit and HUD buttons.
+    // We capture lazily below, only once a real drag/pan actually starts.
     pending = nodeEl ? { node: nodeEl._node, nodeEl, boardEl: nodeEl.parentElement } : null;
   });
   viewportEl.addEventListener('pointermove', (e) => {
@@ -295,6 +354,7 @@ export function createCanvas(viewportEl, opts = {}) {
       moved += Math.abs(dx) + Math.abs(dy);
       if (moved <= 4) { lastX = e.clientX; lastY = e.clientY; return; }
       mode = (editing && pending) ? 'drag' : 'pan';
+      grabPointer(e);                              // the gesture is real now → capture so it tracks off-element
       if (mode === 'pan') viewportEl.classList.add('grabbing');
     }
     if (mode === 'pan') { cam.x += dx; cam.y += dy; promoteWorld(); requestRender(); }
@@ -329,9 +389,46 @@ export function createCanvas(viewportEl, opts = {}) {
   });
   viewportEl.addEventListener('dblclick', (e) => {
     const nodeEl = e.target.closest && e.target.closest('.node');
-    if (nodeEl) { zoomToNode(nodeEl._node, nodeEl); return; }
+    const titleEl = e.target.closest && e.target.closest('.node-title');
+    if (editing && nodeEl && titleEl) { beginTitleEdit(titleEl, nodeEl._node, nodeEl); return; }
+    if (nodeEl) { zoomToNode(nodeEl._node, nodeEl); return; }   // dive into the node (re-roots if it has a chart)
     if (editing) createNodeAt(e.clientX, e.clientY);
   });
+  // Track Space for space-to-pan (ignored while typing). preventDefault stops the page scroll.
+  document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) && !e.target.isContentEditable) {
+      spaceHeld = true; if (e.target === document.body) e.preventDefault();
+    }
+  });
+  document.addEventListener('keyup', (e) => { if (e.code === 'Space') spaceHeld = false; });
+
+  // Inline node-title editing: make the .node-title contentEditable, commit on Enter/blur,
+  // revert on Escape. `el._editing` suppresses paintNode so a re-render can't clobber the text.
+  function beginTitleEdit(titleEl, node, el) {
+    if (el._editing) return;
+    titleEditing = true; el._editing = true;
+    let done = false;
+    titleEl.setAttribute('contenteditable', 'true');
+    titleEl.focus();
+    try { document.getSelection().selectAllChildren(titleEl); } catch { /* ignore */ }
+    const finish = (commit) => {
+      if (done) return; done = true;
+      titleEl.removeEventListener('blur', onBlur); titleEl.removeEventListener('keydown', onKey);
+      const v = titleEl.textContent.trim();
+      if (commit && v && v !== node.title) { node.title = v; el._sig = null; onChange(active.id); }
+      else { titleEl.textContent = node.title; }     // empty / unchanged / cancelled → restore
+      titleEl.removeAttribute('contenteditable');
+      el._editing = false; titleEditing = false;
+      requestRender();
+    };
+    const onBlur = () => finish(true);
+    const onKey = (ev) => {
+      ev.stopPropagation();
+      if (ev.key === 'Enter') { ev.preventDefault(); finish(true); titleEl.blur(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); finish(false); titleEl.blur(); }
+    };
+    titleEl.addEventListener('blur', onBlur); titleEl.addEventListener('keydown', onKey);
+  }
   viewportEl.addEventListener('wheel', (e) => {
     e.preventDefault();
     const r = canvasRect();
@@ -339,6 +436,10 @@ export function createCanvas(viewportEl, opts = {}) {
     const z = clamp(cam.zoom * Math.exp(-e.deltaY * 0.0015), ZOOM_MIN, ZOOM_MAX);
     const k = z / cam.zoom;
     cam.x = k * cam.x + (1 - k) * sx; cam.y = k * cam.y + (1 - k) * sy; cam.zoom = z;
+    // Auto re-root / pop is driven ONLY by a continuous-zoom gesture and only in the gesture's
+    // direction — so programmatic dives/fits never trip it, and a single wheel can't both re-root
+    // and pop (no oscillation). +1 = zooming in (may re-root), -1 = zooming out (may pop).
+    navIntent = e.deltaY < 0 ? 1 : (e.deltaY > 0 ? -1 : 0);
     promoteWorld(); requestRender();
   }, { passive: false });
 
@@ -365,16 +466,104 @@ export function createCanvas(viewportEl, opts = {}) {
 
   function createNodeAt(clientX, clientY) {
     const boardEl = activeBoardElAt(clientX, clientY);
+    if (!boardEl || !boardEl._board || !Number.isFinite(boardEl._eff) || boardEl._eff <= 0) return;  // not painted yet
     const { lx, ly } = localPoint(boardEl, clientX, clientY);
+    if (!Number.isFinite(lx) || !Number.isFinite(ly)) return;
     const board = boardEl._board;
     const node = { id: nextId(board.nodes, 'n'), x: Math.round(lx - NODE_W / 2), y: Math.round(ly - NODE_H / 2), w: NODE_W, h: NODE_H, title: 'New node', status: 'todo' };
     board.nodes.push(node); invalidateBBox(board); onChange(active.id);
     selectNodeKnown(node, board);
   }
 
+  /* ---------- focus stack: seamless infinite-zoom navigation ---------- */
+  // A "dive" re-roots the renderer onto a node's child board and rebases the camera so the
+  // child occupies the EXACT pixels it had while nested — then `cam.zoom` is back to O(1),
+  // so the effScale chain can never underflow no matter how deep you go. A "pop" inverts it
+  // from the LIVE camera (not a stored one), so it stays seamless however much you zoomed.
+  const innerScaleOf = (node) => {
+    const w = node.w || NODE_W, h = node.h || NODE_H, cb = bboxOf(node.board);
+    return Math.max(1e-4, Math.min((w - 2 * PAD) / cb.w, (h - HEADER - PAD) / cb.h));
+  };
+  function coversViewport(sx, sy, sw, sh) {     // an on-screen rect fully spans the viewport
+    if (!(Number.isFinite(sx) && Number.isFinite(sy) && Number.isFinite(sw) && Number.isFinite(sh))) return false;
+    return sx <= 1 && sy <= 1 && sx + sw >= viewW - 1 && sy + sh >= viewH - 1;
+  }
+  function focusFitsViewport() {                 // the whole focus board fits within POP_FIT of the view
+    if (!Number.isFinite(cam.zoom) || cam.zoom <= 0) return false;
+    const bb = bboxOf(focusBoard);
+    return bb.w * cam.zoom <= POP_FIT * viewW && bb.h * cam.zoom <= POP_FIT * viewH;
+  }
+  function pushFocus(node, ownerEl) {            // dive one level (node must be a direct child of focusBoard)
+    if (!node || !node.board) return;
+    if (ownerEl && ownerEl.parentElement !== rootBoardEl) return;
+    if (focusPath.includes(node.id) && focusBoard.nodes.indexOf(node) < 0) return;  // paranoia vs cycles
+    const innerScale = innerScaleOf(node), px = node.x + PAD, py = node.y + HEADER, z = cam.zoom;
+    focusStack.push({ board: focusBoard, path: focusPath.slice(), node, px, py, innerScale });
+    cam.x = cam.x + px * z; cam.y = cam.y + py * z; cam.zoom = z * innerScale;
+    focusBoard = node.board; focusPath = focusPath.concat(node.id);
+    clearRoot(); emitNav();
+  }
+  function popFocus() {                           // climb one level, re-deriving the parent camera
+    if (!focusStack.length) return false;
+    const fr = focusStack.pop();
+    // Prefer LIVE geometry: if the owner node was edited (or its child board grew) while we were
+    // focused inside, the snapshot would seam the nested content on the way out. Fall back to the
+    // snapshot if the node was deleted. For an unchanged dive/pop pair this is the exact inverse.
+    let px = fr.px, py = fr.py, s = fr.innerScale;
+    if (fr.node && fr.board.nodes.indexOf(fr.node) >= 0 && fr.node.board) {
+      px = fr.node.x + PAD; py = fr.node.y + HEADER; s = innerScaleOf(fr.node);
+    }
+    const parentZoom = cam.zoom / s;
+    cam.x = cam.x - px * parentZoom; cam.y = cam.y - py * parentZoom; cam.zoom = parentZoom;
+    focusBoard = fr.board; focusPath = fr.path.slice();
+    clearRoot(); emitNav();
+    return true;
+  }
+  // Jump to an arbitrary path from the sheet root (breadcrumb crumb click). Rebuilds the stack
+  // and fits the target level — exact-pixel restoration only matters for the immediate dive/pop pair.
+  function focusToPath(path, opts) {
+    if (!active) return;
+    path = path || [];
+    focusStack.length = 0;
+    let board = active.board; const acc = [];
+    for (const id of path) {
+      const n = board.nodes && board.nodes.find((x) => x && x.id === id);
+      if (!n || !n.board) break;
+      focusStack.push({ board, path: acc.slice(), node: n, px: n.x + PAD, py: n.y + HEADER, innerScale: innerScaleOf(n) });
+      board = n.board; acc.push(id);
+    }
+    focusBoard = board; focusPath = acc;
+    clearRoot(); emitNav();
+    if (opts && opts.instant) fit();              // restore (e.g. after reload): land instantly, no glide
+    else zoomToFitFocus(0.9);                     // sync → sets `tween`, blocking premature auto-nav in the gap
+  }
+  function getNav() {
+    return { depth: focusPath.length, path: focusPath.slice(), chain: active ? pathChain(active.board, focusPath) : [], canPop: focusStack.length > 0 };
+  }
+  // Persist the focus path per-sheet so a live/MCP reload (location.reload) doesn't yank you back
+  // to the root from deep nesting — you reappear where you were. Per-tab (sessionStorage).
+  const focusKey = () => 'atlas-focus:' + (active && active.id);
+  function persistFocus() { try { sessionStorage.setItem(focusKey(), JSON.stringify(focusPath)); } catch { /* ignore */ } }
+  function readSavedFocus() {
+    try { const s = JSON.parse(sessionStorage.getItem(focusKey()) || '[]'); return Array.isArray(s) ? s : []; } catch { return []; }
+  }
+  function restoreFocus(saved) {
+    // only restore if the saved path still resolves into a real nested board (graceful if pruned)
+    if (saved.length && boardAtPath(active.board, saved) !== active.board) focusToPath(saved, { instant: true });
+  }
+  function emitNav() { persistFocus(); onNav(getNav()); }
+
   /* ---------- camera moves ---------- */
   function zoomToNode(node, nodeEl) {
     nodeEl = nodeEl || nodeElFor(node); if (!nodeEl) return;
+    // Diving into a direct child of the focus root re-roots seamlessly, then fits the child.
+    // The fit tween MUST start synchronously: it sets `tween`, which blocks the auto-pop from
+    // firing in the gap before the child is zoomed in (the child is briefly small → "fits").
+    if (node.board && nodeEl.parentElement === rootBoardEl && !tween && !mode) {
+      pushFocus(node, nodeEl);
+      zoomToFitFocus(0.9);
+      return;
+    }
     const b = nodeEl.parentElement, eff = b._eff;
     const w = node.w || NODE_W, h = node.h || NODE_H;
     const scx = b._ox + (node.x + w / 2) * eff, scy = b._oy + (node.y + h / 2) * eff;
@@ -384,6 +573,12 @@ export function createCanvas(viewportEl, opts = {}) {
     const ny = k * cam.y + (1 - k) * scy + (viewH / 2 - scy);
     tweenCamera(nx, ny, zoomNew);
   }
+  function zoomToFitFocus(margin) {              // glide the current focus board to fill the viewport
+    const bb = bboxOf(focusBoard), m = margin || 0.9;
+    const vw = viewW || viewportEl.clientWidth || 800, vh = viewH || viewportEl.clientHeight || 600;
+    const z = clamp(Math.min((vw * m) / bb.w, (vh * m) / bb.h), ZOOM_MIN, ZOOM_MAX);
+    tweenCamera((vw - bb.w * z) / 2, (vh - bb.h * z) / 2, z);
+  }
   let tween = null;
   function tweenCamera(x, y, z) {
     const sx = cam.x, sy = cam.y, sz = cam.zoom, t0 = performance.now(), dur = 320;
@@ -391,14 +586,14 @@ export function createCanvas(viewportEl, opts = {}) {
     const stepFn = () => {
       const t = Math.min(1, (performance.now() - t0) / dur), e = 1 - Math.pow(1 - t, 3);
       cam.x = sx + (x - sx) * e; cam.y = sy + (y - sy) * e; cam.zoom = sz + (z - sz) * e;
-      frame();
-      if (t < 1) tween = requestAnimationFrame(stepFn); else tween = null;
+      if (t < 1) { frame(); tween = requestAnimationFrame(stepFn); }
+      else { tween = null; frame(); }   // clear tween BEFORE the final frame → it's a clean resting render
     };
     tween = requestAnimationFrame(stepFn);
   }
   function fit() {
-    if (!active) return;
-    const bb = bboxOf(active.board);
+    if (!focusBoard) return;
+    const bb = bboxOf(focusBoard);                 // fit the level you're ON, not the whole tree
     const vw = viewportEl.clientWidth || 800, vh = viewportEl.clientHeight || 600, pad = 70;
     const z = clamp(Math.min((vw - pad * 2) / bb.w, (vh - pad * 2) / bb.h), ZOOM_MIN, 1.4);
     cam.zoom = z; cam.x = (vw - bb.w * z) / 2; cam.y = (vh - bb.h * z) / 2;
@@ -414,11 +609,17 @@ export function createCanvas(viewportEl, opts = {}) {
   }
 
   /* ---------- public API (driven by app.js) ---------- */
+  function clearRoot() {                          // tear down the mounted tree so frame() rebuilds focusBoard
+    for (const [, el] of rootBoardEl._nodes) el.remove();
+    rootBoardEl._nodes.clear(); rootBoardEl._edgeSig = null; rootBoardEl._board = null;
+  }
   function load(sheet) {
     active = sheet; selection = null; onSelect(null);
-    for (const [, el] of rootBoardEl._nodes) el.remove();
-    rootBoardEl._nodes.clear(); rootBoardEl._edgeSig = null;
-    frame(); fit();
+    const saved = readSavedFocus();   // read BEFORE the root emitNav() overwrites the stored path
+    focusBoard = sheet.board; focusPath = []; focusStack.length = 0;   // start at the sheet root
+    clearRoot();
+    frame(); fit(); emitNav();
+    restoreFocus(saved);   // re-enter the depth this sheet was last viewed at (survives reload)
   }
   function setEditing(b) { editing = b; viewportEl.classList.toggle('editing', b); requestRender(); }
   function refresh() {                                   // after an inspector edit mutated the selected node
@@ -446,9 +647,28 @@ export function createCanvas(viewportEl, opts = {}) {
     requestAnimationFrame(() => zoomToNode(node));        // glide in so the (empty) child mounts in place
   }
 
+  // Create a node at the center of the current view, in whatever board is focused/under it.
+  function createNodeAtViewCenter() {
+    const r = canvasRect();
+    createNodeAt(r.left + viewW / 2, r.top + viewH / 2);
+    return selection && selection.node;
+  }
+  // Public climb: pop one level and glide the parent into view (the auto-pop path stays seamless).
+  function popFocusAndFit() { if (popFocus()) { zoomToFitFocus(0.9); return true; } return false; }
+
   window.addEventListener('resize', requestRender);
 
-  return { load, setEditing, refresh, fit, deleteSelected, addSubchart, zoomToNode, getSelection: () => selection, clearSelection, _frame: frame };
+  return {
+    load, setEditing, refresh, fit, deleteSelected, addSubchart, zoomToNode,
+    getSelection: () => selection, clearSelection,
+    // infinite-zoom navigation
+    popFocus: popFocusAndFit, getNav, focusPath: focusToPath, createNodeAtViewCenter,
+    // test/debug hooks — drive deterministic dive/climb checks from window.__atlasCanvas
+    _frame: frame,
+    _cam: () => ({ ...cam }),
+    _nodeCount: () => viewportEl.querySelectorAll('.node').length,
+    _settled: () => !tween && !rafPending,
+  };
 }
 
 // One shared arrowhead marker (referenced document-wide by every board's edges).

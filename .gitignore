@@ -10,3 +10,9 @@ content/reviews/*
 
 # Recovery snapshot the server writes before each workflows.json save.
 content/workflows.json.bak
+
+# Test artifacts (Playwright e2e isolated home + reports)
+.atlas-e2e-home/
+test-results/
+playwright-report/
+playwright/.cache/
