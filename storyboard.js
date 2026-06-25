@@ -31,6 +31,7 @@ function specToTrace(spec) {
   const meta = {
     id: spec.id, code: spec.tag || '', name: spec.name || spec.id,
     title: spec.title || spec.name || spec.id, sub: spec.sub || '', workflow: spec.workflow,
+    layout: spec.layout || null,   // agent-controlled canvas sizing: { width?, height? }
   };
   let compute;
   if (spec.builtin && GENERATORS[spec.builtin]) {
@@ -90,6 +91,19 @@ async function boot() {
   loadAlg(start >= 0 ? start : 0);
 }
 
+// Agent-controlled canvas sizing from spec.layout: width = overall page width,
+// height = stage min-height. Both optional and clamped to sane bounds; absent values
+// reset to the CSS defaults so switching storyboards never inherits prior dimensions.
+function applyLayout(layout) {
+  const sheet = $('sheet'), stage = $('alg-stage');
+  const px = (v, lo, hi) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.max(lo, Math.min(hi, n)) + 'px' : ''; };
+  sheet.style.maxWidth = px(layout && layout.width, 700, 2400);
+  stage.style.minHeight = px(layout && layout.height, 240, 1600);
+  // side column width (pseudocode + narration) — widen it for long code lines
+  const side = px(layout && layout.sidebarWidth, 260, 720);
+  if (side) sheet.style.setProperty('--side-w', side); else sheet.style.removeProperty('--side-w');
+}
+
 async function loadAlg(i) {
   const myLoad = ++loadSeq;
   trace = ALGORITHMS[i];
@@ -98,6 +112,7 @@ async function loadAlg(i) {
   $('alg-eyebrow-code').textContent = trace.meta.code;
   $('alg-title').textContent = trace.meta.title;
   $('alg-sub').textContent = trace.meta.sub;
+  applyLayout(trace.meta.layout);
 
   // back-link to the workflow step this algorithm sits behind
   const back = $('alg-backlink');

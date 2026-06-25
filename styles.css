@@ -364,9 +364,9 @@ body {
 .dot.reject { background: transparent; border: 1.5px solid var(--reject, #e0594e); }
 .dot.idle { background: var(--faint); }
 
-.sheet.alg { max-width: 1080px; }
+.sheet.alg { max-width: 1280px; }   /* default; a spec's layout.width can widen per-storyboard */
 
-.story { display: grid; grid-template-columns: 1fr 340px; gap: 22px; align-items: stretch; }
+.story { display: grid; grid-template-columns: 1fr var(--side-w, 400px); gap: 22px; align-items: stretch; }
 .stage-wrap {
   background: var(--panel); border: 1px solid var(--hair); border-radius: 14px;
   padding: 8px; position: relative; overflow: hidden;
@@ -426,13 +426,14 @@ body {
   margin-bottom: 12px; display: flex; align-items: center; gap: 10px; }
 .pane-h::after { content: ""; flex: 1; height: 1px; background: var(--hair); }
 .pane { overflow: hidden; }
-.code { display: flex; flex-direction: column; gap: 1px; overflow-x: auto; }
-.code-line { display: grid; grid-template-columns: 20px 1fr; gap: 8px; align-items: baseline;
-  padding: 3px 7px; border-radius: 6px; transition: background .25s, opacity .25s; opacity: .5; }
-.code-line .ln { font-family: var(--mono); font-size: 9.5px; color: var(--faint); }
-.code-line code { font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: pre; }
-.code-line.hot { opacity: 1; background: #1f2731; box-shadow: inset 2px 0 0 var(--steel); }
+.code { display: flex; flex-direction: column; gap: 2px; overflow-x: auto; }
+.code-line { display: grid; grid-template-columns: 24px 1fr; gap: 10px; align-items: baseline;
+  padding: 5px 10px; border-radius: 7px; transition: background .25s, opacity .25s; opacity: .62; }
+.code-line .ln { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+.code-line code { font-family: var(--mono); font-size: 14px; line-height: 1.5; color: #c3ccd8; white-space: pre; }
+.code-line.hot { opacity: 1; background: #25303d; box-shadow: inset 3px 0 0 var(--steel); }
 .code-line.hot code { color: var(--ink); }
+.code-line.hot .ln { color: var(--steel); }
 .narr .note { font-size: 14.5px; line-height: 1.55; color: var(--ink); margin: 0; }
 .verdict { font-family: var(--mono); font-size: 12px; line-height: 1.5; margin: 12px 0 0;
   min-height: 3em; color: var(--muted); }
@@ -570,6 +571,28 @@ body {
   background-size: 48px 48px;
 }
 .canvas.grabbing { cursor: grabbing; }
+
+/* recovery panel shown when boot/canvas init throws (instead of a silent blank) */
+.boot-error {
+  position: absolute; inset: 0; z-index: 20; cursor: default;
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+  background: rgba(10, 12, 16, .72);
+}
+.boot-error-card {
+  max-width: 440px; padding: 22px 24px; border-radius: 14px; text-align: left;
+  background: var(--panel-2); border: 1px solid var(--hair); box-shadow: 0 20px 60px -30px #000;
+}
+.boot-error-h { font-family: var(--display); font-weight: 700; font-size: 16px; color: var(--partial); margin: 0 0 12px; }
+.boot-error-msg {
+  font-family: var(--mono); font-size: 12px; color: var(--ink); word-break: break-word;
+  background: rgba(0, 0, 0, .28); padding: 9px 11px; border-radius: 8px; margin: 0 0 12px;
+}
+.boot-error-fix { font-size: 13px; color: var(--muted); line-height: 1.55; margin: 0 0 16px; }
+.boot-error-btn {
+  font-family: var(--mono); font-size: 12px; letter-spacing: .04em; padding: 7px 18px;
+  border-radius: 999px; border: 1px solid var(--steel); color: var(--steel); background: transparent; cursor: pointer;
+}
+.boot-error-btn:hover { background: rgba(227, 166, 72, .12); }
 /* will-change is toggled on by canvas.js only DURING a gesture, then dropped at rest
    so Chrome re-rasterizes crisply at the final zoom (a permanent layer stays pixelated
    until a repaint). */
@@ -619,6 +642,20 @@ body {
 .node-tag.algo { color: var(--steel); border-color: rgba(227, 166, 72, .35); }
 .node-tag.nest { color: var(--todo); border-color: rgba(110, 168, 230, .35); }
 .node-tag.q    { color: var(--steel); border-color: rgba(227, 166, 72, .35); }
+
+/* question-count marker: a bubble hanging under the card's bottom-left.
+   Amber while questions are open; green (Done) once every one is answered. */
+.node-q {
+  position: absolute; left: 14px; bottom: -13px; z-index: 3;
+  display: none; align-items: center; justify-content: center;
+  width: 26px; height: 26px; border-radius: 50%;
+  background: var(--panel-2); border: 1.5px solid rgba(227, 166, 72, .6); color: var(--partial);
+  font-family: var(--display); font-weight: 700; font-size: 14px; line-height: 1;
+  box-shadow: 0 4px 12px -6px #000; pointer-events: none;
+}
+.node.has-open .node-q { display: flex; }
+.node.q-done .node-q { border-color: rgba(70, 200, 160, .6); color: var(--done); }
+.node[data-lod="dot"] .node-q { display: none; }   /* too small to read when zoomed out */
 
 /* level-of-detail tiers (set by the engine from apparent on-screen size) */
 .node[data-lod="dot"] .node-sub, .node[data-lod="dot"] .node-foot, .node[data-lod="dot"] .node-chip { display: none; }
@@ -774,6 +811,7 @@ body {
 }
 .seg.on { background: var(--panel-2); color: var(--ink); border-color: var(--edge); box-shadow: inset 0 0 0 1px var(--hair); }
 .ed-actions { display: flex; gap: 8px; margin-top: 18px; }
+.ed-answers:not(:empty) { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line, rgba(255,255,255,.1)); }
 .ed-btn {
   flex: 1; font-family: var(--mono); font-size: 11px; color: var(--ink);
   background: var(--panel-2); border: 1px solid var(--hair); border-radius: 8px; padding: 9px 10px; cursor: pointer;

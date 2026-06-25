@@ -38,7 +38,7 @@ const r5 = (n) => Math.round(n * 100000) / 100000;
 export function createCanvas(viewportEl, opts = {}) {
   const onChange = opts.onChange || (() => {});
   const onSelect = opts.onSelect || (() => {});
-  const openCount = opts.openCount || (() => 0);
+  const questionStats = opts.questionStats || (() => ({ open: 0, decided: 0, total: 0 }));
   const onNav = opts.onNav || (() => {});       // breadcrumb / depth HUD callback
   const onEditingChange = opts.onEditingChange || (() => {});   // fires when edit mode flips (incl. auto-enable)
   ensureArrowDefs();
@@ -189,15 +189,24 @@ export function createCanvas(viewportEl, opts = {}) {
 
   function paintNode(el, node) {
     if (el._editing) return;                 // don't blow away the contentEditable title mid-edit
-    const open = openCount(node);
+    const q = questionStats(node);           // own + nested questions, so parents badge too
     const status = node.status || 'todo';
-    const sig = [node.title, node.sub || '', status, node.algorithm || '', node.board ? 1 : 0, open].join('');
+    const sig = [node.title, node.sub || '', status, node.algorithm || '', node.board ? 1 : 0, q.open, q.decided].join('');
     if (el._sig === sig) return;
     el._sig = sig;
     if (el._status !== status) { el.dataset.status = status; el._status = status; }
     // "Has a chart inside" is shown by an accented top-right border (.has-chart), not a tag.
     const hasChart = !!node.board;
     if (el._hasChart !== hasChart) { el.classList.toggle('has-chart', hasChart); el._hasChart = hasChart; }
+    // Question marker: a count bubble under the card (visible at every zoom tier,
+    // unlike the in-card footer). Amber while any are open; green once all answered.
+    el.classList.toggle('has-open', q.total > 0);
+    el.classList.toggle('q-done', q.total > 0 && q.open === 0);
+    const qEl = el.querySelector('.node-q');
+    qEl.textContent = String(q.open || q.decided || '');
+    qEl.title = q.open
+      ? `${q.open} open question${q.open > 1 ? 's' : ''}`
+      : `${q.decided} question${q.decided > 1 ? 's' : ''} answered`;
     el.querySelector('.node-chrome').innerHTML =
       `<div class="node-top"><span class="node-dot"></span>` +
       `<h3 class="node-title">${esc(node.title)}</h3>` +
@@ -205,7 +214,6 @@ export function createCanvas(viewportEl, opts = {}) {
       (node.sub ? `<p class="node-sub">${esc(node.sub)}</p>` : '') +
       `<div class="node-foot">` +
       (node.algorithm ? `<span class="node-tag algo">▶ storyboard</span>` : '') +
-      (open ? `<span class="node-tag q">${open} open</span>` : '') +
       `</div>`;
   }
 
@@ -319,7 +327,8 @@ export function createCanvas(viewportEl, opts = {}) {
     ports.innerHTML = ['top', 'right', 'bottom', 'left']
       .map((side) => `<span class="port" data-port="${side}" title="drag to connect"></span>`).join('');
     const grip = document.createElement('span'); grip.className = 'node-resize'; grip.title = 'drag to resize';
-    el.append(chrome, inner, ports, grip);
+    const q = document.createElement('span'); q.className = 'node-q';
+    el.append(chrome, inner, ports, grip, q);
     el._shown = true;
     return el;
   }
