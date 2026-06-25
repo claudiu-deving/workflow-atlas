@@ -89,6 +89,20 @@ function registerSelfWrite(proj, jsonStr) {
   while (selfWrites.size > 24) selfWrites.delete(selfWrites.values().next().value);
 }
 
+// Project → time of our last review autosave. Everything under reviews/ (storyboard
+// comments/params/decisions, workflow decisions) is the app's OWN autosave and must
+// never reload anyone — otherwise typing a comment, which autosaves per keystroke,
+// reloads the page on every key. The /reviews/ path filter catches the file event, but
+// a coalesced fs.watch can also surface a review write as a *fileless* project-dir event
+// the path filter can't see; this lets the watcher swallow that ambiguous event for a
+// brief window after we wrote a review.
+// ponytail: a time-window (not a content hash like selfWrites) because the directory
+// event carries no filename to hash. Window covers post-write fs latency; widen if late
+// events ever leak a stray reload.
+const reviewWriteAt = new Map();
+const REVIEW_EVENT_WINDOW_MS = 1000;
+const noteReviewWrite = (p) => reviewWriteAt.set(p, Date.now());
+
 // Serialize the WHOLE read-modify-write of a project's workflows.json. The per-file
 // writeAtomic queue only serializes the rename; saveSheet/setStation read the entire
 // sheets array, mutate one, and write all — so two interleaved edits to DIFFERENT
@@ -461,6 +475,7 @@ async function writeReview(p, id, obj) {
     decisions: obj.decisions || {},      // step → { answer, by, at } for resolved open questions
   };
   await writeAtomic(reviewPath(p, id), JSON.stringify(out, null, 2) + '\n');
+  noteReviewWrite(p);
   return out;
 }
 
@@ -479,6 +494,7 @@ async function writeWorkflowReview(p, obj) {
     decisions: (obj && obj.decisions) || {},   // sheetId → { [question text]: { answer, by, at } }
   };
   await writeAtomic(workflowReviewPath(p), JSON.stringify(out, null, 2) + '\n');
+  noteReviewWrite(p);
   return out;
 }
 // every open[] question across all sheets — walking the v2 board recursively so a
@@ -589,7 +605,7 @@ const TOOLS = [
 
   // author content
   { name: 'save_algorithm', description: 'Create or replace an algorithm storyboard from a JSON spec. ' +
-      'spec = { id (slug), tag?, name, title?, sub?, workflow?{sheet,label}, kind ("array"|"calc"), code (pseudocode lines[]), params? [{ key, label, sym?, value, unit?, min, max, step, hint? }], ' +
+      'spec = { id (slug), tag?, name, title?, sub?, workflow?{sheet,label}, layout?{ width (overall page px, 700-2400), height (stage min-height px, 240-1600), sidebarWidth (pseudocode/narration column px, 260-720) } for bigger storyboards, kind ("array"|"calc"), code (pseudocode lines[]), params? [{ key, label, sym?, value, unit?, min, max, step, hint? }], ' +
       'and EITHER steps[] (explicit frames) OR builtin (one of: ' + [...BUILTINS].join(', ') + ') + data + questions?[{ step, text }] }. ' +
       'A frame (kind "array") = { array[], cls{index:state}, ptr{label:index}, note, line, verdict{ok?,text}, question? } ' +
       'where state ∈ idle|active|compare|lo|hi|mid|eliminated|found|sorted. A row (kind "calc") = ' +
@@ -918,7 +934,17 @@ try {
   watch(PROJECTS_DIR, { recursive: true }, (_ev, file) => {
     if (!file) return;
     const f = String(file).split(path.sep).join('/');
-    if (f.includes('/reviews/') || f.endsWith('.bak') || f.includes('.tmp-')) return;
+    // Skip the app's own review autosaves and atomic-write temp/.bak files. The regex
+    // matches the reviews dir in EVERY event shape fs.watch emits — "reviews",
+    // "proj/reviews", "proj/reviews/x.json" — not just the "/reviews/" infix (a bare
+    // "proj/reviews" dir event has no trailing slash and used to slip through, reloading
+    // the page on every comment keystroke).
+    if (/(^|\/)reviews(\/|$)/.test(f) || f.endsWith('.bak') || f.includes('.tmp-')) return;
+    const proj = f.split('/')[0];
+    // A review write can also surface as a fileless project-dir event ("proj") with no
+    // path to match above. If we just wrote a review for this project, that's what this
+    // is — swallow it so the comment box doesn't reload mid-keystroke.
+    if (!f.includes('/') && Date.now() - (reviewWriteAt.get(proj) || 0) < REVIEW_EVENT_WINDOW_MS) return;
     // Suppress the live-reload for OUR OWN in-app autosave of workflows.json, so the
     // tab doesn't refresh mid-edit. Two robustness points, both learned from real
     // Windows fs.watch behaviour:
@@ -929,7 +955,6 @@ try {
     // let a duplicate reload. A genuine MCP/other-session write has different bytes (not
     // in the ledger) and still reloads; an algorithm save also rewrites index.json,
     // which reloads through its own event.
-    const proj = f.split('/')[0];
     const mayBeWorkflows = f.endsWith('workflows.json') || !f.includes('/');
     if (mayBeWorkflows && proj) {
       try { if (selfWrites.has(selfKey(proj, readFileSync(workflowsPath(proj), 'utf8')))) return; }

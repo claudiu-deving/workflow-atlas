@@ -6,7 +6,7 @@
 import { esc } from './shared/esc.js';
 import { migrateSheet } from './shared/migrate.js';
 import { createCanvas } from './canvas.js';
-import { resolveProjects, apiBase, withProject, renderSwitcher, wireSwitchLinks, setTabTitle } from './shared/project.js';
+import { resolveProjects, apiBase, renderSwitcher, wireSwitchLinks, setTabTitle } from './shared/project.js';
 
 const $ = (id) => document.getElementById(id);
 let PROJECT = 'default';
@@ -64,11 +64,21 @@ function wfReopen(sheetId, question) {
   if (wfReview.decisions && wfReview.decisions[sheetId]) delete wfReview.decisions[sheetId][question];
   persistWfChange({ sheet: sheetId, question, decision: null });
 }
-// unanswered open questions on a node (the canvas shows this as a badge)
-function nodeOpenCount(node) {
-  if (!node || !node.detail || !Array.isArray(node.detail.open)) return 0;
+// Question tally for a node AND all its descendant boards, so a parent badges
+// when a chart nested inside it still has questions. Decisions are sheet-global
+// (keyed by question text), so any node at any depth resolves against the same map.
+function nodeQuestionStats(node) {
   const dec = wfDecisions(current && current.id);
-  return node.detail.open.filter((q) => !dec[q]).length;
+  let open = 0, decided = 0;
+  const walk = (n) => {
+    if (!n) return;
+    if (n.detail && Array.isArray(n.detail.open)) {
+      for (const q of n.detail.open) { if (dec[q]) decided++; else open++; }
+    }
+    if (n.board && Array.isArray(n.board.nodes)) n.board.nodes.forEach(walk);
+  };
+  walk(node);
+  return { open, decided, total: open + decided };
 }
 
 /* ---------- autosave (browser → server; debounced, coalesced) ---------- */
@@ -126,6 +136,17 @@ async function boot() {
   setTabTitle(PROJECT, 'Workflows');
   renderSwitcher($('proj'), info);
   wireSwitchLinks(PROJECT);
+  // Register live-reload FIRST, before anything below can throw. A hot reload that
+  // lands on a transiently-broken app file (mid-write, or an inconsistent edit) used
+  // to throw in createCanvas — and because this listener was set up *after* that, the
+  // tab lost its reload connection and stayed blank until a manual project switch.
+  // Wiring it up front means the next save always reloads the tab and self-heals it.
+  try {
+    new EventSource('/api/livereload?p=' + encodeURIComponent(PROJECT)).onmessage = async () => {
+      await flushSaves();   // ensure any pending/in-flight edit lands before the reload aborts it
+      location.reload();
+    };
+  } catch { /* no server */ }
   try {
     const res = await fetch(`${API()}/workflows`, { cache: 'no-store' });
     if (res.ok) SHEETS = ((await res.json()).sheets || []).map(migrateSheet);
@@ -133,36 +154,54 @@ async function boot() {
   await loadWorkflowReview();
   buildIndex();
   wireChrome();
-  canvas = createCanvas($('canvas'), {
-    onChange: (id) => { scheduleSave(id); refreshHeaderCount(); },
-    onSelect: (sel) => { lastSel = sel; if (sel) openInspector(sel); else closeCallout(); },
-    openCount: nodeOpenCount,
-    onNav: (nav, cause) => {       // mirror the nesting position into the URL hash (deep-linkable)
-      renderBreadcrumb(nav);
-      const mode = cause === 'load' ? pendingSheetHist : (cause === 'user' ? 'push' : 'replace');
-      syncHash(nav.path, mode);
-    },
-    onEditingChange: syncEditUI,   // canvas may auto-enable edit (dbl-click / context-menu add) → keep the UI in sync
-  });
-  window.__atlasCanvas = canvas;   // handle for power-user debugging / automated checks
-  canvas.setEditing(true);         // edit mode is always on (no toggle) → fires onEditingChange → syncEditUI
-  // dirty-aware live reload: our own autosave is hash-suppressed server-side, so a
-  // message here means a genuine MCP/other-session change — flush any pending edit first.
   try {
-    new EventSource('/api/livereload?p=' + encodeURIComponent(PROJECT)).onmessage = async () => {
-      await flushSaves();   // ensure any pending/in-flight edit lands before the reload aborts it
-      location.reload();
-    };
-  } catch { /* no server */ }
+    canvas = createCanvas($('canvas'), {
+      onChange: (id) => { scheduleSave(id); refreshHeaderCount(); },
+      onSelect: (sel) => { lastSel = sel; if (sel) openInspector(sel); else closeCallout(); },
+      questionStats: nodeQuestionStats,
+      onNav: (nav, cause) => {       // mirror the nesting position into the URL hash (deep-linkable)
+        renderBreadcrumb(nav);
+        const mode = cause === 'load' ? pendingSheetHist : (cause === 'user' ? 'push' : 'replace');
+        syncHash(nav.path, mode);
+      },
+      onEditingChange: syncEditUI,   // canvas may auto-enable edit (dbl-click / context-menu add) → keep the UI in sync
+    });
+    window.__atlasCanvas = canvas;   // handle for power-user debugging / automated checks
+    canvas.setEditing(true);         // edit mode is always on (no toggle) → fires onEditingChange → syncEditUI
 
-  if (!SHEETS.length) {
-    $('sh-title').textContent = info.projects.length ? 'No workflow maps yet' : 'Start the server';
-    $('sh-sub').textContent = info.projects.length
-      ? 'Turn on Edit and double-click the canvas to drop a node, or author one over MCP.'
-      : 'Run the Atlas server so the assistant can author maps for this project.';
-    return;
+    if (!SHEETS.length) {
+      $('sh-title').textContent = info.projects.length ? 'No workflow maps yet' : 'Start the server';
+      $('sh-sub').textContent = info.projects.length
+        ? 'Turn on Edit and double-click the canvas to drop a node, or author one over MCP.'
+        : 'Run the Atlas server so the assistant can author maps for this project.';
+      return;
+    }
+    navigateToHash();   // open the sheet (and nested focus) the URL points at, else the first sheet
+  } catch (err) {
+    // A throw here (e.g. a hot reload that landed on a half-written app file) used to
+    // leave a silent blank canvas. Live-reload is wired up above, so the next save heals
+    // the tab — but show a visible reason + recovery in the meantime instead of nothing.
+    showBootError(err);
   }
-  navigateToHash();   // open the sheet (and nested focus) the URL points at, else the first sheet
+}
+
+// Visible recovery panel when the canvas fails to initialize, replacing the silent blank.
+function showBootError(err) {
+  console.error('Workflow Atlas: canvas init failed —', err);   // keep the full stack in the console
+  const host = $('canvas');
+  if (!host || host.querySelector('.boot-error')) return;
+  const panel = document.createElement('div');
+  panel.className = 'boot-error';
+  panel.innerHTML =
+    `<div class="boot-error-card">
+       <div class="boot-error-h">⚠ The canvas failed to load</div>
+       <p class="boot-error-msg"></p>
+       <p class="boot-error-fix">This is usually a hot reload that caught an app file mid-write. It should heal on the next save — or click Reload. If it keeps happening, open the console (F12) for the full stack and check the Atlas server log.</p>
+       <button class="boot-error-btn" type="button">Reload</button>
+     </div>`;
+  panel.querySelector('.boot-error-msg').textContent = (err && err.message) ? err.message : String(err);
+  panel.querySelector('.boot-error-btn').addEventListener('click', () => location.reload());
+  host.appendChild(panel);
 }
 
 /* ---------- URL ↔ focus path (deep-linkable nesting: #sheetId/nodeId/nodeId…) ---------- */
@@ -284,34 +323,11 @@ function openInspector(sel) {
   if (!sel) return closeCallout();
   if (sel.kind === 'edge') return openEdgeInspector(sel);
   const node = sel.node;
-  if (editing) renderNodeEditor(node, sel.board);
-  else renderNodeView(node);
+  renderNodeEditor(node, sel.board);   // edit mode is always-on → the editor is the only node view
   callout.classList.add('open');
   callout.setAttribute('aria-hidden', 'false');
   scrim.classList.add('open');
   frame.classList.add('callout-open');
-}
-
-// read-only review view (answerable open questions — the original review loop)
-function renderNodeView(node) {
-  const d = node.detail || {};
-  const sheetId = current && current.id;
-  const status = node.status || 'todo';
-  const parts = [
-    `<div class="co-tag" style="color:var(--${esc(status)})">${STATUS_LABEL[status] || esc(status)}</div>`,
-    `<h2 class="co-title">${esc(node.title)}</h2>`,
-  ];
-  if (node.sub) parts.push(`<p class="co-sub">${esc(node.sub)}</p>`);
-  if (d.in && d.in.length) parts.push(block('Takes in', `<ul class="io">${d.in.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`));
-  if (d.out && d.out.length) parts.push(block('Produces', `<ul class="io out">${d.out.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`));
-  if (d.note) parts.push(block('Where it stands', `<p class="co-note">${esc(d.note)}</p>`));
-  if (d.open && d.open.length) parts.push(block('Open questions', `<ul class="co-qs">${d.open.map((q, i) => wfQuestionItem(sheetId, q, i)).join('')}</ul>`));
-  if (node.board) parts.push(`<button class="co-enter" type="button">⤢ Zoom into this chart</button>`);
-  if (node.algorithm) parts.push(`<a class="co-algo" href="${esc(withProject(`algorithms.html#${node.algorithm}`, PROJECT))}"><span class="play">▶</span> Watch the algorithm storyboard</a>`);
-  $('callout-body').innerHTML = parts.join('');
-  if (d.open && d.open.length && sheetId) wireWfDecisions(sheetId, d.open);
-  const enter = $('callout-body').querySelector('.co-enter');
-  if (enter) enter.addEventListener('click', () => canvas.zoomToNode(node));
 }
 
 // edit form: mutate the node in place, repaint the canvas, schedule a save
@@ -347,10 +363,33 @@ function renderNodeEditor(node, board) {
         <button type="button" class="ed-btn" id="ed-sub-chart">${node.board ? '⤢ Enter chart inside' : '＋ Add chart inside'}</button>
         <button type="button" class="ed-btn danger" id="ed-del">🗑 Delete node</button>
       </div>
-    </div>`;
+    </div>
+    <div id="ed-open-answers" class="ed-answers"></div>`;
   const b = $('callout-body');
   const save = () => { scheduleSave(current.id); canvas.refresh(); };
   const lines = (v) => v.split('\n').map((x) => x.trim()).filter(Boolean);
+  // Edit mode is always-on, so this editor is the ONLY inspector view — answering
+  // open questions has to live here too, not just in the read-only review view.
+  const sheetId = current && current.id;
+  const paintAnswers = () => {
+    const host = b.querySelector('#ed-open-answers');
+    const qs = d.open || [];
+    if (!qs.length || !sheetId) { host.innerHTML = ''; return; }
+    host.innerHTML = block('Answer open questions',
+      `<ul class="co-qs">${qs.map((q, i) => wfQuestionItem(sheetId, q, i)).join('')}</ul>`);
+    host.querySelectorAll('.decide').forEach((btn) => btn.addEventListener('click', () => {
+      const li = btn.closest('.co-q');
+      const answer = li.querySelector('.answer').value.trim();
+      if (!answer) { li.querySelector('.answer').focus(); return; }
+      const by = li.querySelector('.author').value.trim();
+      try { if (by) localStorage.setItem(AUTHOR_KEY, by); } catch { /* ignore */ }
+      wfDecide(sheetId, qs[+btn.dataset.i], answer, by);
+      canvas.refresh(); paintAnswers();
+    }));
+    host.querySelectorAll('.reopen').forEach((btn) => btn.addEventListener('click', () => {
+      wfReopen(sheetId, qs[+btn.dataset.i]); canvas.refresh(); paintAnswers();
+    }));
+  };
   b.querySelector('#ed-title').addEventListener('input', (e) => { node.title = e.target.value; save(); });
   b.querySelector('#ed-sub').addEventListener('input', (e) => { node.sub = e.target.value || undefined; save(); });
   b.querySelector('#ed-note').addEventListener('input', (e) => { d.note = e.target.value || undefined; save(); });
@@ -370,6 +409,7 @@ function renderNodeEditor(node, board) {
       if (dec) { wfDecide(current.id, added[0], dec.answer, dec.by); wfReopen(current.id, removed[0]); }
     }
     openSnapshot.length = 0; openSnapshot.push(...cur);
+    paintAnswers();   // questions added/removed/renamed → refresh their answer cards
   });
   b.querySelector('#ed-algo').addEventListener('input', (e) => { node.algorithm = e.target.value.trim() || undefined; save(); });
   b.querySelector('#ed-w').addEventListener('input', (e) => { node.w = Math.max(80, +e.target.value || 240); save(); });
@@ -381,6 +421,7 @@ function renderNodeEditor(node, board) {
   }));
   b.querySelector('#ed-sub-chart').addEventListener('click', () => canvas.addSubchart());
   b.querySelector('#ed-del').addEventListener('click', () => { canvas.deleteSelected(); closeCallout(); });
+  paintAnswers();
 }
 
 function openEdgeInspector(sel) {
@@ -423,23 +464,6 @@ function wfQuestionItem(sheetId, q, i) {
          </div>
        </div>`;
   return `<li class="co-q${dec ? ' is-decided' : ''}"><div class="co-q-text">${esc(q)}</div>${body}</li>`;
-}
-function wireWfDecisions(sheetId, questions) {
-  const body = $('callout-body');
-  const rerender = () => { if (canvas) canvas.refresh(); if (lastSel && lastSel.kind === 'node') renderNodeView(lastSel.node); };
-  body.querySelectorAll('.decide').forEach((btn) => btn.addEventListener('click', () => {
-    const li = btn.closest('.co-q');
-    const answer = li.querySelector('.answer').value.trim();
-    if (!answer) { li.querySelector('.answer').focus(); return; }
-    const by = li.querySelector('.author').value.trim();
-    try { if (by) localStorage.setItem(AUTHOR_KEY, by); } catch { /* ignore */ }
-    wfDecide(sheetId, questions[+btn.dataset.i], answer, by);
-    rerender();
-  }));
-  body.querySelectorAll('.reopen').forEach((btn) => btn.addEventListener('click', () => {
-    wfReopen(sheetId, questions[+btn.dataset.i]);
-    rerender();
-  }));
 }
 
 function closeCallout() {
