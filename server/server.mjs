@@ -322,6 +322,10 @@ function validateSheet(sheet) {
     if (sheet.code.length > MAX_CODE) throw new Error(`sheet.code is ${sheet.code.length} chars — keep the badge ≤ ${MAX_CODE}; it renders in the index chip`);
   }
   if (sheet.name != null && typeof sheet.name !== 'string') throw new Error('sheet.name must be a string');
+  // A SHARED sheet is a reusable component mounted by other sheets' nodes (node.boardRef).
+  // Its single `status` is the component's one source of truth — every mount mirrors it.
+  if (sheet.shared != null && typeof sheet.shared !== 'boolean') throw new Error('sheet.shared must be a boolean');
+  if (sheet.status != null && !STATUSES.has(sheet.status)) throw new Error(`sheet.status must be one of: ${[...STATUSES].join(', ')}`);
   if (sheet.stations != null && !Array.isArray(sheet.stations)) throw new Error('sheet.stations must be an array');
   (sheet.stations || []).forEach((st, i) => validateStation(st, `stations[${i}]`));
   // v2 canvas form: a recursive board of nodes[] + edges[]. validateDetail is reused so
@@ -348,6 +352,32 @@ function lintSheets(sheets) {
   }
   return warn;
 }
+// Every sheet id a sheet's nodes mount via boardRef (recursively through inline boards).
+function refsOfSheet(sheet) {
+  const acc = new Set();
+  const walk = (b) => { for (const n of (b && b.nodes) || []) { if (n.boardRef) acc.add(n.boardRef); if (n.board) walk(n.board); } };
+  walk(sheet && sheet.board);
+  return acc;
+}
+// A boardRef makes the sheet tree a DAG; a cycle (A mounts B mounts A) would infinitely
+// recurse the renderer's dive. Reject it at write time — the one hard cross-sheet rule.
+// A ref to a not-yet-created sheet is fine (authoring order); only true cycles throw.
+function assertRefsAcyclic(sheets) {
+  const graph = new Map();
+  for (const s of sheets || []) if (s && s.id) graph.set(s.id, refsOfSheet(s));
+  const state = new Map();   // id → 'grey' (on stack) | 'black' (done)
+  const visit = (id, stack) => {
+    if (!graph.has(id)) return;            // dangling ref → not our concern here (lints elsewhere)
+    state.set(id, 'grey');
+    for (const ref of graph.get(id)) {
+      const st = state.get(ref);
+      if (st === 'grey') throw new Error(`shared-component cycle: ${[...stack, id, ref].join(' → ')} — a mounted board cannot (transitively) mount itself`);
+      if (st !== 'black') visit(ref, [...stack, id]);
+    }
+    state.set(id, 'black');
+  };
+  for (const id of graph.keys()) if (state.get(id) !== 'black') visit(id, []);
+}
 // reject the same id appearing twice — every per-sheet tool addresses by id
 function assertUniqueIds(sheets) {
   const ids = sheets.map((s) => s && s.id);
@@ -360,6 +390,7 @@ async function readWorkflows(p) {
   catch { return { sheets: [] }; }
 }
 async function persistWorkflows(p, sheets, registerSelf = false) {
+  assertRefsAcyclic(sheets);   // every write goes through here — catch a boardRef cycle before it lands
   await fs.mkdir(projDir(p), { recursive: true });
   const json = JSON.stringify({ sheets }, null, 2) + '\n';
   // Register BEFORE the write so the watcher event can never beat the ledger entry.
@@ -516,6 +547,30 @@ async function workflowQuestions(p) {
   }
   return out;
 }
+// The shared-component registry, DERIVED (never stored): every sheet that is either
+// flagged `shared` or mounted by some node's boardRef, with its single status, its
+// deep-link url, and the cards that mount it. Mirrors how list_open_questions is a pure
+// walk — the boardRef/shared fields are the source of truth, this is just a view.
+async function listShared(p) {
+  const sheets = ((await readWorkflows(p)).sheets || []).map(migrateSheet);
+  const known = new Set(sheets.map((s) => s.id));
+  const consumers = new Map();   // referenced sheet id → [{ sheet, where, node }]
+  for (const s of sheets) {
+    const walk = (b, prefix) => {
+      for (const n of (b && b.nodes) || []) {
+        const where = prefix + (n.title || 'node');
+        if (n.boardRef) { if (!consumers.has(n.boardRef)) consumers.set(n.boardRef, []); consumers.get(n.boardRef).push({ sheet: s.id, where, node: n.id }); }
+        if (n.board) walk(n.board, where + ' › ');
+      }
+    };
+    walk(s.board, '');
+  }
+  const keys = new Set([...sheets.filter((s) => s.shared).map((s) => s.id), ...consumers.keys()]);
+  return [...keys].map((id) => {
+    const s = sheets.find((x) => x.id === id);
+    return { key: id, exists: known.has(id), title: s ? (s.title || s.name || id) : null, status: s ? (s.status || null) : null, shared: !!(s && s.shared), url: '#' + id, mountedBy: consumers.get(id) || [] };
+  });
+}
 // keys that would corrupt the prototype chain if used to index a plain object
 const UNSAFE_KEY = (k) => k === '__proto__' || k === 'constructor' || k === 'prototype';
 async function setWorkflowDecision(p, sheetId, question, answer, by) {
@@ -602,6 +657,8 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' } }, required: ['algorithm'] } },
   { name: 'list_open_questions', description: 'List every authored open question — across algorithm storyboards AND workflow sheets — and whether each has been decided yet.',
     inputSchema: { type: 'object', properties: {} } },
+  { name: 'list_shared', description: 'List shared components (transcluded boards): every sheet marked shared or mounted via a node.boardRef, with its single status, its deep-link url (#sheetId), and the cards that mount it. Derived, not stored.',
+    inputSchema: { type: 'object', properties: {} } },
 
   // author content
   { name: 'save_algorithm', description: 'Create or replace an algorithm storyboard from a JSON spec. ' +
@@ -624,9 +681,9 @@ const TOOLS = [
   { name: 'get_sheet', description: 'Read ONE workflow sheet by id (lighter than get_workflows).',
     inputSchema: { type: 'object', properties: { sheet: { type: 'string' } }, required: ['sheet'] } },
   { name: 'save_sheet', description: 'Upsert ONE workflow sheet by id — create it or replace it in place WITHOUT resending the others. ' +
-      'sheet = { id (slug), code (SHORT badge), name, title, sub, schema? (2 for the v2 board form), AND EITHER legacy stations[] OR a v2 "board" }. ' +
+      'sheet = { id (slug), code (SHORT badge), name, title, sub, schema? (2 for the v2 board form), shared? (true ⇒ this sheet is a reusable COMPONENT other sheets mount), status? (done|partial|todo — a shared component\'s single status, mirrored by every mount), AND EITHER legacy stations[] OR a v2 "board" }. ' +
       'A v2 board (the infinite-canvas / nested-chart form the app now renders) = { nodes:[ NODE ], edges:[ EDGE ], view?:{x,y,zoom} }. ' +
-      'NODE = { id (unique within this board), x, y, w?, h? (local px), title, sub?, status (done|partial|todo), detail?{in[],out[],note,open[]}, algorithm?, board? (a NESTED child board — revealed by zooming into the node) }. ' +
+      'NODE = { id (unique within this board), x, y, w?, h? (local px), title, sub?, status (done|partial|todo), detail?{in[],out[],note,open[]}, algorithm?, board? (a NESTED child board — revealed by zooming into the node), boardRef? (TRANSCLUDE another sheet by id instead of owning a board — mounts that shared component live+read-only and inherits its status; mutually exclusive with board; see list_shared) }. ' +
       'EDGE = { id, from (node id in THIS board), to (node id in THIS board), kind? (flow|loop|dep), label?, fromSide? (top|right|bottom|left — the side the edge leaves the source node) } — edges are intra-board only; link across levels by nesting, not by an edge. ' +
       'Legacy stations[] sheets still load and auto-migrate to a board on read. Returns created-or-updated + lint warnings. Persists to this session\'s project.',
     inputSchema: { type: 'object', properties: { sheet: { type: 'object' } }, required: ['sheet'] } },
@@ -685,6 +742,15 @@ async function callTool(name, args) {
     }
     case 'get_algorithm': return JSON.stringify(await readAlgorithm(p, a.algorithm), null, 2);
     case 'get_workflows': return JSON.stringify(await readWorkflows(p), null, 2);
+    case 'list_shared': {
+      const rows = await listShared(p);
+      if (!rows.length) return '(no shared components yet — mark a sheet shared:true and mount it from cards via node.boardRef:"<sheetId>")';
+      return rows.map((r) => {
+        const head = `${r.exists ? '' : '⚠ MISSING '}${r.key}  [${r.status || '—'}]${r.shared ? ' ·shared' : ''}  ${r.url}  — ${r.title || '(no such sheet)'}`;
+        const cons = r.mountedBy.length ? r.mountedBy.map((c) => `    ↳ ${c.sheet} (${c.where})`).join('\n') : '    (mounted by nothing yet)';
+        return head + '\n' + cons;
+      }).join('\n');
+    }
     case 'get_review': return JSON.stringify(await readReview(p, a.algorithm), null, 2);
     case 'list_open_questions': {
       const algs = await listAlgorithms(p);

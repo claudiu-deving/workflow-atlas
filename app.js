@@ -19,6 +19,10 @@ const STATUS_LABEL = { done: 'done', partial: 'partial', todo: 'to build' };
 const STATUSES = ['done', 'partial', 'todo'];
 
 let SHEETS = [];
+const sheetById = (id) => SHEETS.find((s) => s && s.id === id) || null;
+// The board a node opens into: its private inline board, else the board of the sheet it
+// MOUNTS via boardRef (transclusion). Shared with the canvas so hash paths resolve across sheets.
+const childBoardOf = (n) => (n && (n.board || (n.boardRef ? (sheetById(n.boardRef) || {}).board : null))) || null;
 let current = null;
 let editing = false;
 let lastSel = null;          // the canvas selection currently shown in the inspector
@@ -122,9 +126,9 @@ function buildIndex() {
   indexNav.innerHTML = '';
   SHEETS.forEach((s, i) => {
     const b = document.createElement('button');
-    b.className = 'idx';
+    b.className = 'idx' + (s.shared ? ' shared' : '');
     b.dataset.id = s.id;
-    b.innerHTML = `<span class="idx-code">${esc(s.code || '')}</span><span class="idx-name">${esc(s.name || s.title || s.id)}</span>`;
+    b.innerHTML = `<span class="idx-code">${esc(s.code || '')}</span><span class="idx-name">${esc(s.name || s.title || s.id)}${s.shared ? ' <span class="idx-shared" title="shared component">▣</span>' : ''}</span>`;
     b.addEventListener('click', () => select(i));
     indexNav.appendChild(b);
   });
@@ -156,6 +160,7 @@ async function boot() {
   wireChrome();
   try {
     canvas = createCanvas($('canvas'), {
+      resolveSheet: sheetById,        // node.boardRef → the mounted sheet (transclusion)
       onChange: (id) => { scheduleSave(id); refreshHeaderCount(); },
       onSelect: (sel) => { lastSel = sel; if (sel) openInspector(sel); else closeCallout(); },
       questionStats: nodeQuestionStats,
@@ -246,11 +251,34 @@ function select(i, opts = {}) {
   $('sh-code').textContent = s.code || '';
   $('sh-title').textContent = s.title || s.name || s.id;
   $('sh-sub').textContent = s.sub || '';
+  renderMounts(s);
   refreshHeaderCount();
   closeCallout();
   canvas.load(current, { focus: opts.focus });   // hash is written by onNav, not here
 }
 
+// "Mounted by" — for a shared component sheet, the cards across other sheets that mount it
+// (node.boardRef === this sheet). Derived by scanning SHEETS; each chip deep-links to that card.
+function renderMounts(sheet) {
+  const host = $('sh-mounts');
+  if (!host) return;
+  const consumers = [];
+  for (const s of SHEETS) {
+    const walk = (board, path) => {
+      for (const n of (board && board.nodes) || []) {
+        if (n.boardRef === sheet.id) consumers.push({ sheet: s.id, path: path.concat(n.id), title: n.title });
+        if (n.board) walk(n.board, path.concat(n.id));
+      }
+    };
+    walk(s.board, []);
+  }
+  if (!sheet.shared && !consumers.length) { host.innerHTML = ''; return; }
+  const tag = sheet.shared ? `<span class="mount-flag">▣ shared component${sheet.status ? ' · ' + esc(sheet.status) : ''}</span>` : '';
+  const chips = consumers.length
+    ? 'Mounted by ' + consumers.map((c) => `<a class="mount-chip" href="${buildHash(c.sheet, c.path)}">${esc(sheetById(c.sheet) ? (sheetById(c.sheet).name || c.sheet) : c.sheet)} › ${esc(c.title)}</a>`).join(' ')
+    : (sheet.shared ? '<span class="mount-none">not mounted anywhere yet</span>' : '');
+  host.innerHTML = tag + (tag && chips ? ' · ' : '') + chips;
+}
 function refreshHeaderCount() {
   if (!current || !current.board) { $('sh-count').textContent = ''; return; }
   const nodes = current.board.nodes || [];
@@ -355,12 +383,15 @@ function renderNodeEditor(node, board) {
       <textarea class="ed-ta" id="ed-open" rows="2">${esc((d.open || []).join('\n'))}</textarea>
       <label class="ed-l">Algorithm storyboard id <i>(optional)</i></label>
       <input class="ed-in" id="ed-algo" value="${esc(node.algorithm || '')}" />
+      <label class="ed-l">Mount shared component <i>(sheet id — transcludes that sheet)</i></label>
+      <input class="ed-in" id="ed-ref" value="${esc(node.boardRef || '')}" placeholder="e.g. ai-review" />
+      <p class="ed-hint" id="ed-ref-info"></p>
       <div class="ed-row">
         <span><label class="ed-l">Width</label><input class="ed-num" id="ed-w" type="number" min="80" value="${node.w || 240}" /></span>
         <span><label class="ed-l">Height</label><input class="ed-num" id="ed-h" type="number" min="48" value="${node.h || 96}" /></span>
       </div>
       <div class="ed-actions">
-        <button type="button" class="ed-btn" id="ed-sub-chart">${node.board ? '⤢ Enter chart inside' : '＋ Add chart inside'}</button>
+        <button type="button" class="ed-btn" id="ed-sub-chart">${node.boardRef ? '↗ Open shared component' : (node.board ? '⤢ Enter chart inside' : '＋ Add chart inside')}</button>
         <button type="button" class="ed-btn danger" id="ed-del">🗑 Delete node</button>
       </div>
     </div>
@@ -412,6 +443,28 @@ function renderNodeEditor(node, board) {
     paintAnswers();   // questions added/removed/renamed → refresh their answer cards
   });
   b.querySelector('#ed-algo').addEventListener('input', (e) => { node.algorithm = e.target.value.trim() || undefined; save(); });
+  // Mount a shared component: node.boardRef names another sheet whose board is transcluded
+  // here (read-only, its status inherited). Mutually exclusive with a private inner chart.
+  const refInfo = b.querySelector('#ed-ref-info');
+  const paintRefInfo = () => {
+    const ref = node.boardRef;
+    if (!ref) { refInfo.textContent = ''; return; }
+    const s = sheetById(ref);
+    refInfo.innerHTML = s
+      ? `▣ mounts <a href="#${encodeURIComponent(ref)}">${esc(s.title || s.name || ref)}</a> · status: ${esc((s.status || '—'))}${s.shared ? '' : ' · ⚠ target sheet not marked shared'}`
+      : `▣ mounts <b>${esc(ref)}</b> · ⚠ no such sheet yet`;
+  };
+  b.querySelector('#ed-ref').addEventListener('input', (e) => {
+    const v = e.target.value.trim();
+    if (v && node.board) { e.target.value = node.boardRef || ''; alert('This card already has a private chart inside. Delete that first to mount a shared component instead.'); return; }
+    node.boardRef = v || undefined;
+    paintRefInfo();
+    // re-render the action button label (Add chart ↔ Open shared) to match the new state
+    const btn = b.querySelector('#ed-sub-chart');
+    if (btn) btn.textContent = node.boardRef ? '↗ Open shared component' : (node.board ? '⤢ Enter chart inside' : '＋ Add chart inside');
+    save();
+  });
+  paintRefInfo();
   b.querySelector('#ed-w').addEventListener('input', (e) => { node.w = Math.max(80, +e.target.value || 240); save(); });
   b.querySelector('#ed-h').addEventListener('input', (e) => { node.h = Math.max(48, +e.target.value || 96); save(); });
   b.querySelectorAll('#ed-status .seg').forEach((btn) => btn.addEventListener('click', () => {
@@ -419,7 +472,10 @@ function renderNodeEditor(node, board) {
     b.querySelectorAll('#ed-status .seg').forEach((x) => x.classList.toggle('on', x === btn));
     save();
   }));
-  b.querySelector('#ed-sub-chart').addEventListener('click', () => canvas.addSubchart());
+  b.querySelector('#ed-sub-chart').addEventListener('click', () => {
+    if (node.boardRef) { location.hash = buildHash(node.boardRef, []); return; }   // jump to the shared component's own sheet
+    canvas.addSubchart();
+  });
   b.querySelector('#ed-del').addEventListener('click', () => { canvas.deleteSelected(); closeCallout(); });
   paintAnswers();
 }

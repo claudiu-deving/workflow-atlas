@@ -41,6 +41,12 @@ export function createCanvas(viewportEl, opts = {}) {
   const questionStats = opts.questionStats || (() => ({ open: 0, decided: 0, total: 0 }));
   const onNav = opts.onNav || (() => {});       // breadcrumb / depth HUD callback
   const onEditingChange = opts.onEditingChange || (() => {});   // fires when edit mode flips (incl. auto-enable)
+  const resolveSheet = opts.resolveSheet || (() => null);       // id → sheet object (for boardRef transclusion)
+  // The board a node opens INTO: its private inline board, else the board of the sheet it
+  // MOUNTS via boardRef (transclusion). A mounted board is shown live but READ-ONLY here —
+  // it's edited on its own sheet, so there's never ambiguity about which sheet a change saves.
+  const boardOf = (n) => (n && (n.board || (n.boardRef ? (resolveSheet(n.boardRef) || {}).board : null))) || null;
+  const sharedSheetOf = (n) => (n && n.boardRef ? resolveSheet(n.boardRef) : null);
   ensureArrowDefs();
 
   const world = viewportEl.querySelector('.world');
@@ -55,9 +61,11 @@ export function createCanvas(viewportEl, opts = {}) {
   // dive seamlessly (no stored camera — a pop re-derives the parent camera from the live one).
   let focusBoard = null;
   let focusPath = [];
-  const focusStack = [];        // [{ board, path, node, px, py, innerScale }]
+  let focusReadonly = false;     // true once the focus path crosses a boardRef (we're inside a mounted/shared board)
+  const focusStack = [];        // [{ board, path, node, px, py, innerScale, readonly }]
   let editing = false;
   let selection = null;         // { kind:'node'|'edge', node|edge, board }
+  let selset = null;            // { board, nodes:Set } — marquee multi-selection (left-drag box)
   let viewW = 0, viewH = 0;
   let titleEditing = false;     // an inline node-title edit is in flight → suppress repaint/nav
   let rerootCandidate = null;   // set by renderBoard during a walk, applied after it returns
@@ -84,7 +92,7 @@ export function createCanvas(viewportEl, opts = {}) {
   }
   function paintRoot() {
     world.style.transform = `translate(${r3(cam.x)}px, ${r3(cam.y)}px) scale(${r5(cam.zoom)})`;
-    renderBoard(focusBoard, rootBoardEl, cam.x, cam.y, cam.zoom, 0, focusPath);
+    renderBoard(focusBoard, rootBoardEl, cam.x, cam.y, cam.zoom, 0, focusPath, focusReadonly);
   }
   function frame() {
     rafPending = false;
@@ -109,9 +117,12 @@ export function createCanvas(viewportEl, opts = {}) {
   }
 
   // ox/oy = screen (canvas-relative) position of this board's local (0,0); eff = px/unit.
-  function renderBoard(board, boardEl, ox, oy, eff, depth, path) {
+  // `readonly` is true for a mounted/shared board (and everything inside it): it renders
+  // live but rejects edits, since those belong to the component's own sheet.
+  function renderBoard(board, boardEl, ox, oy, eff, depth, path, readonly) {
     const bbox = bboxOf(board);
     boardEl._board = board; boardEl._eff = eff; boardEl._ox = ox; boardEl._oy = oy; boardEl._bw = bbox.w; boardEl._bh = bbox.h;
+    boardEl._readonly = !!readonly;
     if (boardEl._lastBW !== bbox.w || boardEl._lastBH !== bbox.h) {
       boardEl.style.width = bbox.w + 'px'; boardEl.style.height = bbox.h + 'px';
       boardEl._lastBW = bbox.w; boardEl._lastBH = bbox.h;
@@ -128,7 +139,7 @@ export function createCanvas(viewportEl, opts = {}) {
       const w = node.w || NODE_W, h = node.h || NODE_H;
       const sx = ox + node.x * eff, sy = oy + node.y * eff, sw = w * eff, sh = h * eff;
       const onScreen = sx + sw > -CULL_MARGIN && sx < viewW + CULL_MARGIN && sy + sh > -CULL_MARGIN && sy < viewH + CULL_MARGIN;
-      const selected = selection && selection.node === node;
+      const selected = (selection && selection.node === node) || (selset && selset.board === board && selset.nodes.has(node));
       if ((!onScreen || sw < MIN_VISIBLE_PX) && !selected) { if (el._shown !== false) { el.style.display = 'none'; el._shown = false; } unmountChild(el); continue; }
       if (el._shown === false) { el.style.display = ''; el._shown = true; }
       positionNode(el, node, w, h);
@@ -139,9 +150,10 @@ export function createCanvas(viewportEl, opts = {}) {
 
       const apparent = sw;   // node.w * eff
       const mounted = !!el._childEl;
+      const childBoard = boardOf(node);   // private board OR a mounted shared sheet's board
       // No depth cap: re-rooting (below) keeps the mounted subtree shallow, so mounting is
       // gated purely on apparent size + visibility, at any absolute nesting depth.
-      const want = node.board && onScreen && (mounted ? apparent >= UNMOUNT_PX : apparent >= MOUNT_PX);
+      const want = childBoard && onScreen && (mounted ? apparent >= UNMOUNT_PX : apparent >= MOUNT_PX);
       if (want && !mounted) mountChild(el);
       else if (!want && mounted) unmountChild(el);
       if (el._childEl) {
@@ -150,7 +162,8 @@ export function createCanvas(viewportEl, opts = {}) {
           el._childEl.style.transform = `translate(${r3(fl.ox)}px, ${r3(fl.oy)}px) scale(${r5(innerScale)})`;
           el._innerScale = innerScale; el._cox = fl.ox; el._coy = fl.oy;
         }
-        renderBoard(node.board, el._childEl, sx + fl.ox * eff, sy + fl.oy * eff, eff * innerScale, depth + 1, path.concat(node.id));
+        // crossing a boardRef makes this subtree (the mounted component) read-only.
+        renderBoard(childBoard, el._childEl, sx + fl.ox * eff, sy + fl.oy * eff, eff * innerScale, depth + 1, path.concat(node.id), readonly || !!node.boardRef);
         // A direct child of the focus root that has grown to FULLY cover the viewport becomes
         // the new render root (seamless re-root), so the scale chain never lengthens unboundedly.
         if (depth === 0 && coversViewport(sx, sy, sw, sh)) rerootCandidate = { node, el };
@@ -173,6 +186,7 @@ export function createCanvas(viewportEl, opts = {}) {
   // Gated by a content+width signature so the scrollHeight reflow happens only when text changes.
   function fitCardHeight(el, node, w) {
     if (el._editing) return;                       // mid inline-title edit → don't remeasure/jump
+    if (el.parentElement && el.parentElement._readonly) return;   // mounted component → never mutate/save through the consumer sheet
     const key = el._sig + '|' + w;
     if (el._fitKey === key) return;
     el._fitKey = key;
@@ -190,14 +204,19 @@ export function createCanvas(viewportEl, opts = {}) {
   function paintNode(el, node) {
     if (el._editing) return;                 // don't blow away the contentEditable title mid-edit
     const q = questionStats(node);           // own + nested questions, so parents badge too
-    const status = node.status || 'todo';
-    const sig = [node.title, node.sub || '', status, node.algorithm || '', node.board ? 1 : 0, q.open, q.decided].join('');
+    // A mount inherits its shared component's single status (the "edit once" win); its title
+    // stays local. An unresolved boardRef (target sheet not loaded) falls back to its own status.
+    const shared = sharedSheetOf(node);
+    const childBoard = boardOf(node);
+    const status = (shared && shared.status) || node.status || 'todo';
+    const sig = [node.title, node.sub || '', status, node.algorithm || '', childBoard ? 1 : 0, node.boardRef || "", shared ? (shared.title || shared.name || "") : "", q.open, q.decided].join('');
     if (el._sig === sig) return;
     el._sig = sig;
     if (el._status !== status) { el.dataset.status = status; el._status = status; }
     // "Has a chart inside" is shown by an accented top-right border (.has-chart), not a tag.
-    const hasChart = !!node.board;
+    const hasChart = !!childBoard;
     if (el._hasChart !== hasChart) { el.classList.toggle('has-chart', hasChart); el._hasChart = hasChart; }
+    if (el._isShared !== !!node.boardRef) { el.classList.toggle('is-shared', !!node.boardRef); el._isShared = !!node.boardRef; }
     // Question marker: a count bubble under the card (visible at every zoom tier,
     // unlike the in-card footer). Amber while any are open; green once all answered.
     el.classList.toggle('has-open', q.total > 0);
@@ -214,6 +233,7 @@ export function createCanvas(viewportEl, opts = {}) {
       (node.sub ? `<p class="node-sub">${esc(node.sub)}</p>` : '') +
       `<div class="node-foot">` +
       (node.algorithm ? `<span class="node-tag algo">▶ storyboard</span>` : '') +
+      (node.boardRef ? `<span class="node-tag shared">▣ ${esc((shared && (shared.title || shared.name)) || node.boardRef)}</span>` : '') +
       `</div>`;
   }
 
@@ -353,7 +373,7 @@ export function createCanvas(viewportEl, opts = {}) {
   }
 
   /* ---------- selection ---------- */
-  function selectNodeKnown(node, board) { selection = { kind: 'node', node, board }; onSelect(selection); requestRender(); }
+  function selectNodeKnown(node, board) { selset = null; selection = { kind: 'node', node, board }; onSelect(selection); requestRender(); }
   function selectNode(node, nodeEl) {
     const board = (nodeEl ? nodeEl.parentElement._board : (nodeElFor(node) || {}).parentElement && nodeElFor(node).parentElement._board) || activeBoardElForNode(node);
     selectNodeKnown(node, board);
@@ -363,11 +383,12 @@ export function createCanvas(viewportEl, opts = {}) {
     const boardEl = pathEl.closest('.board'); const board = boardEl && boardEl._board;
     const edge = board && board.edges.find((e) => e.id === pathEl.dataset.eid);
     if (!edge) return;
+    selset = null;
     selection = { kind: 'edge', edge, board };
     boardEl._edgeSig = null;            // force a redraw so the highlight shows
     onSelect(selection); requestRender();
   }
-  function clearSelection() { if (!selection) return; const b = selection.board; selection = null; if (b) { const be = boardElOf(b); if (be) be._edgeSig = null; } onSelect(null); requestRender(); }
+  function clearSelection() { if (!selection && !selset) return; const b = selection && selection.board; selection = null; selset = null; if (b) { const be = boardElOf(b); if (be) be._edgeSig = null; } onSelect(null); requestRender(); }
 
   /* ---------- right-click context menu (canvas + node actions) ---------- */
   let ctxEl = null;
@@ -426,10 +447,14 @@ export function createCanvas(viewportEl, opts = {}) {
     const cx = e.clientX, cy = e.clientY;
     const nodeEl = e.target.closest && e.target.closest('.node');
     if (nodeEl && nodeEl._node) {
-      const node = nodeEl._node, board = nodeEl.parentElement._board;
+      const node = nodeEl._node, board = nodeEl.parentElement._board, ro = nodeEl.parentElement._readonly;
       const items = [];
-      if (node.board) items.push({ label: '⤢ Dive into chart', run: () => zoomToNode(node, nodeEl) });
-      else items.push({ label: '＋ Add chart inside', run: () => { ensureEditing(); selectNodeKnown(node, board); addSubchart(); } });
+      if (boardOf(node)) items.push({ label: node.boardRef ? '⤢ Enter shared component' : '⤢ Dive into chart', run: () => zoomToNode(node, nodeEl) });
+      if (ro) {                                  // a card inside a mounted component: navigation only — edit it on its own sheet
+        buildCtx(cx, cy, items.length ? items : [{ label: '⤢ Fit to view', run: () => fit() }]);
+        return;
+      }
+      if (!boardOf(node)) items.push({ label: '＋ Add chart inside', run: () => { ensureEditing(); selectNodeKnown(node, board); addSubchart(); } });
       items.push({ label: '✎ Rename', run: () => { ensureEditing(); const t = nodeEl.querySelector('.node-title'); if (t) beginTitleEdit(t, node, nodeEl); } });
       items.push({ sep: true });
       for (const s of ['done', 'partial', 'todo'])
@@ -438,17 +463,17 @@ export function createCanvas(viewportEl, opts = {}) {
       items.push({ label: '🗑 Delete node', danger: true, run: () => { ensureEditing(); deleteNode(node, board); } });
       buildCtx(cx, cy, items);
     } else {
-      const items = [
-        { label: '＋ Add node here', run: () => { ensureEditing(); createNodeAt(cx, cy); } },
-        { label: '⤢ Fit to view', run: () => fit() },
-      ];
+      const roBoard = activeBoardElAt(cx, cy);
+      const items = [];
+      if (!(roBoard && roBoard._readonly)) items.push({ label: '＋ Add node here', run: () => { ensureEditing(); createNodeAt(cx, cy); } });
+      items.push({ label: '⤢ Fit to view', run: () => fit() });
       if (focusStack.length) items.push({ sep: true }, { label: '↑ Climb out one level', run: () => popFocusAndFit() });
       buildCtx(cx, cy, items);
     }
   });
 
   /* ---------- pointer: pan / drag / connect / click ---------- */
-  let mode = null, pending = null, moved = 0, lastX = 0, lastY = 0, connect = null, spaceHeld = false, resize = null, pendingEdge = null;
+  let mode = null, pending = null, moved = 0, lastX = 0, lastY = 0, connect = null, spaceHeld = false, resize = null, pendingEdge = null, pressX = 0, pressY = 0;
   let navIntent = 0;            // set by the wheel handler (+1 in / -1 out), consumed once by frame()
   const grabPointer = (e) => { try { viewportEl.setPointerCapture(e.pointerId); } catch { /* ignore */ } };
   viewportEl.addEventListener('pointerdown', (e) => {
@@ -472,9 +497,9 @@ export function createCanvas(viewportEl, opts = {}) {
     const gripEl = editing && e.target.closest && e.target.closest('.node-resize');
     const nodeEl = e.target.closest && e.target.closest('.node');
     const edgeEl = e.target.classList && e.target.classList.contains('edge') ? e.target : null;
-    lastX = e.clientX; lastY = e.clientY; moved = 0; mode = null; pending = null; connect = null; resize = null; pendingEdge = null;
-    if (portEl && nodeEl) { startConnect(nodeEl, portEl.dataset.port); mode = 'connect'; grabPointer(e); e.preventDefault(); return; }
-    if (gripEl && nodeEl) { startResize(nodeEl, e); mode = 'resize'; grabPointer(e); e.preventDefault(); return; }
+    lastX = e.clientX; lastY = e.clientY; pressX = e.clientX; pressY = e.clientY; moved = 0; mode = null; pending = null; connect = null; resize = null; pendingEdge = null;
+    if (portEl && nodeEl && !nodeEl.parentElement._readonly) { startConnect(nodeEl, portEl.dataset.port); mode = 'connect'; grabPointer(e); e.preventDefault(); return; }
+    if (gripEl && nodeEl && !nodeEl.parentElement._readonly) { startResize(nodeEl, e); mode = 'resize'; grabPointer(e); e.preventDefault(); return; }
     // defer edge selection to pointerup (like a node click) — selecting on pointerDOWN let the
     // pointerup "click, no pending" branch immediately clearSelection() and close the panel.
     if (edgeEl) { pendingEdge = edgeEl; return; }
@@ -489,20 +514,34 @@ export function createCanvas(viewportEl, opts = {}) {
       if (e.buttons === 0) return;                 // not dragging
       moved += Math.abs(dx) + Math.abs(dy);
       if (moved <= 4) { lastX = e.clientX; lastY = e.clientY; return; }
-      mode = (editing && pending) ? 'drag' : 'pan';
-      if (mode === 'drag') { pending.rawX = pending.node.x; pending.rawY = pending.node.y; }   // unsnapped anchor
+      // Left-drag on a node moves it; left-drag on empty space draws a SELECTION BOX
+      // (panning is middle-mouse / space only — set above in pointerdown).
+      mode = (editing && pending && !pending.boardEl._readonly) ? 'drag' : 'marquee';   // mounted boards don't move their cards
+      if (mode === 'drag') {
+        pending.rawX = pending.node.x; pending.rawY = pending.node.y;   // unsnapped anchor
+        // dragging a node that's part of a marquee selection moves the whole group; dragging
+        // an unselected node drops the marquee and moves just that node.
+        if (selset && selset.board === pending.boardEl._board && selset.nodes.has(pending.node)) pending.group = [...selset.nodes].map((n) => ({ n, x0: n.x, y0: n.y }));
+        else clearMarqueeSel();
+      } else { startMarquee(); }
       grabPointer(e);                              // the gesture is real now → capture so it tracks off-element
-      if (mode === 'pan') viewportEl.classList.add('grabbing');
     }
     if (mode === 'pan') { cam.x += dx; cam.y += dy; promoteWorld(); requestRender(); }
+    else if (mode === 'marquee') updateMarquee(e);
     else if (mode === 'drag') {
       const eff = pending.boardEl._eff || cam.zoom;
-      pending.rawX += dx / eff; pending.rawY += dy / eff;       // accumulate the true position…
-      pending.node.x = pending.rawX; pending.node.y = pending.rawY;
-      const g = snapDrag(pending.boardEl._board, pending.node, eff);   // …then pull onto sibling x/y lines
-      invalidateBBox(pending.boardEl._board);
-      requestRender(); onChange(active.id);
-      showGuides(pending.boardEl, g.x, g.y);                    // draw the line(s) it snapped to
+      if (pending.group) {                                       // move every selected node by the same local delta
+        pending.gdx = (pending.gdx || 0) + dx / eff; pending.gdy = (pending.gdy || 0) + dy / eff;
+        for (const g of pending.group) { g.n.x = g.x0 + pending.gdx; g.n.y = g.y0 + pending.gdy; }
+        invalidateBBox(pending.boardEl._board); requestRender(); onChange(active.id);
+      } else {
+        pending.rawX += dx / eff; pending.rawY += dy / eff;     // accumulate the true position…
+        pending.node.x = pending.rawX; pending.node.y = pending.rawY;
+        const g = snapDrag(pending.boardEl._board, pending.node, eff);   // …then pull onto sibling x/y lines
+        invalidateBBox(pending.boardEl._board);
+        requestRender(); onChange(active.id);
+        showGuides(pending.boardEl, g.x, g.y);                  // draw the line(s) it snapped to
+      }
     } else if (mode === 'connect') updateConnect(e);
     else if (mode === 'resize') updateResize(e);
     lastX = e.clientX; lastY = e.clientY;
@@ -512,7 +551,13 @@ export function createCanvas(viewportEl, opts = {}) {
     try { viewportEl.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
     if (mode === 'connect') finishConnect(e);
     else if (mode === 'resize') finishResize();
-    else if (mode === 'drag' && pending) {           // snap to integer local coords on drop (clean JSON)
+    else if (mode === 'marquee') finishMarquee(e);
+    else if (mode === 'drag' && pending && pending.group) {   // group move: round all, then rebase/clamp once
+      for (const g of pending.group) { g.n.x = Math.round(g.n.x); g.n.y = Math.round(g.n.y); }
+      if (pending.boardEl === rootBoardEl) rebaseRoot(pending.boardEl._board);
+      else for (const g of pending.group) { g.n.x = Math.max(0, g.n.x); g.n.y = Math.max(0, g.n.y); }
+      invalidateBBox(pending.boardEl._board); onChange(active.id); requestRender();
+    } else if (mode === 'drag' && pending) {           // snap to integer local coords on drop (clean JSON)
       pending.node.x = Math.round(pending.node.x); pending.node.y = Math.round(pending.node.y);
       // Let a node drag UP/LEFT past the origin: rebase the whole ROOT board back into the positive
       // quadrant (boardBBox anchors at 0,0) and shift the camera to match, so the content doesn't jump.
@@ -534,14 +579,54 @@ export function createCanvas(viewportEl, opts = {}) {
   // (Not lostpointercapture: pointerup itself releases capture, which would fire it mid-handler.)
   viewportEl.addEventListener('pointercancel', () => {
     if (connect && connect.pathEl) connect.pathEl.remove();
+    if (marqueeEl) marqueeEl.style.display = 'none';
     viewportEl.classList.remove('grabbing');
     hideGuides();
     mode = null; pending = null; connect = null; resize = null; pendingEdge = null;
   });
+
+  /* ---------- marquee: left-drag selection box (selects nodes in the focused board) ---------- */
+  let marqueeEl = null;
+  function startMarquee() {
+    if (!marqueeEl) { marqueeEl = document.createElement('div'); marqueeEl.className = 'marquee-box'; viewportEl.appendChild(marqueeEl); }
+    marqueeEl.style.display = 'block';
+    updateMarquee({ clientX: pressX, clientY: pressY });
+  }
+  function marqueeRect(e) {
+    const r = canvasRect();
+    const x0 = pressX - r.left, y0 = pressY - r.top, x1 = e.clientX - r.left, y1 = e.clientY - r.top;
+    return { x: Math.min(x0, x1), y: Math.min(y0, y1), w: Math.abs(x1 - x0), h: Math.abs(y1 - y0) };
+  }
+  function updateMarquee(e) {
+    if (!marqueeEl) return;
+    const m = marqueeRect(e);
+    marqueeEl.style.left = m.x + 'px'; marqueeEl.style.top = m.y + 'px'; marqueeEl.style.width = m.w + 'px'; marqueeEl.style.height = m.h + 'px';
+  }
+  function finishMarquee(e) {
+    if (marqueeEl) marqueeEl.style.display = 'none';
+    const m = marqueeRect(e), maxX = m.x + m.w, maxY = m.y + m.h;
+    // The focused board is rendered at the root element — use its live screen mapping to test each node.
+    const eff = rootBoardEl._eff, ox = rootBoardEl._ox, oy = rootBoardEl._oy;
+    const hits = new Set();
+    if (focusBoard && Number.isFinite(eff)) {
+      for (const n of focusBoard.nodes) {
+        const sx = ox + n.x * eff, sy = oy + n.y * eff, sw = (n.w || NODE_W) * eff, sh = (n.h || NODE_H) * eff;
+        if (sx < maxX && sx + sw > m.x && sy < maxY && sy + sh > m.y) hits.add(n);
+      }
+    }
+    // onSelect(null) closes any open single-node inspector — but app.js routes that through
+    // closeCallout → clearSelection, which nulls selset. So tear down FIRST, then set selset,
+    // or the marquee selection is wiped the instant it's made.
+    selection = null; selset = null;
+    onSelect(null);
+    selset = hits.size ? { board: focusBoard, nodes: hits } : null;
+    requestRender();
+  }
+  function clearMarqueeSel() { if (selset) { selset = null; requestRender(); } }
   viewportEl.addEventListener('dblclick', (e) => {
     const nodeEl = e.target.closest && e.target.closest('.node');
     const titleEl = e.target.closest && e.target.closest('.node-title');
-    if (editing && nodeEl && titleEl) { beginTitleEdit(titleEl, nodeEl._node, nodeEl); return; }
+    if (editing && nodeEl && titleEl && !nodeEl.parentElement._readonly) { beginTitleEdit(titleEl, nodeEl._node, nodeEl); return; }
     if (nodeEl) { zoomToNode(nodeEl._node, nodeEl); return; }   // dive into the node (re-roots if it has a chart)
     // Empty canvas → drop a node right where you clicked, in the focused board, at any zoom and even
     // outside the board's tight bounds. Auto-enables edit so you can immediately drag/rename it.
@@ -683,6 +768,7 @@ export function createCanvas(viewportEl, opts = {}) {
   function createNodeAt(clientX, clientY, opts = {}) {
     const boardEl = activeBoardElAt(clientX, clientY);
     if (!boardEl || !boardEl._board || !Number.isFinite(boardEl._eff) || boardEl._eff <= 0) return;  // not painted yet
+    if (boardEl._readonly) { toast('shared component — edit it on its own sheet'); return; }
     const { lx, ly } = localPoint(boardEl, clientX, clientY);
     if (!Number.isFinite(lx) || !Number.isFinite(ly)) return;
     const board = boardEl._board;
@@ -708,7 +794,7 @@ export function createCanvas(viewportEl, opts = {}) {
   // seamless dive/pop camera math both read this, so they can never disagree (a mismatch would seam).
   const FRAME_PAD = 12;   // gutter between a frame's border and its embedded child board
   function frameLayout(node) {
-    const w = node.w || NODE_W, h = node.h || NODE_H, cb = bboxOf(node.board);
+    const w = node.w || NODE_W, h = node.h || NODE_H, cb = bboxOf(boardOf(node));
     const availW = w - 2 * FRAME_PAD, availH = h - HEADER - FRAME_PAD;
     const s = Math.max(1e-4, Math.min(availW / cb.w, availH / cb.h));
     const ox = FRAME_PAD + Math.max(0, (availW - cb.w * s) / 2);
@@ -725,17 +811,18 @@ export function createCanvas(viewportEl, opts = {}) {
     return bb.w * cam.zoom <= POP_FIT * viewW && bb.h * cam.zoom <= POP_FIT * viewH;
   }
   function pushFocus(node, ownerEl, cause = 'auto') {   // dive one level (node must be a direct child of focusBoard)
-    if (!node || !node.board) return;
+    const childBoard = boardOf(node);                   // private board OR a mounted shared sheet's board
+    if (!node || !childBoard) return;
     if (ownerEl && ownerEl.parentElement !== rootBoardEl) return;
     // Refuse to re-root into an ancestor board (a true cycle). Object-identity match (like
     // board.js's validator) so legitimate id reuse across sibling subtrees still dives fine.
-    // The old id-based guard was inert: a direct child is always in focusBoard.nodes, so the
-    // `&& indexOf < 0` clause was never true.
-    if (node.board === focusBoard || focusStack.some((f) => f.board === node.board)) return;
+    // For a boardRef this catches A→B→A too, since the SAME sheet board object is reused.
+    if (childBoard === focusBoard || focusStack.some((f) => f.board === childBoard)) return;
     const fl = frameLayout(node), innerScale = fl.s, px = node.x + fl.ox, py = node.y + fl.oy, z = cam.zoom;
-    focusStack.push({ board: focusBoard, path: focusPath.slice(), node, px, py, innerScale });
+    focusStack.push({ board: focusBoard, path: focusPath.slice(), node, px, py, innerScale, readonly: focusReadonly });
     cam.x = cam.x + px * z; cam.y = cam.y + py * z; cam.zoom = z * innerScale;
-    focusBoard = node.board; focusPath = focusPath.concat(node.id);
+    focusBoard = childBoard; focusPath = focusPath.concat(node.id);
+    focusReadonly = focusReadonly || !!node.boardRef;   // inside a mounted component → read-only
     clearRoot(); emitNav(cause);
   }
   function popFocus(cause = 'auto') {             // climb one level, re-deriving the parent camera
@@ -745,12 +832,13 @@ export function createCanvas(viewportEl, opts = {}) {
     // focused inside, the snapshot would seam the nested content on the way out. Fall back to the
     // snapshot if the node was deleted. For an unchanged dive/pop pair this is the exact inverse.
     let px = fr.px, py = fr.py, s = fr.innerScale;
-    if (fr.node && fr.board.nodes.indexOf(fr.node) >= 0 && fr.node.board) {
+    if (fr.node && fr.board.nodes.indexOf(fr.node) >= 0 && boardOf(fr.node)) {
       const fl = frameLayout(fr.node); px = fr.node.x + fl.ox; py = fr.node.y + fl.oy; s = fl.s;
     }
     const parentZoom = cam.zoom / s;
     cam.x = cam.x - px * parentZoom; cam.y = cam.y - py * parentZoom; cam.zoom = parentZoom;
     focusBoard = fr.board; focusPath = fr.path.slice();
+    focusReadonly = fr.readonly;
     clearRoot(); emitNav(cause);
     return true;
   }
@@ -760,21 +848,22 @@ export function createCanvas(viewportEl, opts = {}) {
     if (!active) return;
     path = path || [];
     focusStack.length = 0;
-    let board = active.board; const acc = [];
+    let board = active.board; const acc = []; let ro = false;
     for (const id of path) {
       const n = board.nodes && board.nodes.find((x) => x && x.id === id);
-      if (!n || !n.board) break;
+      const child = n && boardOf(n);
+      if (!n || !child) break;
       const fl = frameLayout(n);
-      focusStack.push({ board, path: acc.slice(), node: n, px: n.x + fl.ox, py: n.y + fl.oy, innerScale: fl.s });
-      board = n.board; acc.push(id);
+      focusStack.push({ board, path: acc.slice(), node: n, px: n.x + fl.ox, py: n.y + fl.oy, innerScale: fl.s, readonly: ro });
+      board = child; acc.push(id); ro = ro || !!n.boardRef;
     }
-    focusBoard = board; focusPath = acc;
+    focusBoard = board; focusPath = acc; focusReadonly = ro;
     clearRoot(); emitNav((opts && opts.cause) || 'user');
     if (opts && opts.instant) fit();              // restore (e.g. after reload): land instantly, no glide
     else zoomToFitFocus(0.9);                     // sync → sets `tween`, blocking premature auto-nav in the gap
   }
   function getNav() {
-    return { depth: focusPath.length, path: focusPath.slice(), chain: active ? pathChain(active.board, focusPath) : [], canPop: focusStack.length > 0 };
+    return { depth: focusPath.length, path: focusPath.slice(), chain: active ? pathChain(active.board, focusPath, boardOf) : [], canPop: focusStack.length > 0, readonly: focusReadonly };
   }
   // The current focus path is mirrored to the URL hash by app.js (via onNav), so it survives reload
   // AND back/forward/deep links. `cause` lets app.js choose pushState (deliberate dive/pop/jump) vs
@@ -787,8 +876,8 @@ export function createCanvas(viewportEl, opts = {}) {
     // Diving into a direct child of the focus root re-roots seamlessly, then fits the child.
     // The fit tween MUST start synchronously: it sets `tween`, which blocks the auto-pop from
     // firing in the gap before the child is zoomed in (the child is briefly small → "fits").
-    if (node.board && nodeEl.parentElement === rootBoardEl && !tween && !mode) {
-      pushFocus(node, nodeEl, 'user');   // deliberate dive (double-click) → a history entry
+    if (boardOf(node) && nodeEl.parentElement === rootBoardEl && !tween && !mode) {
+      pushFocus(node, nodeEl, 'user');   // deliberate dive (double-click) → a history entry; re-roots into a mounted component too
       zoomToFitFocus(0.9);
       return;
     }
@@ -896,6 +985,7 @@ export function createCanvas(viewportEl, opts = {}) {
 
   /* ---------- public API (driven by app.js) ---------- */
   function clearRoot() {                          // tear down the mounted tree so frame() rebuilds focusBoard
+    selset = null;                                // a marquee selection is per-level; drop it when we change level
     for (const [, el] of rootBoardEl._nodes) el.remove();
     rootBoardEl._nodes.clear(); rootBoardEl._edgeSig = null; rootBoardEl._board = null;
   }
@@ -931,12 +1021,12 @@ export function createCanvas(viewportEl, opts = {}) {
   function load(sheet, opts = {}) {
     active = sheet; selection = null; onSelect(null);
     const healed = normalizeBoards(sheet.board);   // heal any out-of-bounds (negative) coords from old data
-    focusBoard = sheet.board; focusPath = []; focusStack.length = 0;   // start at the sheet root
+    focusBoard = sheet.board; focusPath = []; focusStack.length = 0; focusReadonly = false;   // start at the sheet root (own sheet → editable)
     clearRoot();
     frame(); fit(); emitNav('load');
     // Re-enter a deep focus carried by the URL (back/forward, deep link, reload) — graceful if pruned.
     const focus = opts.focus || [];
-    if (focus.length && boardAtPath(active.board, focus) !== active.board) focusToPath(focus, { instant: true, cause: 'load' });
+    if (focus.length && boardAtPath(active.board, focus, boardOf) !== active.board) focusToPath(focus, { instant: true, cause: 'load' });
     if (healed) onChange(sheet.id);   // persist the healed coordinates
   }
   function setEditing(b) { if (editing === b) return; editing = b; viewportEl.classList.toggle('editing', b); onEditingChange(b); requestRender(); }
@@ -946,8 +1036,19 @@ export function createCanvas(viewportEl, opts = {}) {
     requestRender();
   }
   function deleteSelected() {
+    if (selset && selset.nodes.size) {              // marquee multi-selection → delete every node + its edges
+      const board = selset.board;
+      const be0 = boardElOf(board); if (be0 && be0._readonly) { toast('shared component — edit it on its own sheet'); return; }
+      const ids = new Set([...selset.nodes].map((n) => n.id));
+      board.nodes = board.nodes.filter((n) => !selset.nodes.has(n));
+      board.edges = board.edges.filter((e) => !ids.has(e.from) && !ids.has(e.to));
+      invalidateBBox(board); const be = boardElOf(board); if (be) be._edgeSig = null;
+      selset = null; selection = null; onSelect(null); onChange(active.id); requestRender();
+      return;
+    }
     if (!selection) return;
     const board = selection.board;
+    const be0 = boardElOf(board); if (be0 && be0._readonly) { toast('shared component — edit it on its own sheet'); return; }
     if (selection.kind === 'node') {
       const i = board.nodes.indexOf(selection.node); if (i >= 0) board.nodes.splice(i, 1);
       board.edges = board.edges.filter((e) => e.from !== selection.node.id && e.to !== selection.node.id);
@@ -961,6 +1062,7 @@ export function createCanvas(viewportEl, opts = {}) {
   function addSubchart() {
     if (!selection || selection.kind !== 'node') return;
     const node = selection.node;
+    if (node.boardRef) { toast('this card mounts a shared component — detach it first to add a private chart'); return; }
     if (!node.board) node.board = { nodes: [], edges: [], view: { x: 0, y: 0, zoom: 1 } };
     onChange(active.id); onSelect(selection); requestRender();
     requestAnimationFrame(() => zoomToNode(node));        // glide in so the (empty) child mounts in place
@@ -979,7 +1081,7 @@ export function createCanvas(viewportEl, opts = {}) {
 
   return {
     load, setEditing, refresh, fit, deleteSelected, addSubchart, zoomToNode,
-    getSelection: () => selection, clearSelection,
+    getSelection: () => selection || (selset && selset.nodes.size ? { kind: 'multi', board: selset.board, nodes: selset.nodes } : null), clearSelection,
     // infinite-zoom navigation
     popFocus: popFocusAndFit, getNav, focusPath: focusToPath, createNodeAtViewCenter,
     // test/debug hooks — drive deterministic dive/climb checks from window.__atlasCanvas

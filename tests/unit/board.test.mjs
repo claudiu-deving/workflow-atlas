@@ -98,3 +98,24 @@ test('boardBBox floors an empty board so fit-scale never divides by zero', () =>
   const bb = boardBBox(board());
   assert.ok(bb.w > 0 && bb.h > 0);
 });
+
+/* ---------------- transclusion: node.boardRef (shared components) ---------------- */
+test('validateBoard accepts a boardRef slug and rejects board+boardRef together', () => {
+  assert.doesNotThrow(() => validateBoard(board([node('n1', { boardRef: 'ai-review' })]), 'board', 0, () => {}));
+  assert.throws(() => validateBoard(board([node('n1', { boardRef: 'Not A Slug' })]), 'board', 0, () => {}), /boardRef must be a sheet-id slug/);
+  assert.throws(() => validateBoard(board([node('n1', { boardRef: 'x', board: board() })]), 'board', 0, () => {}), /private \(board\) OR shared \(boardRef\)/);
+});
+
+test('boardAtPath / pathChain resolve a boardRef via the injected childOf resolver', () => {
+  // sheet "svc" is the shared component; the consumer mounts it at n1.
+  const svcBoard = board([node('s1')]);
+  const sheets = { svc: { id: 'svc', board: svcBoard } };
+  const root = board([node('n1', { boardRef: 'svc' })]);
+  const childOf = (n) => n.board || (n.boardRef ? (sheets[n.boardRef] || {}).board : null);
+  // Without the resolver the path stops at the mount (boardRef is opaque)…
+  assert.equal(boardAtPath(root, ['n1']), root);
+  // …with it, the path crosses into the mounted sheet's board.
+  assert.equal(boardAtPath(root, ['n1'], childOf), svcBoard);
+  const chain = pathChain(root, ['n1', 's1'], childOf);
+  assert.deepEqual(chain.map((c) => c.id), ['n1', 's1']);
+});
