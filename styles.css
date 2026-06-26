@@ -715,6 +715,9 @@ body {
 .snap-guide.v { top: 0; left: 0; width: 1px; height: 100%; }
 .snap-guide.h { top: 0; left: 0; width: 100%; height: 1px; }
 
+/* left-drag selection box (marquee) */
+.marquee-box { position: absolute; z-index: 6; pointer-events: none; display: none; border: 1px solid var(--steel); background: rgba(227, 166, 72, .12); border-radius: 2px; }
+
 
 /* edges — one svg per board, in that board's own (scaled) coordinate system */
 .edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
@@ -822,3 +825,26 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .node-inner { transition: none; }
 }
+
+/* ---------------- Shared components (transcluded boards · node.boardRef) ---------------- */
+:root { --shared: #3fb0a0; }   /* teal — distinct from algo (amber) and nest (blue) */
+.node-tag.shared { color: var(--shared); border-color: rgba(63, 176, 160, .38); }
+/* a card that mounts a shared component: teal accent corner instead of the plain nest one */
+.node.is-shared.has-chart::after { border-right-color: var(--shared); border-top-color: var(--shared); }
+.node.is-shared { box-shadow: inset 2px 0 0 var(--shared); }
+
+/* left index: mark shared-component sheets */
+.idx.shared .idx-code { color: var(--shared); }
+.idx-shared { color: var(--shared); font-size: 11px; }
+
+/* "Mounted by" header strip on a shared sheet */
+.sh-mounts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0 0; font-size: 12px; color: var(--muted); }
+.sh-mounts:empty { display: none; }
+.mount-flag { font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; color: var(--shared); border: 1px solid rgba(63, 176, 160, .38); border-radius: 999px; padding: 3px 9px; }
+.mount-chip { font-family: var(--mono); font-size: 11px; color: var(--ink); text-decoration: none; background: var(--panel-2); border: 1px solid var(--hair); border-radius: 999px; padding: 3px 9px; }
+.mount-chip:hover { border-color: var(--shared); color: var(--shared); }
+.mount-none { color: var(--faint); font-style: italic; }
+
+/* inspector: the boardRef mount info line */
+.ed-hint { font-size: 11.5px; color: var(--muted); margin: 6px 0 0; line-height: 1.4; }
+.ed-hint a { color: var(--shared); }

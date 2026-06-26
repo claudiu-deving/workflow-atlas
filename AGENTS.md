@@ -56,10 +56,14 @@ a node, re-roots onto its child board, and resets its scale at each level, so de
 free (the e2e suite dives 25 levels). Zoom out to pop; the breadcrumb and the URL hash
 (`#<sheet>/<nodeId>/…`) track where you are.
 
-- **node** — `{ id, x, y, w, h, title, status, sub?, detail?, algorithm?, board? }`.
+- **node** — `{ id, x, y, w, h, title, status, sub?, detail?, algorithm?, board?, boardRef? }`.
   `status` ∈ `done·partial·todo`; `detail` = `{ in[], out[], note, open[] }` (the
   inspector); `algorithm` links a storyboard; **`board` nests a child chart** (same
-  `{ nodes, edges }` shape, recursively).
+  `{ nodes, edges }` shape, recursively); **`boardRef` MOUNTS another sheet** (transclusion)
+  instead of owning a board — the card shows that shared component live + read-only and
+  inherits its status. Mark the mounted sheet `shared: true` with its own `status`; the
+  cards that mount it surface via `list_shared`. `board`/`boardRef` are mutually exclusive,
+  and a boardRef cycle is rejected at save.
 - **edge** — `{ id, from, to, kind, label?, fromSide? }`. `from`/`to` MUST be node ids
   **in the SAME board** — express a cross-level link by containment (nest the node),
   never by an edge. `kind` ∈ `flow·loop·dep`; `fromSide` ∈ `top·right·bottom·left`

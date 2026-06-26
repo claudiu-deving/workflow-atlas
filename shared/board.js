@@ -41,27 +41,33 @@ export function boardBBox(board) {
   return { w: Math.max(maxX + PAD, 1), h: Math.max(maxY + PAD, 1) };
 }
 
+// `childOf(node)` is the board a node opens INTO. By default that's its private inline
+// board; callers that resolve transclusion (node.boardRef → another sheet's board) pass
+// their own resolver so a focus path can cross sheet boundaries seamlessly.
+const ownBoard = (n) => n && n.board;
+
 // The BOARD a path points INTO (the child board of the path's last node), or the
 // deepest board still resolvable if the path was pruned. Used by the renderer to
 // re-derive the focus board after a live reload, and to validate a focus stack.
-export function boardAtPath(rootBoard, path) {
+export function boardAtPath(rootBoard, path, childOf = ownBoard) {
   let board = rootBoard;
   for (const id of (path || [])) {
     const n = board && Array.isArray(board.nodes) && board.nodes.find((x) => x && x.id === id);
-    if (!n || !n.board) return board;            // pruned: stop at the deepest board that still resolves
-    board = n.board;
+    const child = n && childOf(n);
+    if (!n || !child) return board;              // pruned: stop at the deepest board that still resolves
+    board = child;
   }
   return board;
 }
 
 // The chain of { id, title, node } a path walks — feeds the breadcrumb navigator.
-export function pathChain(rootBoard, path) {
+export function pathChain(rootBoard, path, childOf = ownBoard) {
   const out = []; let board = rootBoard;
   for (const id of (path || [])) {
     const n = board && Array.isArray(board.nodes) && board.nodes.find((x) => x && x.id === id);
     if (!n) break;
     out.push({ id, title: n.title, node: n });
-    board = n.board;
+    board = childOf(n);
     if (!board) break;
   }
   return out;
@@ -97,6 +103,13 @@ export function validateBoard(b, where, seen, validateDetail) {
     if (!n.title || typeof n.title !== 'string') throw new Error(`${w}.title is required (a string)`);
     if (n.status != null && !STATUSES.has(n.status)) throw new Error(`${w}.status must be one of: ${[...STATUSES].join(', ')}`);
     if (n.algorithm != null && !isSlug(n.algorithm)) throw new Error(`${w}.algorithm must be a slug`);
+    // boardRef MOUNTS another sheet's board (transclusion) instead of owning one inline.
+    // A node's interior is either private (board) or shared (boardRef) — never both. The
+    // cross-sheet cycle these can form is caught at the server (assertRefsAcyclic), not here.
+    if (n.boardRef != null) {
+      if (!isSlug(n.boardRef)) throw new Error(`${w}.boardRef must be a sheet-id slug`);
+      if (n.board != null) throw new Error(`${w} has both board and boardRef — a node's interior is private (board) OR shared (boardRef), not both`);
+    }
     if (typeof validateDetail === 'function') validateDetail(n.detail, w);
     if (n.board != null) validateBoard(n.board, `${w}.board`, seen, validateDetail);   // recurse (cycle-guarded)
   });
