@@ -89,6 +89,23 @@ function registerSelfWrite(proj, jsonStr) {
   while (selfWrites.size > 24) selfWrites.delete(selfWrites.values().next().value);
 }
 
+// Swallow a watch event whose file is byte-identical to the last time we reloaded on
+// it. A phantom 'change' — Windows fs.watch coalescing, a read touching the file, or a
+// SECOND server instance (bound to another project) no-op-touching workflows.json on
+// each turn — must not reload a tab when nothing actually changed. Distinct from
+// selfWrites (which suppresses reloads for content we DID change from the in-app editor):
+// this catches events where the bytes never moved at all. Bounded.
+const lastReloadHash = new Map();   // abs file path -> content hash when we last reloaded
+function unchangedSinceLastReload(absPath) {
+  let cur;
+  try { cur = sha(readFileSync(absPath, 'utf8')); }
+  catch { return false; }   // gone/unreadable mid-rename -> treat as a real change, reload
+  if (lastReloadHash.get(absPath) === cur) return true;
+  lastReloadHash.set(absPath, cur);
+  while (lastReloadHash.size > 256) lastReloadHash.delete(lastReloadHash.keys().next().value);
+  return false;
+}
+
 // Project → time of our last review autosave. Everything under reviews/ (storyboard
 // comments/params/decisions, workflow decisions) is the app's OWN autosave and must
 // never reload anyone — otherwise typing a comment, which autosaves per keystroke,
@@ -1088,6 +1105,10 @@ try {
       try { if (selfWrites.has(selfKey(proj, readFileSync(workflowsPath(proj), 'utf8')))) return; }
       catch { /* unreadable mid-rename — fall through and reload */ }
     }
+    // A real file event (not a fileless dir event) whose bytes are unchanged is a
+    // phantom — don't reload. This is what kills the reload-on-every-input: a second
+    // server instance touches workflow-atlas/workflows.json each turn without changing it.
+    if (f.includes('/') && unchangedSinceLastReload(path.join(PROJECTS_DIR, f))) return;
     scheduleReload(proj);
   });
 } catch (e) { log('live-reload (data) unavailable:', e.message); }
