@@ -417,6 +417,51 @@ async function getSheet(p, id) {
   if (!s) throw new Error(`no such sheet: ${id}`);
   return s;
 }
+// Mirror the canvas's dot/card/frame level-of-detail for the READ tools: include
+// nested child boards only `depth` levels deep, replacing a deeper node.board with a
+// stub { nodes, path } so a deep sheet reads shallowly and stays navigable (fetch the
+// rest with get_node at the given path). basePath is the #sheet/nodeId/… hash-path.
+function pruneBoard(board, depth, basePath) {
+  if (!board || !Array.isArray(board.nodes)) return board;
+  return { ...board, nodes: board.nodes.map((n) => {
+    if (!(n.board && Array.isArray(n.board.nodes))) return n;   // leaf or boardRef — already tiny
+    const path = `${basePath}/${n.id}`;
+    if (depth <= 1) { const { board: child, ...rest } = n; return { ...rest, more: { nodes: child.nodes.length, path } }; }
+    return { ...n, board: pruneBoard(n.board, depth - 1, path) };
+  }) };
+}
+function pruneSheet(sheet, depth) {
+  if (depth == null || !sheet || !sheet.board) return sheet;
+  return { ...sheet, board: pruneBoard(sheet.board, depth, sheet.id) };
+}
+// Address one node by the same #sheet/nodeId/nodeId path the URL hash uses, so a
+// caller can jump to one pillar instead of dumping the whole sheet. Returns that node
+// with its own child board pruned to `depth` (default 1). Follows the v2 board only.
+async function getNode(p, rawPath, depth) {
+  const parts = String(rawPath || '').replace(/^#/, '').split('/').filter(Boolean);
+  if (parts.length < 2) throw new Error('path must be "sheetId/nodeId[/nodeId…]" — see the URL hash / a sheet\'s more.path');
+  const [sheetId, ...nodeIds] = parts;
+  if (!safeId(sheetId)) throw new Error('invalid sheet id in path');
+  let board = migrateSheet(await getSheet(p, sheetId)).board;   // throws if no such sheet; migrate so legacy stations work
+  let node = null;
+  for (const id of nodeIds) {
+    node = ((board && board.nodes) || []).find((n) => n && n.id === id);
+    if (!node) throw new Error(`no node "${id}" on path ${sheetId}/${nodeIds.join('/')} — check the ids`);
+    board = node.board;
+  }
+  const want = depth == null ? 1 : depth;
+  return node.board ? { ...node, board: pruneBoard(node.board, want, parts.join('/')) } : node;
+}
+// A table of contents: every sheet's identity + per-status node counts, no boards —
+// the cheap "what's here" entry point that never reads a single board into context.
+async function listSheets(p) {
+  return ((await readWorkflows(p)).sheets || []).map(migrateSheet).map((s) => {
+    const counts = { done: 0, partial: 0, todo: 0 };
+    const walk = (b) => { for (const n of (b && b.nodes) || []) { if (counts[n.status] != null) counts[n.status]++; if (n.board) walk(n.board); } };
+    walk(s.board);
+    return { id: s.id, code: s.code, name: s.name, title: s.title, sub: s.sub, shared: !!s.shared, status: s.status, nodes: counts };
+  });
+}
 // per-sheet upsert — authoring one sheet never resends the rest
 async function saveSheet(p, sheet, registerSelf = false) {
   validateSheet(sheet);
@@ -651,7 +696,10 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} } },
   { name: 'get_algorithm', description: 'Read the full JSON spec of an algorithm storyboard (meta, kind, code, params, steps or builtin).',
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' } }, required: ['algorithm'] } },
-  { name: 'get_workflows', description: 'Read the workflow maps (the SHEETS data) shown in the Workflows view.',
+  { name: 'get_workflows', description: 'Read the workflow maps (the SHEETS data) shown in the Workflows view. ' +
+      'Pass "depth" (positive int) to include nested child boards only that many levels deep — a deeper node.board is replaced by a stub { nodes, path } you can fetch with get_node. Omit depth for the full tree (can be very large). Prefer list_sheets first, then get_sheet/get_node with depth.',
+    inputSchema: { type: 'object', properties: { depth: { type: 'integer' } } } },
+  { name: 'list_sheets', description: 'Table of contents: every sheet\'s id/code/name/title/sub + per-status node counts, with NO boards — the cheap way to see what exists before reading any board.',
     inputSchema: { type: 'object', properties: {} } },
   { name: 'get_review', description: 'Read the saved review (tuned params + per-step comments + decisions) for an algorithm.',
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' } }, required: ['algorithm'] } },
@@ -678,8 +726,12 @@ const TOOLS = [
       'Example sheet: { "id":"checkout", "code":"WF-02", "name":"Checkout", "title":"Order checkout", "sub":"…", "stations":[ {"title":"Validate cart","status":"done","detail":{"in":["cart"],"out":["valid cart"],"open":["allow backorders?"]}} ] }. ' +
       'The response echoes which sheet ids were added/updated/removed plus lint warnings. Persists to this session\'s project.',
     inputSchema: { type: 'object', properties: { sheets: { type: 'array' } }, required: ['sheets'] } },
-  { name: 'get_sheet', description: 'Read ONE workflow sheet by id (lighter than get_workflows).',
-    inputSchema: { type: 'object', properties: { sheet: { type: 'string' } }, required: ['sheet'] } },
+  { name: 'get_sheet', description: 'Read ONE workflow sheet by id (lighter than get_workflows). ' +
+      'A deeply nested sheet can still be huge — pass "depth" (positive int) to include nested child boards only that many levels deep (a deeper node.board becomes a stub { nodes, path } you fetch with get_node). Omit depth for the full sheet.',
+    inputSchema: { type: 'object', properties: { sheet: { type: 'string' }, depth: { type: 'integer' } }, required: ['sheet'] } },
+  { name: 'get_node', description: 'Read ONE node addressed by the same #sheet/nodeId/nodeId path the URL hash uses (or a stub\'s more.path) — jump straight to one pillar/sub-board instead of dumping the whole sheet. ' +
+      'Returns that node with its own child board pruned to "depth" (default 1; deeper child boards become { nodes, path } stubs).',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, depth: { type: 'integer' } }, required: ['path'] } },
   { name: 'save_sheet', description: 'Upsert ONE workflow sheet by id — create it or replace it in place WITHOUT resending the others. ' +
       'sheet = { id (slug), code (SHORT badge), name, title, sub, schema? (2 for the v2 board form), shared? (true ⇒ this sheet is a reusable COMPONENT other sheets mount), status? (done|partial|todo — a shared component\'s single status, mirrored by every mount), AND EITHER legacy stations[] OR a v2 "board" }. ' +
       'A v2 board (the infinite-canvas / nested-chart form the app now renders) = { nodes:[ NODE ], edges:[ EDGE ], view?:{x,y,zoom} }. ' +
@@ -734,6 +786,7 @@ async function callTool(name, args) {
   if (name === 'set_param' && !Number.isFinite(a.value)) throw new Error('value must be a finite number');
   const needsSheet = new Set(['get_sheet', 'delete_sheet', 'set_station', 'delete_station', 'set_workflow_decision', 'reopen_workflow_question']);
   if (needsSheet.has(name) && !safeId(a.sheet)) throw new Error('invalid or missing sheet id (slug)');
+  if (a.depth != null && (!Number.isInteger(a.depth) || a.depth < 1)) throw new Error('depth must be a positive integer');
   const p = CURRENT_PROJECT;   // this server process is bound to one project (its launch dir)
   switch (name) {
     case 'list_algorithms': {
@@ -741,7 +794,13 @@ async function callTool(name, args) {
       return algs.map((id) => `${id}${existsSync(reviewPath(p, id)) ? ' (review saved)' : ''}`).join('\n') || '(none)';
     }
     case 'get_algorithm': return JSON.stringify(await readAlgorithm(p, a.algorithm), null, 2);
-    case 'get_workflows': return JSON.stringify(await readWorkflows(p), null, 2);
+    case 'get_workflows': {
+      const wf = await readWorkflows(p);
+      if (a.depth == null) return JSON.stringify(wf, null, 2);
+      return JSON.stringify({ ...wf, sheets: (wf.sheets || []).map((s) => pruneSheet(migrateSheet(s), a.depth)) }, null, 2);
+    }
+    case 'list_sheets': return JSON.stringify(await listSheets(p), null, 2);
+    case 'get_node': return JSON.stringify(await getNode(p, a.path, a.depth), null, 2);
     case 'list_shared': {
       const rows = await listShared(p);
       if (!rows.length) return '(no shared components yet — mark a sheet shared:true and mount it from cards via node.boardRef:"<sheetId>")';
@@ -805,7 +864,10 @@ async function callTool(name, args) {
       return `saved ${n} sheet(s) — added: [${added.join(', ')}]  updated: [${updated.join(', ')}]  removed: [${removed.join(', ')}]` +
         (warns.length ? `\n⚠ ${warns.join('\n⚠ ')}` : '');
     }
-    case 'get_sheet': return JSON.stringify(await getSheet(p, a.sheet), null, 2);
+    case 'get_sheet': {
+      const s = await getSheet(p, a.sheet);
+      return JSON.stringify(a.depth == null ? s : pruneSheet(migrateSheet(s), a.depth), null, 2);
+    }
     case 'save_sheet': {
       const r = await withSheetLock(p, () => saveSheet(p, a.sheet));
       openInBrowser('/');

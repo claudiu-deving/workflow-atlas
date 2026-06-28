@@ -217,8 +217,12 @@ reviews over REST, and speaks **MCP** — over **stdio** (how an MCP client like
 Claude Code launches it) *and* at `/mcp` over HTTP (for manual testing). Every tool
 acts on the session's project. Tools:
 
-- **Read** — `list_algorithms`, `get_algorithm`, `get_workflows`, `get_sheet`,
-  `get_review`, `get_workflow_review`, `list_open_questions`
+- **Read** — `list_algorithms`, `get_algorithm`, `list_sheets` (TOC: ids + status
+  counts, no boards), `get_workflows`, `get_sheet`, `get_node` (one node by its
+  `#sheet/nodeId/…` path), `get_review`, `get_workflow_review`, `list_open_questions`.
+  `get_workflows` / `get_sheet` take an optional `depth` (positive int) that includes
+  nested boards only that many levels deep — a deeper `node.board` becomes a stub
+  `{ nodes, path }` you fetch with `get_node`, so a deep sheet reads shallowly
 - **Author algorithms** — `save_algorithm`, `delete_algorithm`
 - **Author workflows** — `save_sheet` / `delete_sheet` / `reorder_sheets` and
   `set_station` / `delete_station` (per-piece upserts; preferred), or
