@@ -130,3 +130,149 @@ export function validateBoard(b, where, seen, validateDetail) {
   });
   seen.delete(b);   // leave the chain so a board may legitimately recur in a SIBLING subtree; only ANCESTOR cycles throw
 }
+
+/* ---------------- granular editing: addressing + merge + apply (pure) ----------------
+   These power the granular write tools (edit_board / set_node) and are pure — no IO — so
+   the server unit-tests them directly and wraps them with read/migrate/validate/persist. */
+
+// Split a "sheetId/nodeId/nodeId…" address (the URL-hash form; a leading '#' is fine) into the
+// sheet id and the node-id segments beneath it. Each segment names a CONTAINER node you descend
+// into. Throws on an empty path or a non-slug sheet id.
+export function parsePath(raw) {
+  const parts = String(raw || '').replace(/^#/, '').split('/').filter(Boolean);
+  if (!parts.length) throw new Error('empty path — expected "sheetId/nodeId/…"');
+  const [sheetId, ...segs] = parts;
+  if (!isSlug(sheetId)) throw new Error(`invalid sheet id in path: "${sheetId}"`);
+  return { sheetId, segs };
+}
+
+// Descend node-id segments from a root board to the board they point INTO ([] → the root board
+// itself). Every segment MUST resolve to an existing node — a typo throws (mirroring get_node's
+// contract), so a write tool never silently materializes a chain of empty boards from a bad path.
+// `createLast`: when ONLY the final segment's node exists but has no child board yet, create an
+// empty one so you can author into it. A boardRef (transclusion) mount is never descended into,
+// nor given a private board — its interior belongs to the source sheet.
+export function boardForSegs(rootBoard, segs, { createLast = false } = {}) {
+  let board = rootBoard;
+  const path = segs || [];
+  path.forEach((id, i) => {
+    const last = i === path.length - 1;
+    const n = board && Array.isArray(board.nodes) && board.nodes.find((x) => x && x.id === id);
+    if (!n) throw new Error(`no node "${id}" here — check the path ids (read it with get_sheet/get_node)`);
+    if (n.boardRef) throw new Error(`node "${id}" mounts shared component "${n.boardRef}" — edit that source sheet, not the mount`);
+    if (!n.board) {
+      if (last && createLast) n.board = { nodes: [], edges: [], view: { x: 0, y: 0, zoom: 1 } };
+      else throw new Error(`node "${id}" has no child board to descend into — author the container first`);
+    }
+    board = n.board;
+  });
+  return board;
+}
+
+// Merge a PATCH into a node IN PLACE. The contract the tools document:
+//   • a top-level key REPLACES that field (title, status, x, y, sub, algorithm, board, …);
+//   • `detail` MERGES per key — set {detail:{note}} and detail.in/out/open are left untouched;
+//   • a null value CLEARS that field, top-level (sub:null) or inside detail (detail:{open:null});
+//   • an array value (detail.open, …) REPLACES the whole array — there is no append.
+//   • `id` is fixed by addressing and is never merged.
+export function mergeNode(node, patch) {
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (k === 'id') continue;
+    if (k === 'detail') {
+      if (v == null) { delete node.detail; continue; }
+      if (typeof v !== 'object' || Array.isArray(v)) throw new Error('detail must be an object { in?, out?, note?, open? }');
+      const next = { ...(node.detail && typeof node.detail === 'object' ? node.detail : {}) };
+      for (const [dk, dv] of Object.entries(v)) { if (dv == null) delete next[dk]; else next[dk] = dv; }
+      node.detail = next;
+    } else if (v == null) {
+      delete node[k];
+    } else {
+      node[k] = v;
+    }
+  }
+  return node;
+}
+
+// Apply a board edit (upsert/patch nodes & edges by id; delete by id) to a board IN PLACE and
+// return a summary. Order: deleteEdges, then deleteNodes (cascading their still-incident edges),
+// then node upserts, then edge upserts (so a new edge can reference a just-created node). A NEW
+// node gets default geometry and is auto-placed stacked BELOW the current bbox, so a batch of
+// creates never overlaps; pass x/y to override. Pure — the caller validates the whole sheet
+// (validateBoard) before persisting, which is what rejects a dangling edge / dup id / bad shape.
+export function applyBoardEdit(board, edit = {}) {
+  if (!board || !Array.isArray(board.nodes) || !Array.isArray(board.edges)) throw new Error('target board is malformed');
+  const sum = { created: [], updated: [], deletedNodes: [], deletedEdges: [] };
+  for (const id of edit.deleteEdges || []) {
+    const i = board.edges.findIndex((e) => e && e.id === id);
+    if (i < 0) throw new Error(`deleteEdges: no edge "${id}" in this board`);
+    board.edges.splice(i, 1);
+    sum.deletedEdges.push(id);
+  }
+  for (const id of edit.deleteNodes || []) {
+    const i = board.nodes.findIndex((n) => n && n.id === id);
+    if (i < 0) throw new Error(`deleteNodes: no node "${id}" in this board`);
+    board.nodes.splice(i, 1);
+    const kept = board.edges.filter((e) => e.from !== id && e.to !== id);   // cascade incident edges
+    if (kept.length !== board.edges.length) sum.deletedEdges.push(`*incident-to-${id}`);
+    board.edges = kept;
+    sum.deletedNodes.push(id);
+  }
+  let placeY = boardBBox(board).h;   // stack new nodes below everything already present
+  for (const patch of edit.nodes || []) {
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('each nodes[] item must be an object');
+    const existing = patch.id != null ? board.nodes.find((n) => n && n.id === patch.id) : null;
+    if (existing) { mergeNode(existing, patch); sum.updated.push(existing.id); continue; }
+    const id = patch.id != null ? String(patch.id) : nextId(board.nodes, 'n');
+    const node = { id, x: COL_X, y: placeY, w: NODE_W, h: NODE_H, status: 'todo' };
+    placeY += ROW_DY;
+    mergeNode(node, patch);                       // title/status/x/y/… (x/y override the auto-place)
+    if (!node.title) throw new Error(`new node "${id}" requires a title`);
+    board.nodes.push(node);
+    sum.created.push(id);
+  }
+  for (const e of edit.edges || []) {
+    if (!e || typeof e !== 'object' || Array.isArray(e)) throw new Error('each edges[] item must be an object');
+    if (e.from == null || e.to == null) throw new Error('an edge needs "from" and "to" (node ids in this board)');
+    const id = e.id != null ? String(e.id) : nextId(board.edges, 'e');
+    const existing = e.id != null ? board.edges.find((x) => x && x.id === id) : null;
+    const edge = { id, from: String(e.from), to: String(e.to), kind: e.kind || 'flow' };
+    if (e.label != null) edge.label = e.label;
+    if (e.fromSide != null) edge.fromSide = e.fromSide;
+    if (existing) { Object.assign(existing, edge); sum.updated.push('edge:' + id); }
+    else { board.edges.push(edge); sum.created.push('edge:' + id); }
+  }
+  return sum;
+}
+
+/* ---------------- node index / search (pure) — powers find_nodes ---------------- */
+// Flatten a board into [{ path, node }] for EVERY node at every depth, each with its addressable
+// "sheetId/nodeId/…" path. Descends INLINE child boards (node.board); a boardRef mount is a LEAF
+// here (its target sheet is indexed under its own id), which also means no cross-sheet boardRef
+// cycle can ever loop this walk.
+export function indexNodes(rootBoard, basePath) {
+  const out = [];
+  const walk = (board, prefix) => {
+    for (const n of (board && board.nodes) || []) {
+      if (!n || !n.id) continue;
+      const path = `${prefix}/${n.id}`;
+      out.push({ path, node: n });
+      if (n.board) walk(n.board, path);
+    }
+  };
+  if (rootBoard) walk(rootBoard, basePath);
+  return out;
+}
+
+// Case-insensitive substring search over a node's human-readable fields (`q` must be pre-lowercased).
+// Returns the first { field, value } that contains q, or null. Searches id, title, sub, algorithm,
+// and detail.note / detail.in / detail.out / detail.open — so "find the card that mentions X" works.
+export function matchNode(node, q) {
+  if (!q) return { field: 'all', value: '' };
+  const hit = (field, value) => (typeof value === 'string' && value.toLowerCase().includes(q)) ? { field, value } : null;
+  let m = hit('id', node.id) || hit('title', node.title) || hit('sub', node.sub) || hit('algorithm', node.algorithm);
+  if (m) return m;
+  const d = node.detail || {};
+  if ((m = hit('note', d.note))) return m;
+  for (const k of ['in', 'out', 'open']) for (const v of (d[k] || [])) if ((m = hit(k, v))) return m;
+  return null;
+}

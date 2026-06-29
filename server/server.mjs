@@ -15,12 +15,12 @@ import fs from 'node:fs/promises';
 import { existsSync, mkdirSync, watch, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { GENERATORS } from '../shared/generators.js';
 import { migrateSheet } from '../shared/migrate.js';
-import { validateBoard } from '../shared/board.js';
+import { validateBoard, parsePath, boardForSegs, mergeNode, applyBoardEdit, indexNodes, matchNode } from '../shared/board.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');        // the app files (this repo) — served as static
@@ -33,11 +33,27 @@ const SEED = path.join(ROOT, 'content');           // bundled demo content used 
 const ATLAS_HOME = process.env.WORKFLOW_ATLAS_HOME || path.join(os.homedir(), '.workflow-atlas');
 const PROJECTS_DIR = path.join(ATLAS_HOME, 'projects');
 const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'default';
-// Each server process is bound to ONE project: explicit WORKFLOW_ATLAS_PROJECT, else
-// derived from the launch directory — so an MCP client opened in repo X authors X's
-// project automatically, and parallel sessions in different repos stay isolated.
-// (Prefer CLAUDE_PROJECT_DIR so the server and the review hook agree on the project.)
-const CURRENT_PROJECT = slug(process.env.WORKFLOW_ATLAS_PROJECT || path.basename(process.env.CLAUDE_PROJECT_DIR || process.cwd()));
+// Each server process is bound to ONE project. Resolution order:
+//   1. explicit WORKFLOW_ATLAS_PROJECT (an operator override always wins);
+//   2. the GIT REPO ROOT — `git rev-parse --git-common-dir` resolves to the MAIN repo's git
+//      dir, which every linked worktree SHARES, so all worktrees of repo X map to the one
+//      project X (the launch-dir basename would give each worktree its own empty project);
+//   3. the launch directory's basename (not a git repo).
+// (CLAUDE_PROJECT_DIR is preferred as the base so the server and the review hook agree.)
+function resolveProjectName() {
+  if (process.env.WORKFLOW_ATLAS_PROJECT) return slug(process.env.WORKFLOW_ATLAS_PROJECT);
+  const base = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  try {
+    const r = spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd: base, encoding: 'utf8', timeout: 2000 });
+    if (r.status === 0 && r.stdout && r.stdout.trim()) {
+      const commonDir = path.resolve(base, r.stdout.trim());   // ".git" (main) or "/repo/.git" (worktree) → absolute
+      const repoRoot = path.basename(path.dirname(commonDir));  // the dir that CONTAINS .git == the repo
+      if (repoRoot && repoRoot !== '.' && repoRoot !== path.sep) return slug(repoRoot);
+    }
+  } catch { /* git missing / not a repo — fall through to the launch dir */ }
+  return slug(path.basename(base));
+}
+const CURRENT_PROJECT = resolveProjectName();
 
 const projDir = (p) => path.join(PROJECTS_DIR, slug(p));
 const algDir = (p) => path.join(projDir(p), 'algorithms');
@@ -121,7 +137,7 @@ const REVIEW_EVENT_WINDOW_MS = 1000;
 const noteReviewWrite = (p) => reviewWriteAt.set(p, Date.now());
 
 // Serialize the WHOLE read-modify-write of a project's workflows.json. The per-file
-// writeAtomic queue only serializes the rename; saveSheet/setStation read the entire
+// writeAtomic queue only serializes the rename; saveSheet/edit_board/set_node read the entire
 // sheets array, mutate one, and write all — so two interleaved edits to DIFFERENT
 // sheets could drop one. Routing every mutation through here closes that window.
 const sheetRMW = new Map();
@@ -130,6 +146,88 @@ async function withSheetLock(p, fn) {
   const run = prev.catch(() => {}).then(fn);
   sheetRMW.set(p, run);
   try { return await run; } finally { if (sheetRMW.get(p) === run) sheetRMW.delete(p); }
+}
+
+/* ---------------- concurrency: per-sheet revision token + optimistic guard + cross-process lock ----------------
+   A sheet's `rev` is a short content hash of its STORED bytes. ANY edit — a human's in the app
+   (over REST) or the AI's (over MCP) — changes the bytes, so the rev changes, with no counter to
+   keep in sync. This is what lets a human edit BLOCK an AI overwrite: */
+const revOfSheet = (sheet) => sha(JSON.stringify(sheet || null)).slice(0, 12);
+
+// What rev THIS process (one MCP/AI session) last OBSERVED for a sheet — set by every MCP read,
+// and refreshed after every MCP write. An MCP write is rejected when the sheet's current rev
+// differs from what we last saw (the human edited it since), so the AI re-reads instead of
+// clobbering. The human's own REST edits never consult or update this map (they ARE the change
+// being protected), so they always land and they invalidate the AI's stale view.
+const lastSeenRev = new Map();
+const seenKey = (p, id) => `${p}::${id}`;
+const noteSeen = (p, id, rev) => { if (id && rev != null) lastSeenRev.set(seenKey(p, id), rev); };
+function enforceFreshness(p, sheetId, curRev, { baseRev, force } = {}) {
+  if (force) return;
+  const expected = baseRev != null ? baseRev : lastSeenRev.get(seenKey(p, sheetId));
+  if (expected != null && expected !== curRev)
+    throw new Error(`stale edit: sheet "${sheetId}" changed since you last read it (you had rev ${expected}, it is now ${curRev}) — most likely a human edit in the app. Re-read it with get_sheet/get_node and re-apply your change, or pass force:true to overwrite it.`);
+}
+
+// Cross-PROCESS advisory lock for the shared workflows.json. With git-worktree project sharing,
+// two server processes (different worktrees, same project) can interleave read-modify-write and
+// silently drop one edit; an O_EXCL lock file is an atomic mutex across processes on one FS. Held
+// only for the brief RMW; a crashed holder's lock is stolen once it goes stale.
+const LOCK_STALE_MS = 10000;
+async function acquireFileLock(file) {
+  const path = file + '.lock';
+  const token = randomUUID();                                    // identifies OUR hold of the lock
+  const deadline = Date.now() + 8000;
+  for (;;) {
+    try {
+      const fh = await fs.open(path, 'wx');                      // atomic exclusive create (one winner)
+      try { await fh.writeFile(`${process.pid} ${Date.now()} ${token}`); } catch { /* best-effort holder marker */ }
+      await fh.close();
+      return { path, token };
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let stale = false;
+      try { stale = Date.now() - (await fs.stat(path)).mtimeMs > LOCK_STALE_MS; } catch { /* vanished mid-check — retry */ }
+      if (stale) { await fs.rm(path, { force: true }).catch(() => {}); continue; }   // steal a crashed holder's lock
+      if (Date.now() > deadline) throw new Error('workflows.json is locked by another session — please retry');
+      await new Promise((r) => setTimeout(r, 20 + (process.pid % 30)));
+    }
+  }
+}
+// Only remove the lock if it STILL holds OUR token: if our hold went stale and another process
+// stole+recreated it, the file now carries their token, so we must not delete their fresh lock.
+async function releaseFileLock(lock) {
+  if (!lock) return;
+  try { if ((await fs.readFile(lock.path, 'utf8')).endsWith(lock.token)) await fs.rm(lock.path, { force: true }); }
+  catch { /* already gone */ }
+}
+
+// THE workflow write path: one serialized read-modify-write of a project's workflows.json — both
+// in-process (withSheetLock) AND cross-process (file lock). Reads the CURRENT sheets, runs the
+// mutator (mutates the array in place, returns { touched: [sheetId…], …summary }), validates only
+// the touched sheets (recursive validateBoard) + the global invariants, commits v2 (drops legacy
+// stations[] on a sheet that now carries a board), persists atomically, and (for guarded MCP
+// writes) refreshes this session's last-seen rev. Attaches the primary touched sheet's new rev.
+async function withWorkflowsTxn(p, opts, mutate) {
+  const { registerSelf = false, snapshot = false, guard = false } = opts || {};
+  return withSheetLock(p, async () => {
+    await fs.mkdir(projDir(p), { recursive: true });
+    const lock = await acquireFileLock(workflowsPath(p));
+    try {
+      const sheets = (await readWorkflows(p)).sheets || [];
+      const result = (await mutate(sheets)) || {};
+      const touched = Array.isArray(result.touched) ? result.touched : sheets.map((s) => s && s.id);
+      for (const id of touched) { const s = sheets.find((x) => x && x.id === id); if (s) validateSheet(s); }
+      sheets.forEach((s) => { if (s && s.board && Array.isArray(s.board.nodes)) delete s.stations; });   // commit v2
+      assertUniqueIds(sheets);
+      if (snapshot) { try { await fs.copyFile(workflowsPath(p), workflowsPath(p) + '.bak'); } catch { /* no prior file */ } }
+      await persistWorkflows(p, sheets, registerSelf);   // assertRefsAcyclic + atomic write
+      const primary = touched.length ? sheets.find((x) => x && x.id === touched[0]) : null;
+      result.rev = primary ? revOfSheet(primary) : undefined;
+      if (guard) for (const id of touched) { const s = sheets.find((x) => x && x.id === id); if (s) noteSeen(p, id, revOfSheet(s)); }
+      return result;
+    } finally { await releaseFileLock(lock); }
+  });
 }
 
 const PORT = Number(process.env.PORT) || 5174;
@@ -416,18 +514,20 @@ async function persistWorkflows(p, sheets, registerSelf = false) {
   await writeAtomic(workflowsPath(p), json);
   return json;
 }
+// Replace-ALL (the in-app editor's rare bulk PUT /workflows). Snapshots the prior file to .bak
+// first — it's the destructive op (an omitted sheet is deleted). Per-piece edits (save_sheet /
+// edit_board / set_node) must NOT overwrite the .bak, or one follow-up edit erases the recovery
+// point — so only this path passes snapshot:true.
 async function writeWorkflows(p, obj, registerSelf = false) {
-  const sheets = Array.isArray(obj) ? obj : (obj && obj.sheets);
-  if (!Array.isArray(sheets)) throw new Error('workflows must be an array of sheets, or { sheets: [...] }');
-  sheets.forEach((s) => validateSheet(s));
-  sheets.forEach((s) => { if (s && s.board && Array.isArray(s.board.nodes)) delete s.stations; });   // commit v2
-  assertUniqueIds(sheets);
-  // Snapshot the prior file ONLY on this replace-all path — it's the destructive
-  // op (an omitted sheet is deleted). Per-piece edits (save_sheet/set_station) must
-  // NOT overwrite the .bak, or one follow-up edit would erase the recovery point.
-  try { await fs.copyFile(workflowsPath(p), workflowsPath(p) + '.bak'); } catch { /* no prior file */ }
-  await persistWorkflows(p, sheets, registerSelf);
-  return sheets.length;
+  const incoming = Array.isArray(obj) ? obj : (obj && obj.sheets);
+  if (!Array.isArray(incoming)) throw new Error('workflows must be an array of sheets, or { sheets: [...] }');
+  incoming.forEach((s) => validateSheet(s));   // fail clearly before taking the lock
+  incoming.forEach((s) => { if (s && s.board && Array.isArray(s.board.nodes)) delete s.stations; });
+  await withWorkflowsTxn(p, { registerSelf, snapshot: true }, (sheets) => {
+    sheets.length = 0; sheets.push(...incoming);
+    return { touched: incoming.map((s) => s && s.id).filter(Boolean) };
+  });
+  return incoming.length;
 }
 async function getSheet(p, id) {
   const s = ((await readWorkflows(p)).sheets || []).find((x) => x && x.id === id);
@@ -472,84 +572,127 @@ async function getNode(p, rawPath, depth) {
 // A table of contents: every sheet's identity + per-status node counts, no boards —
 // the cheap "what's here" entry point that never reads a single board into context.
 async function listSheets(p) {
-  return ((await readWorkflows(p)).sheets || []).map(migrateSheet).map((s) => {
+  return ((await readWorkflows(p)).sheets || []).map((raw) => {
+    const rev = revOfSheet(raw);        // the STORED bytes' rev — capture before migrate mutates it
+    const s = migrateSheet(raw);
     const counts = { done: 0, partial: 0, todo: 0 };
     const walk = (b) => { for (const n of (b && b.nodes) || []) { if (counts[n.status] != null) counts[n.status]++; if (n.board) walk(n.board); } };
     walk(s.board);
-    return { id: s.id, code: s.code, name: s.name, title: s.title, sub: s.sub, shared: !!s.shared, status: s.status, nodes: counts };
+    return { id: s.id, code: s.code, name: s.name, title: s.title, sub: s.sub, shared: !!s.shared, status: s.status, nodes: counts, rev };
   });
 }
-// per-sheet upsert — authoring one sheet never resends the rest
-async function saveSheet(p, sheet, registerSelf = false) {
-  validateSheet(sheet);
-  if (sheet.board && Array.isArray(sheet.board.nodes)) delete sheet.stations;   // commit v2: the legacy spine is superseded
+// find_nodes: index/search every node across the project (or one sheet) by text/status, returning
+// each match's addressable path so you jump straight to get_node/set_node instead of drilling board
+// by board. A discovery tool like list_sheets — it deliberately does NOT arm the freshness baseline
+// (it reveals no single sheet's full content; get_node does that before you edit).
+async function findNodes(p, { query, status, sheet } = {}) {
   const sheets = (await readWorkflows(p)).sheets || [];
-  const i = sheets.findIndex((s) => s && s.id === sheet.id);
-  const created = i < 0;
-  if (created) sheets.push(sheet); else sheets[i] = sheet;
-  await persistWorkflows(p, sheets, registerSelf);
-  return { id: sheet.id, created, count: sheets.length, warnings: lintSheets([sheet]) };
+  if (sheet && !sheets.some((s) => s && s.id === sheet)) throw new Error(`no such sheet: ${sheet}`);   // catch a typo, like getSheet
+  const q = query ? String(query).toLowerCase() : '';
+  const rows = [];
+  for (const raw of sheets) {
+    if (sheet && raw.id !== sheet) continue;
+    const s = migrateSheet(raw);
+    for (const { path, node } of indexNodes(s.board, s.id)) {
+      if (status && (node.status || 'todo') !== status) continue;
+      const m = q ? matchNode(node, q) : null;
+      if (q && !m) continue;
+      rows.push({ path, status: node.status || 'todo', title: node.title || '(untitled)', sub: node.sub || null,
+        children: (node.board && node.board.nodes || []).length, boardRef: node.boardRef || null, match: m });
+    }
+  }
+  return rows;
 }
-async function deleteSheet(p, id, registerSelf = false) {
-  const sheets = (await readWorkflows(p)).sheets || [];
-  const next = sheets.filter((s) => !(s && s.id === id));
-  if (next.length === sheets.length) throw new Error(`no such sheet: ${id}`);
-  await persistWorkflows(p, next, registerSelf);
-  // intentionally KEEP the sheet's decisions in the review file: re-creating the
-  // sheet later recovers them, and they only render for questions that still exist.
-  return next.length;
+// a short context window around the match, so the caller sees WHY a non-title field matched
+function matchSnippet(value, q, pad = 22) {
+  if (!q || typeof value !== 'string') return '';
+  const i = value.toLowerCase().indexOf(q);
+  if (i < 0) return '';
+  const a = Math.max(0, i - pad), b = Math.min(value.length, i + q.length + pad);
+  return (a > 0 ? '…' : '') + value.slice(a, b).replace(/\s+/g, ' ') + (b < value.length ? '…' : '');
+}
+// per-sheet upsert — authoring one whole sheet never resends the rest. `opts.guard` (set by the
+// MCP path) makes a stale write fail instead of clobbering a human edit; REST passes guard:false.
+async function saveSheet(p, sheet, opts = {}) {
+  validateSheet(sheet);                                          // clear error before taking the lock
+  if (sheet.board && Array.isArray(sheet.board.nodes)) delete sheet.stations;   // commit v2: legacy spine superseded
+  return withWorkflowsTxn(p, { registerSelf: opts.registerSelf, guard: opts.guard }, (sheets) => {
+    const i = sheets.findIndex((s) => s && s.id === sheet.id);
+    const created = i < 0;
+    if (opts.guard && !created) enforceFreshness(p, sheet.id, revOfSheet(sheets[i]), opts);
+    if (created) sheets.push(sheet); else sheets[i] = sheet;
+    return { touched: [sheet.id], id: sheet.id, created, count: sheets.length, warnings: lintSheets([sheet]) };
+  });
+}
+async function deleteSheet(p, id, opts = {}) {
+  const r = await withWorkflowsTxn(p, { registerSelf: opts.registerSelf, guard: opts.guard }, (sheets) => {
+    const existing = sheets.find((s) => s && s.id === id);
+    if (!existing) throw new Error(`no such sheet: ${id}`);
+    if (opts.guard) enforceFreshness(p, id, revOfSheet(existing), opts);
+    const kept = sheets.filter((s) => !(s && s.id === id));
+    sheets.length = 0; sheets.push(...kept);
+    // intentionally KEEP the sheet's decisions in the review file: re-creating the
+    // sheet later recovers them, and they only render for questions that still exist.
+    return { touched: [], remaining: sheets.length };
+  });
+  return r.remaining;
 }
 async function reorderSheets(p, order) {
   if (!Array.isArray(order)) throw new Error('order must be an array of sheet ids');
-  const sheets = (await readWorkflows(p)).sheets || [];
-  const byId = new Map(sheets.filter((s) => s && s.id).map((s) => [s.id, s]));
-  const seen = new Set();
-  const out = [];
-  for (const id of order) { const s = byId.get(id); if (s && !seen.has(id)) { out.push(s); seen.add(id); } }
-  for (const s of sheets) { if (s && !seen.has(s.id)) out.push(s); }   // unlisted sheets keep their order at the end
-  await persistWorkflows(p, out);
-  return out.map((s) => s.id);
+  const r = await withWorkflowsTxn(p, {}, (sheets) => {
+    const byId = new Map(sheets.filter((s) => s && s.id).map((s) => [s.id, s]));
+    const seen = new Set(); const next = [];
+    for (const id of order) { const s = byId.get(id); if (s && !seen.has(id)) { next.push(s); seen.add(id); } }
+    for (const s of sheets) { if (s && !seen.has(s.id)) next.push(s); }   // unlisted sheets keep their order at the end
+    sheets.length = 0; sheets.push(...next);
+    return { touched: [], order: sheets.map((s) => s.id) };
+  });
+  return r.order;
 }
-// station-level edits within one sheet
-async function setStation(p, sheetId, station, index) {
-  validateStation(station, 'station');
-  const sheets = (await readWorkflows(p)).sheets || [];
-  const sheet = sheets.find((s) => s && s.id === sheetId);
-  if (!sheet) throw new Error(`no such sheet: ${sheetId}`);
-  sheet.stations = Array.isArray(sheet.stations) ? sheet.stations : [];
-  // validate the index SHAPE before deciding append-vs-replace, so a fractional
-  // or out-of-range index errors instead of silently appending.
-  if (index != null && (!Number.isInteger(index) || index < 0)) throw new Error('index must be a non-negative integer');
-  const len = sheet.stations.length;
-  let at, created;
-  if (index == null || index === len) { sheet.stations.push(station); at = len; created = true; }
-  else if (index < len) { sheet.stations[index] = station; at = index; created = false; }
-  else throw new Error(`index ${index} out of range (0..${len}); pass ${len} to append`);
-  await persistWorkflows(p, sheets);
-  return { index: at, count: sheet.stations.length, created };
+
+// GRANULAR write — edit one card/edge without resending the sheet. editBoard applies a board edit
+// (upsert/patch nodes & edges by id, delete by id) to the board addressed by `at` (a sheet id =
+// the root board, or sheetId/nodeId/… = that container node's child board). One atomic, validated,
+// concurrency-guarded write. Legacy stations migrate to a board on the first such edit.
+async function editBoard(p, at, edit, opts = {}) {
+  const { sheetId, segs } = parsePath(at);
+  return withWorkflowsTxn(p, { guard: opts.guard }, (sheets) => {
+    const i = sheets.findIndex((s) => s && s.id === sheetId);
+    if (i < 0) throw new Error(`no such sheet: ${sheetId} — create it with save_sheet first`);
+    if (opts.guard) enforceFreshness(p, sheetId, revOfSheet(sheets[i]), opts);   // before migrate/mutation
+    const sheet = migrateSheet(sheets[i]);
+    sheet.board = sheet.board || { nodes: [], edges: [], view: { x: 0, y: 0, zoom: 1 } };
+    const board = boardForSegs(sheet.board, segs, { createLast: true });
+    const summary = applyBoardEdit(board, edit || {});
+    sheets[i] = sheet;
+    return { touched: [sheetId], ...summary };
+  });
 }
-async function deleteStation(p, sheetId, index) {
-  const sheets = (await readWorkflows(p)).sheets || [];
-  const sheet = sheets.find((s) => s && s.id === sheetId);
-  if (!sheet) throw new Error(`no such sheet: ${sheetId}`);
-  const st = Array.isArray(sheet.stations) ? sheet.stations : [];
-  if (!Number.isInteger(index) || index < 0 || index >= st.length) throw new Error(`station index ${index} out of range (0..${st.length - 1})`);
-  const removedTitle = st[index] && st[index].title;
-  st.splice(index, 1);
-  // keep loop.to targets consistent: shift numeric targets past the gap, and drop
-  // any loop (numeric or title-based) that pointed at the station just removed.
-  for (const s of st) {
-    if (!s || !s.loop) continue;
-    if (typeof s.loop.to === 'number') {
-      if (s.loop.to === index) delete s.loop;         // its target is gone
-      else if (s.loop.to > index) s.loop.to -= 1;      // shifted one left
-    } else if (typeof s.loop.to === 'string' && s.loop.to === removedTitle) {
-      delete s.loop;                                   // title target removed
+// set_node: the one-card shorthand over editBoard. Patch-by-default — an absent leaf id ERRORS
+// unless create:true (a new node needs a title), so a typo can never silently spawn a phantom.
+async function setNode(p, rawPath, set, opts = {}) {
+  const { sheetId, segs } = parsePath(rawPath);
+  if (!segs.length) throw new Error('set_node path must include a node id: "sheetId/nodeId[/nodeId…]"');
+  const leafId = segs[segs.length - 1];
+  const parentSegs = segs.slice(0, -1);
+  return withWorkflowsTxn(p, { guard: opts.guard }, (sheets) => {
+    const i = sheets.findIndex((s) => s && s.id === sheetId);
+    if (i < 0) throw new Error(`no such sheet: ${sheetId}`);
+    if (opts.guard) enforceFreshness(p, sheetId, revOfSheet(sheets[i]), opts);
+    const sheet = migrateSheet(sheets[i]);
+    sheet.board = sheet.board || { nodes: [], edges: [], view: { x: 0, y: 0, zoom: 1 } };
+    const board = boardForSegs(sheet.board, parentSegs, { createLast: true });
+    const existing = board.nodes.find((n) => n && n.id === leafId);
+    let created = false;
+    if (existing) { mergeNode(existing, set || {}); }
+    else {
+      if (!opts.create) throw new Error(`no node "${leafId}" in "${[sheetId, ...parentSegs].join('/')}" — pass create:true to add it (a new node needs a title)`);
+      applyBoardEdit(board, { nodes: [{ id: leafId, ...(set || {}) }] });   // auto-places + requires a title
+      created = true;
     }
-  }
-  sheet.stations = st;
-  await persistWorkflows(p, sheets);
-  return { count: st.length };
+    sheets[i] = sheet;
+    return { touched: [sheetId], id: leafId, created };
+  });
 }
 
 /* ---------------- review store (params + comments + decisions) ---------------- */
@@ -713,10 +856,7 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} } },
   { name: 'get_algorithm', description: 'Read the full JSON spec of an algorithm storyboard (meta, kind, code, params, steps or builtin).',
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' } }, required: ['algorithm'] } },
-  { name: 'get_workflows', description: 'Read the workflow maps (the SHEETS data) shown in the Workflows view. ' +
-      'Pass "depth" (positive int) to include nested child boards only that many levels deep — a deeper node.board is replaced by a stub { nodes, path } you can fetch with get_node. Omit depth for the full tree (can be very large). Prefer list_sheets first, then get_sheet/get_node with depth.',
-    inputSchema: { type: 'object', properties: { depth: { type: 'integer' } } } },
-  { name: 'list_sheets', description: 'Table of contents: every sheet\'s id/code/name/title/sub + per-status node counts, with NO boards — the cheap way to see what exists before reading any board.',
+  { name: 'list_sheets', description: 'Table of contents: every sheet\'s id/code/name/title/sub + per-status node counts + its current rev (the concurrency token), with NO boards — the cheap way to see what exists before reading any board. Start here, then drill in with get_sheet / get_node.',
     inputSchema: { type: 'object', properties: {} } },
   { name: 'get_review', description: 'Read the saved review (tuned params + per-step comments + decisions) for an algorithm.',
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' } }, required: ['algorithm'] } },
@@ -724,6 +864,10 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} } },
   { name: 'list_shared', description: 'List shared components (transcluded boards): every sheet marked shared or mounted via a node.boardRef, with its single status, its deep-link url (#sheetId), and the cards that mount it. Derived, not stored.',
     inputSchema: { type: 'object', properties: {} } },
+  { name: 'find_nodes', description: 'Find / index workflow nodes by text or status, returning each match\'s node PATH so you jump straight to a card instead of drilling board by board. ' +
+      'Pass the path straight to get_node or set_node to read/patch that card. (For edit_board, whose "at" addresses a BOARD, use the card\'s PARENT board — drop the last id from the path — and reference the card\'s id in nodes[].) ' +
+      'With NO query it INDEXES every node across all sheets at every nesting depth. query = case-insensitive substring matched against a node\'s id / title / sub / detail.note / detail.in / detail.out / detail.open / algorithm (e.g. "Npgsql"). status = done|partial|todo filter. sheet = scope to one sheet (else the whole project). A boardRef mount shows as a leaf (→mounts <sheetId>); edit its contents on the source sheet.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' }, status: { type: 'string' }, sheet: { type: 'string' } } } },
 
   // author content
   { name: 'save_algorithm', description: 'Create or replace an algorithm storyboard from a JSON spec. ' +
@@ -735,38 +879,35 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { spec: { type: 'object' } }, required: ['spec'] } },
   { name: 'delete_algorithm', description: 'Delete an algorithm storyboard and its review. Persists.',
     inputSchema: { type: 'object', properties: { algorithm: { type: 'string' } }, required: ['algorithm'] } },
-  { name: 'save_workflows', description: 'REPLACE-ALL the workflow maps — this OVERWRITES every sheet; any sheet you omit is DELETED. ' +
-      'Almost always use save_sheet/set_station for edits instead. If you do use this, call get_workflows first and resend the full set. (The previous file is snapshotted to workflows.json.bak first.) ' +
-      'sheets = [ { id (slug), code (SHORT badge string like "WA-01" — NOT pseudocode; an algorithm spec\'s "code" is a different field), name, title, sub, stations[] } ]. ' +
-      'A station = { title, sub?, status (done|partial|todo), algorithm?, detail?{in[],out[],note,open[]}, loop?{to (station index OR a target station\'s title), label}, fan?{tracks[]} }. ' +
-      'A sheet may instead carry a v2 "board" { nodes[], edges[] } for the infinite-canvas / nested-chart form — see save_sheet for that shape. ' +
-      'Example sheet: { "id":"checkout", "code":"WF-02", "name":"Checkout", "title":"Order checkout", "sub":"…", "stations":[ {"title":"Validate cart","status":"done","detail":{"in":["cart"],"out":["valid cart"],"open":["allow backorders?"]}} ] }. ' +
-      'The response echoes which sheet ids were added/updated/removed plus lint warnings. Persists to this session\'s project.',
-    inputSchema: { type: 'object', properties: { sheets: { type: 'array' } }, required: ['sheets'] } },
-  { name: 'get_sheet', description: 'Read ONE workflow sheet by id (lighter than get_workflows). ' +
-      'A deeply nested sheet can still be huge — pass "depth" (positive int) to include nested child boards only that many levels deep (a deeper node.board becomes a stub { nodes, path } you fetch with get_node). Omit depth for the full sheet.',
+  { name: 'get_sheet', description: 'Read ONE workflow sheet by id. ' +
+      'A deeply nested sheet can be huge — pass "depth" (positive int) to include nested child boards only that many levels deep (a deeper node.board becomes a stub { nodes, path } you fetch with get_node). Omit depth for the full sheet. Reading a sheet records its rev so a later edit_board/set_node/save_sheet is rejected if a human changed it meanwhile (see save_sheet).',
     inputSchema: { type: 'object', properties: { sheet: { type: 'string' }, depth: { type: 'integer' } }, required: ['sheet'] } },
   { name: 'get_node', description: 'Read ONE node addressed by the same #sheet/nodeId/nodeId path the URL hash uses (or a stub\'s more.path) — jump straight to one pillar/sub-board instead of dumping the whole sheet. ' +
-      'Returns that node with its own child board pruned to "depth" (default 1; deeper child boards become { nodes, path } stubs).',
+      'Returns that node with its own child board pruned to "depth" (default 1; deeper child boards become { nodes, path } stubs). To EDIT what you read here, use set_node (one card) or edit_board (a whole board) — never resend the sheet.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' }, depth: { type: 'integer' } }, required: ['path'] } },
   { name: 'save_sheet', description: 'Upsert ONE workflow sheet by id — create it or replace it in place WITHOUT resending the others. ' +
       'sheet = { id (slug), code (SHORT badge), name, title, sub, schema? (2 for the v2 board form), shared? (true ⇒ this sheet is a reusable COMPONENT other sheets mount), status? (done|partial|todo — a shared component\'s single status, mirrored by every mount), AND EITHER legacy stations[] OR a v2 "board" }. ' +
       'A v2 board (the infinite-canvas / nested-chart form the app now renders) = { nodes:[ NODE ], edges:[ EDGE ], view?:{x,y,zoom} }. ' +
       'NODE = { id (unique within this board), x, y, w?, h? (local px), title, sub?, status (done|partial|todo), detail?{in[],out[],note,open[]}, algorithm?, board? (a NESTED child board — revealed by zooming into the node), boardRef? (TRANSCLUDE another sheet by id instead of owning a board — mounts that shared component live+read-only and inherits its status; mutually exclusive with board; see list_shared) }. ' +
       'EDGE = { id, from (node id in THIS board), to (node id in THIS board), kind? (flow|loop|dep), label?, fromSide? (top|right|bottom|left — the side the edge leaves the source node) } — edges are intra-board only; link across levels by nesting, not by an edge. ' +
-      'Legacy stations[] sheets still load and auto-migrate to a board on read. Returns created-or-updated + lint warnings. Persists to this session\'s project.',
-    inputSchema: { type: 'object', properties: { sheet: { type: 'object' } }, required: ['sheet'] } },
-  { name: 'delete_sheet', description: 'Delete ONE workflow sheet by id. Persists.',
-    inputSchema: { type: 'object', properties: { sheet: { type: 'string' } }, required: ['sheet'] } },
+      'Legacy stations[] sheets still load and auto-migrate to a board on read. Use this to CREATE a sheet or rewrite it wholesale; for surgical edits to an existing sheet prefer edit_board / set_node (they don\'t resend the tree). ' +
+      'CONCURRENCY: pass "baseRev" (a sheet\'s rev from list_sheets or a prior write) to make the write FAIL if the sheet changed since — by default a write is auto-rejected if a human edited the sheet in the app since you last read it; pass force:true to overwrite anyway. Returns created-or-updated + the new rev + lint warnings. Persists to this session\'s project.',
+    inputSchema: { type: 'object', properties: { sheet: { type: 'object' }, baseRev: { type: 'string' }, force: { type: 'boolean' } }, required: ['sheet'] } },
+  { name: 'delete_sheet', description: 'Delete ONE workflow sheet by id (pass baseRev/force as in save_sheet to guard against a concurrent human edit). Persists.',
+    inputSchema: { type: 'object', properties: { sheet: { type: 'string' }, baseRev: { type: 'string' }, force: { type: 'boolean' } }, required: ['sheet'] } },
   { name: 'reorder_sheets', description: 'Reorder the sheets in the left index. order = [id, …]; any sheet id you omit keeps its order at the end. Persists.',
     inputSchema: { type: 'object', properties: { order: { type: 'array', items: { type: 'string' } } }, required: ['order'] } },
-  { name: 'set_station', description: 'Add or replace ONE station inside a sheet WITHOUT resending the rest. ' +
-      'With "index" in range it replaces that station; omit index (or pass the current length) to append. station shape as in save_workflows. Returns the resulting index. Persists.',
-    inputSchema: { type: 'object', properties: { sheet: { type: 'string' }, station: { type: 'object' }, index: { type: 'number' } }, required: ['sheet', 'station'] } },
-  { name: 'delete_station', description: 'Delete the station at "index" within a sheet (numeric loop.to targets are shifted to stay consistent). Persists.',
-    inputSchema: { type: 'object', properties: { sheet: { type: 'string' }, index: { type: 'number' } }, required: ['sheet', 'index'] } },
-  { name: 'get_workflow_review', description: 'Read recorded decisions on workflow open questions: { decisions: { <sheetId>: { <question text>: { answer, by, at } } } }.',
-    inputSchema: { type: 'object', properties: {} } },
+  { name: 'edit_board', description: 'GRANULAR write — edit cards & connections in ONE board WITHOUT resending the sheet. This is the primary way to keep the diagram in sync as you work (mark a card done, add a step, wire two cards). ' +
+      '"at" addresses the board: the sheet id = its ROOT board, or "sheetId/nodeId/…" = the child board inside that container node (every non-leaf node on the path must already exist; only a leaf container\'s missing board is created so you can author into it). ' +
+      'nodes[] UPSERT-MERGE by id: an existing id patches just the fields you pass (top-level keys replace; "detail" merges per key — set {detail:{note}} and detail.in/out/open are untouched; a null value CLEARS a field; an array replaces the whole array); a new id CREATES the node (needs a title; auto-placed below the board\'s bbox — pass x/y to override). ' +
+      'edges[] upsert by id (omit id to create one; from/to must be node ids in THIS board; kind? flow|loop|dep, label?, fromSide? top|right|bottom|left). deleteNodes[] removes nodes (and cascades their incident edges); deleteEdges[] removes edges by id. ' +
+      'One atomic, validated write. CONCURRENCY: auto-rejected if a human edited the sheet in the app since you last read it (re-read & re-apply, or pass force:true); pass baseRev (from list_sheets / a prior write) to pin it explicitly. Returns what changed + the new rev. Persists.',
+    inputSchema: { type: 'object', properties: { at: { type: 'string' }, nodes: { type: 'array' }, edges: { type: 'array' }, deleteNodes: { type: 'array', items: { type: 'string' } }, deleteEdges: { type: 'array', items: { type: 'string' } }, baseRev: { type: 'string' }, force: { type: 'boolean' } }, required: ['at'] } },
+  { name: 'set_node', description: 'Shorthand to edit ONE card: patch a single node addressed by its "sheetId/nodeId[/nodeId…]" path (the URL-hash form get_node uses). ' +
+      '"set" is merged into the node with the same rules as edit_board.nodes[] (top-level replaces; detail merges per key; null clears; arrays replace). ' +
+      'PATCH-by-default: if the node does not exist this ERRORS (so a typo can\'t silently create a phantom) — pass create:true to add it (a new node needs a title). For edges, deletes, or several cards at once, use edit_board. ' +
+      'CONCURRENCY: same auto-guard as edit_board (baseRev / force). Returns created|updated + the new rev. Persists.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, set: { type: 'object' }, create: { type: 'boolean' }, baseRev: { type: 'string' }, force: { type: 'boolean' } }, required: ['path'] } },
   { name: 'set_workflow_decision', description: 'Answer a workflow open question — record a decision against a station/track open[] item, identified by its sheet id and the EXACT question text (see list_open_questions). Persists.',
     inputSchema: { type: 'object', properties: { sheet: { type: 'string' }, question: { type: 'string' }, answer: { type: 'string' }, by: { type: 'string' } }, required: ['sheet', 'question', 'answer'] } },
   { name: 'reopen_workflow_question', description: 'Clear a recorded decision so a workflow open question is open again. Persists.',
@@ -801,7 +942,7 @@ async function callTool(name, args) {
   const needsStep = new Set(['set_comment', 'set_decision', 'reopen_question']);
   if (needsStep.has(name) && (!Number.isInteger(a.step) || a.step < 0)) throw new Error('step must be a non-negative integer');
   if (name === 'set_param' && !Number.isFinite(a.value)) throw new Error('value must be a finite number');
-  const needsSheet = new Set(['get_sheet', 'delete_sheet', 'set_station', 'delete_station', 'set_workflow_decision', 'reopen_workflow_question']);
+  const needsSheet = new Set(['get_sheet', 'delete_sheet', 'set_workflow_decision', 'reopen_workflow_question']);
   if (needsSheet.has(name) && !safeId(a.sheet)) throw new Error('invalid or missing sheet id (slug)');
   if (a.depth != null && (!Number.isInteger(a.depth) || a.depth < 1)) throw new Error('depth must be a positive integer');
   const p = CURRENT_PROJECT;   // this server process is bound to one project (its launch dir)
@@ -811,13 +952,37 @@ async function callTool(name, args) {
       return algs.map((id) => `${id}${existsSync(reviewPath(p, id)) ? ' (review saved)' : ''}`).join('\n') || '(none)';
     }
     case 'get_algorithm': return JSON.stringify(await readAlgorithm(p, a.algorithm), null, 2);
-    case 'get_workflows': {
-      const wf = await readWorkflows(p);
-      if (a.depth == null) return JSON.stringify(wf, null, 2);
-      return JSON.stringify({ ...wf, sheets: (wf.sheets || []).map((s) => pruneSheet(migrateSheet(s), a.depth)) }, null, 2);
+    case 'list_sheets': {
+      const rows = await listSheets(p);
+      // Deliberately NOT noteSeen here: the TOC carries no board CONTENT, so arming the
+      // freshness baseline from it would let a later save_sheet pass the guard against a sheet
+      // whose content was never actually read — masking a human edit. Only get_sheet/get_node
+      // (which reveal content) arm the baseline; the rev is returned so a caller may pin baseRev.
+      return JSON.stringify(rows, null, 2);
     }
-    case 'list_sheets': return JSON.stringify(await listSheets(p), null, 2);
-    case 'get_node': return JSON.stringify(await getNode(p, a.path, a.depth), null, 2);
+    case 'get_node': {
+      const node = await getNode(p, a.path, a.depth);
+      try { const { sheetId } = parsePath(a.path); noteSeen(p, sheetId, revOfSheet(await getSheet(p, sheetId))); } catch { /* path already validated by getNode */ }
+      return JSON.stringify(node, null, 2);
+    }
+    case 'find_nodes': {
+      if (a.query != null && typeof a.query !== 'string') throw new Error('query must be a string');
+      if (a.status != null && !STATUSES.has(a.status)) throw new Error(`status must be one of: ${[...STATUSES].join(', ')}`);
+      if (a.sheet != null && !safeId(a.sheet)) throw new Error('sheet must be a slug');
+      const rows = await findNodes(p, { query: a.query, status: a.status, sheet: a.sheet });
+      if (!rows.length) return '(no matching nodes)';
+      const CAP = 200, q = (a.query || '').toLowerCase();
+      const lines = rows.slice(0, CAP).map((r) => {
+        const tag = r.boardRef ? `  (→mounts ${r.boardRef})` : (r.children ? `  (${r.children} inside)` : '');
+        const f = r.match && r.match.field;
+        // show match context only when it adds info beyond the title/path (the id is already in the path)
+        const ctx = (f && !['title', 'all', 'id'].includes(f)) ? `  — ${f}: "${matchSnippet(r.match.value, q)}"` : '';
+        // otherwise surface the sub so same-titled cards are distinguishable without a follow-up read
+        const sub = (!ctx && r.sub) ? `  · ${r.sub.length > 44 ? r.sub.slice(0, 44) + '…' : r.sub}` : '';
+        return `${r.path}  [${r.status}]  ${r.title}${sub}${tag}${ctx}`;
+      });
+      return lines.join('\n') + `\n\n${rows.length} node(s)` + (rows.length > CAP ? ` — showing ${CAP}; narrow with query/status/sheet` : '') + '.';
+    }
     case 'list_shared': {
       const rows = await listShared(p);
       if (!rows.length) return '(no shared components yet — mark a sheet shared:true and mount it from cards via node.boardRef:"<sheetId>")';
@@ -868,50 +1033,42 @@ async function callTool(name, args) {
       await deleteAlgorithm(p, a.algorithm);
       return `deleted algorithm "${a.algorithm}"`;
     }
-    case 'save_workflows': {
-      const beforeIds = new Set(((await readWorkflows(p)).sheets || []).map((s) => s && s.id));
-      const incoming = Array.isArray(a.sheets) ? a.sheets : [];
-      const afterIds = new Set(incoming.map((s) => s && s.id));
-      const added = [...afterIds].filter((id) => !beforeIds.has(id));
-      const removed = [...beforeIds].filter((id) => !afterIds.has(id));
-      const updated = [...afterIds].filter((id) => beforeIds.has(id));
-      const n = await withSheetLock(p, () => writeWorkflows(p, a.sheets));
-      openInBrowser('/');
-      const warns = lintSheets(incoming);
-      return `saved ${n} sheet(s) — added: [${added.join(', ')}]  updated: [${updated.join(', ')}]  removed: [${removed.join(', ')}]` +
-        (warns.length ? `\n⚠ ${warns.join('\n⚠ ')}` : '');
-    }
     case 'get_sheet': {
       const s = await getSheet(p, a.sheet);
+      noteSeen(p, a.sheet, revOfSheet(s));               // record the rev we hand out, for the stale-write guard
       return JSON.stringify(a.depth == null ? s : pruneSheet(migrateSheet(s), a.depth), null, 2);
     }
     case 'save_sheet': {
-      const r = await withSheetLock(p, () => saveSheet(p, a.sheet));
+      const r = await saveSheet(p, a.sheet, { guard: true, baseRev: a.baseRev, force: a.force });
       openInBrowser('/');
-      return `${r.created ? 'created' : 'updated'} sheet "${r.id}" (${r.count} sheet(s) total)` +
+      return `${r.created ? 'created' : 'updated'} sheet "${r.id}" (${r.count} sheet(s) total) [rev ${r.rev}]` +
         (r.warnings.length ? `\n⚠ ${r.warnings.join('\n⚠ ')}` : '');
     }
     case 'delete_sheet': {
-      const n = await withSheetLock(p, () => deleteSheet(p, a.sheet));
+      const n = await deleteSheet(p, a.sheet, { guard: true, baseRev: a.baseRev, force: a.force });
       openInBrowser('/');
       return `deleted sheet "${a.sheet}" (${n} remaining)`;
     }
     case 'reorder_sheets': {
-      const order = await withSheetLock(p, () => reorderSheets(p, a.order));
+      const order = await reorderSheets(p, a.order);
       openInBrowser('/');
       return `sheet order: ${order.join(', ')}`;
     }
-    case 'set_station': {
-      const r = await withSheetLock(p, () => setStation(p, a.sheet, a.station, a.index));
+    case 'edit_board': {
+      const r = await editBoard(p, a.at, { nodes: a.nodes, edges: a.edges, deleteNodes: a.deleteNodes, deleteEdges: a.deleteEdges }, { guard: true, baseRev: a.baseRev, force: a.force });
       openInBrowser('/');
-      return `${r.created ? 'added' : 'replaced'} station #${r.index} in "${a.sheet}" (${r.count} station(s))`;
+      const parts = [];
+      if (r.created.length) parts.push(`created ${r.created.join(', ')}`);
+      if (r.updated.length) parts.push(`updated ${r.updated.join(', ')}`);
+      if (r.deletedNodes.length) parts.push(`−nodes ${r.deletedNodes.join(', ')}`);
+      if (r.deletedEdges.length) parts.push(`−edges ${r.deletedEdges.join(', ')}`);
+      return `edited board "${a.at}" — ${parts.join(' · ') || 'no change'} [rev ${r.rev}]`;
     }
-    case 'delete_station': {
-      const r = await withSheetLock(p, () => deleteStation(p, a.sheet, a.index));
+    case 'set_node': {
+      const r = await setNode(p, a.path, a.set || {}, { guard: true, create: a.create, baseRev: a.baseRev, force: a.force });
       openInBrowser('/');
-      return `deleted station #${a.index} from "${a.sheet}" (${r.count} remaining)`;
+      return `${r.created ? 'created' : 'updated'} node "${r.id}" in "${parsePath(a.path).sheetId}" [rev ${r.rev}]`;
     }
-    case 'get_workflow_review': return JSON.stringify(await readWorkflowReview(p), null, 2);
     case 'set_workflow_decision': {
       if (!a.answer || !a.answer.trim()) throw new Error('answer is required');
       const exists = (await workflowQuestions(p)).some((q) => q.sheet === a.sheet && q.text === a.question);
@@ -988,9 +1145,10 @@ async function dispatch(msg) {
           instructions:
             'Workflow Atlas lets you SHOW algorithms/workflows as visuals instead of describing them. ' +
             'When the user says they have reviewed, commented, or answered the open questions in the app, ' +
-            'call list_open_questions (and get_review / get_workflow_review) to read their decisions back, ' +
+            'call list_open_questions (and get_review) to read their decisions back, ' +
             'then revise the affected storyboards/sheets and summarize what changed — this closes the review loop. ' +
-            'Prefer the per-piece tools (save_sheet, set_station) over save_workflows, which replaces ALL sheets.',
+            'Keep the diagram in sync as you work with the GRANULAR tools — set_node (one card) and edit_board (cards+edges in one board) — instead of resending a whole sheet; reach for save_sheet only to create a sheet or rewrite it wholesale. ' +
+            'Reads record a freshness token, so an edit is auto-rejected if the human changed that sheet in the app meanwhile — re-read and re-apply rather than forcing.',
         });
       case 'ping': return ok({});
       case 'tools/list': return ok({ tools: TOOLS });
@@ -1084,7 +1242,7 @@ try {
     // "proj/reviews", "proj/reviews/x.json" — not just the "/reviews/" infix (a bare
     // "proj/reviews" dir event has no trailing slash and used to slip through, reloading
     // the page on every comment keystroke).
-    if (/(^|\/)reviews(\/|$)/.test(f) || f.endsWith('.bak') || f.includes('.tmp-')) return;
+    if (/(^|\/)reviews(\/|$)/.test(f) || f.endsWith('.bak') || f.endsWith('.lock') || f.includes('.tmp-')) return;
     const proj = f.split('/')[0];
     // A review write can also surface as a fileless project-dir event ("proj") with no
     // path to match above. If we just wrote a review for this project, that's what this
@@ -1151,7 +1309,7 @@ async function handleApi(req, res, url) {
         if (!isLocalRequest(req)) return json(res, 403, { error: 'local requests only' });
         try {
           const obj = JSON.parse(await readBody(req));
-          const n = await withSheetLock(proj, () => writeWorkflows(proj, obj && obj.sheets != null ? obj.sheets : obj, true));
+          const n = await writeWorkflows(proj, obj && obj.sheets != null ? obj.sheets : obj, true);   // writeWorkflows owns the txn/lock
           return json(res, 200, { ok: true, count: n });
         } catch (e) { return json(res, 400, { error: e.message }); }
       }
@@ -1170,13 +1328,15 @@ async function handleApi(req, res, url) {
           const obj = JSON.parse(await readBody(req));
           const sheet = obj && obj.sheet ? obj.sheet : obj;
           if (!sheet || sheet.id !== id) return json(res, 400, { error: 'body sheet.id must match the URL' });
-          const r = await withSheetLock(proj, () => saveSheet(proj, sheet, true));   // registerSelf ⇒ our own tab won't reload
+          // The human's own edit: registerSelf ⇒ our tab won't reload; guard:false ⇒ it always lands and
+          // bumps the rev (which is exactly what makes a later stale AI write get rejected).
+          const r = await saveSheet(proj, sheet, { registerSelf: true });
           return json(res, 200, { ok: true, saved: r });
         } catch (e) { return json(res, 400, { error: e.message }); }
       }
       if (req.method === 'DELETE') {
         if (!isLocalRequest(req)) return json(res, 403, { error: 'local requests only' });
-        try { const n = await withSheetLock(proj, () => deleteSheet(proj, id, true)); return json(res, 200, { ok: true, remaining: n }); }
+        try { const n = await deleteSheet(proj, id, { registerSelf: true }); return json(res, 200, { ok: true, remaining: n }); }
         catch (e) { return json(res, 400, { error: e.message }); }
       }
       return json(res, 405, { error: 'GET, PUT, or DELETE' });

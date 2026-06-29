@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   validateBoard, boardAtPath, pathChain, nextId, boardBBox,
+  parsePath, boardForSegs, mergeNode, applyBoardEdit, indexNodes, matchNode, NODE_W, COL_X,
 } from '../../shared/board.js';
 
 const node = (id, extra = {}) => ({ id, title: id, x: 0, y: 0, w: 240, h: 96, ...extra });
@@ -104,6 +105,89 @@ test('validateBoard accepts a boardRef slug and rejects board+boardRef together'
   assert.doesNotThrow(() => validateBoard(board([node('n1', { boardRef: 'ai-review' })]), 'board', 0, () => {}));
   assert.throws(() => validateBoard(board([node('n1', { boardRef: 'Not A Slug' })]), 'board', 0, () => {}), /boardRef must be a sheet-id slug/);
   assert.throws(() => validateBoard(board([node('n1', { boardRef: 'x', board: board() })]), 'board', 0, () => {}), /private \(board\) OR shared \(boardRef\)/);
+});
+
+/* ---------------- granular editing: parsePath / boardForSegs / mergeNode / applyBoardEdit ---------------- */
+test('parsePath splits sheet + node segments and rejects bad input', () => {
+  assert.deepEqual(parsePath('checkout/n3'), { sheetId: 'checkout', segs: ['n3'] });
+  assert.deepEqual(parsePath('#checkout/n1/n2'), { sheetId: 'checkout', segs: ['n1', 'n2'] });
+  assert.deepEqual(parsePath('checkout'), { sheetId: 'checkout', segs: [] });
+  assert.throws(() => parsePath(''), /empty path/);
+  assert.throws(() => parsePath('Bad Id/n1'), /invalid sheet id/);
+});
+
+test('boardForSegs descends, errors on a typo, refuses a boardRef, and createLast adds a leaf board', () => {
+  const leaf = board([node('z')]);
+  const mid = board([node('m1', { board: leaf })]);
+  const root = board([node('n1', { board: mid })]);
+  assert.equal(boardForSegs(root, []), root);
+  assert.equal(boardForSegs(root, ['n1']), mid);
+  assert.equal(boardForSegs(root, ['n1', 'm1']), leaf);
+  assert.throws(() => boardForSegs(root, ['nope']), /no node/);            // a typo errors, never vivifies
+  assert.throws(() => boardForSegs(board([node('x')]), ['x', 'y']), /no child board/);  // non-leaf must already nest
+  assert.throws(() => boardForSegs(board([node('r1', { boardRef: 'svc' })]), ['r1']), /shared component/);
+  const c = board([node('p')]);
+  const made = boardForSegs(c, ['p'], { createLast: true });               // only the LEAF's board is created
+  assert.ok(made && Array.isArray(made.nodes) && c.nodes[0].board === made);
+});
+
+test('mergeNode: top-level replaces, detail merges per key, null clears, id is fixed', () => {
+  const n = { id: 'n1', title: 't', detail: { in: ['a'], note: 'old', open: ['q1'] } };
+  mergeNode(n, { status: 'done', detail: { note: 'new', open: ['q1', 'q2'] } });
+  assert.equal(n.status, 'done');
+  assert.deepEqual(n.detail.in, ['a']);          // untouched detail key survives
+  assert.equal(n.detail.note, 'new');            // replaced
+  assert.deepEqual(n.detail.open, ['q1', 'q2']); // array fully replaced
+  mergeNode(n, { detail: { note: null } });      // null clears a key inside detail
+  assert.ok(!('note' in n.detail));
+  mergeNode(n, { sub: 's' }); assert.equal(n.sub, 's');
+  mergeNode(n, { sub: null }); assert.ok(!('sub' in n));   // null clears a top-level field
+  mergeNode(n, { id: 'CHANGED' }); assert.equal(n.id, 'n1');  // id is addressing, never merged
+});
+
+test('applyBoardEdit upserts/patches/deletes nodes & edges, cascading incident edges', () => {
+  const b = board([node('n1'), node('n2')], [{ id: 'e1', from: 'n1', to: 'n2', kind: 'flow' }]);
+  let sum = applyBoardEdit(b, { nodes: [{ id: 'n1', status: 'done' }] });
+  assert.deepEqual(sum.updated, ['n1']);
+  assert.equal(b.nodes.find((n) => n.id === 'n1').status, 'done');
+
+  sum = applyBoardEdit(b, { nodes: [{ id: 'n3', title: 'Three', status: 'todo' }] });
+  assert.deepEqual(sum.created, ['n3']);
+  const n3 = b.nodes.find((n) => n.id === 'n3');
+  assert.equal(n3.title, 'Three'); assert.equal(n3.w, NODE_W); assert.equal(n3.x, COL_X);
+  assert.throws(() => applyBoardEdit(b, { nodes: [{ id: 'n4' }] }), /requires a title/);  // create needs a title
+
+  sum = applyBoardEdit(b, { edges: [{ from: 'n2', to: 'n3' }] });          // new edge gets an auto id
+  assert.ok(sum.created.some((x) => x.startsWith('edge:')));
+  assert.ok(b.edges.find((e) => e.from === 'n2' && e.to === 'n3'));
+
+  sum = applyBoardEdit(b, { deleteNodes: ['n2'] });                        // delete cascades its edges
+  assert.deepEqual(sum.deletedNodes, ['n2']);
+  assert.ok(!b.nodes.find((n) => n.id === 'n2'));
+  assert.ok(!b.edges.find((e) => e.from === 'n2' || e.to === 'n2'));       // e1 and n2→n3 both gone
+  assert.throws(() => applyBoardEdit(b, { deleteNodes: ['zzz'] }), /no node/);
+  assert.throws(() => applyBoardEdit(b, { deleteEdges: ['nope'] }), /no edge/);
+});
+
+test('indexNodes flattens every node with its path, descends inline boards, treats boardRef as a leaf', () => {
+  const leaf = board([node('z')]);
+  const mid = board([node('m1', { board: leaf }), node('m2', { boardRef: 'other' })]);
+  const root = board([node('n1', { board: mid }), node('n2')]);
+  const paths = indexNodes(root, 'sheet').map((x) => x.path);
+  assert.deepEqual(paths, ['sheet/n1', 'sheet/n1/m1', 'sheet/n1/m1/z', 'sheet/n1/m2', 'sheet/n2']);
+  assert.ok(paths.includes('sheet/n1/m2') && !paths.some((p) => p.startsWith('sheet/n1/m2/')));  // boardRef = leaf, not descended
+});
+
+test('matchNode searches id/title/sub/note/in/out/open/algorithm, case-insensitive', () => {
+  const n = node('pg', { title: 'PostgreSQL', sub: ':5433', algorithm: 'anomaly-score',
+    detail: { in: ['SQL via Npgsql'], out: ['Rows'], note: 'EF model', open: [] } });
+  assert.equal(matchNode(n, 'postgres').field, 'title');
+  assert.equal(matchNode(n, 'npgsql').field, 'in');          // case-insensitive, inside detail.in
+  assert.equal(matchNode(n, 'ef model').field, 'note');
+  assert.equal(matchNode(n, 'anomaly').field, 'algorithm');
+  assert.equal(matchNode(n, ':5433').field, 'sub');
+  assert.equal(matchNode(n, 'nonexistent'), null);
+  assert.equal(matchNode(n, '').field, 'all');               // empty query = index mode (matches everything)
 });
 
 test('boardAtPath / pathChain resolve a boardRef via the injected childOf resolver', () => {

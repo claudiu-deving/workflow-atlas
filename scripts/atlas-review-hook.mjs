@@ -22,12 +22,27 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 const debug = (...a) => { if (process.env.ATLAS_HOOK_DEBUG) process.stderr.write('[atlas-review-hook] ' + a.join(' ') + '\n'); };
 const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'default';
+// MUST mirror the server's resolveProjectName so the hook reads the SAME project the server wrote
+// — the git common-dir is shared by all worktrees, so a worktree session lands on the one project.
+function resolveProject() {
+  if (process.env.WORKFLOW_ATLAS_PROJECT) return slug(process.env.WORKFLOW_ATLAS_PROJECT);
+  const base = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  try {
+    const r = spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd: base, encoding: 'utf8', timeout: 2000 });
+    if (r.status === 0 && r.stdout && r.stdout.trim()) {
+      const repoRoot = path.basename(path.dirname(path.resolve(base, r.stdout.trim())));
+      if (repoRoot && repoRoot !== '.' && repoRoot !== path.sep) return slug(repoRoot);
+    }
+  } catch { /* not a git repo — fall through */ }
+  return slug(path.basename(base));
+}
 
 try {
-  const project = slug(process.env.WORKFLOW_ATLAS_PROJECT || path.basename(process.env.CLAUDE_PROJECT_DIR || process.cwd()));
+  const project = resolveProject();
   const home = process.env.WORKFLOW_ATLAS_HOME || path.join(os.homedir(), '.workflow-atlas');
   const CONTENT = process.env.ATLAS_CONTENT_DIR || path.join(home, 'projects', project);
   const ALG_DIR = path.join(CONTENT, 'algorithms');
@@ -82,7 +97,21 @@ try {
         else unit.open++;
       }
     };
-    for (const st of s.stations || []) {
+    // v2 board sheets carry questions on node.detail.open at any nesting depth — walk them
+    // recursively (mirrors the server's workflowQuestions); a granular edit migrates legacy
+    // sheets to a board, so walking ONLY stations would silently drop their questions.
+    const walkBoard = (b, prefix) => {
+      for (const n of (b && b.nodes) || []) {
+        const where = prefix + (n.title || 'node');
+        collect(n.detail, where);
+        if (n.board) walkBoard(n.board, `${where} › `);
+      }
+    };
+    // A board supersedes the legacy spine (migrateSheet early-returns for schema:2), so walk
+    // stations ONLY when there's no board — else a stray leftover stations[] would surface
+    // phantom questions the server's workflowQuestions never registers (un-answerable).
+    if (s.board) walkBoard(s.board, '');
+    else for (const st of s.stations || []) {
       collect(st.detail, st.title || 'station');
       for (const t of (st.fan && st.fan.tracks) || []) collect(t.detail, `${st.title} › ${t.title}`);
     }
@@ -128,7 +157,7 @@ try {
 
   let ctx = `Workflow Atlas review: all open questions are now answered for ${names}. `
     + `Read these decisions back and revise the affected storyboards/workflows over MCP `
-    + `(set_param / save_algorithm / save_sheet / set_station etc.), then summarize what you changed.\n\nDecisions:\n`;
+    + `(set_param / save_algorithm / set_node / edit_board etc.), then summarize what you changed.\n\nDecisions:\n`;
   for (const d of decisions) ctx += `- [${d.where}] ${d.question}\n    → ${d.answer}${d.by ? ` (${d.by})` : ''}\n`;
   if (comments.length) {
     ctx += `\nComments:\n`;
