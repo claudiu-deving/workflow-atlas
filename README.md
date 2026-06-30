@@ -56,7 +56,7 @@ excluded, so typing a comment never reloads under you). A server is **required**
 the app fetches project data from `/api`, and that data lives in your home dir,
 not in the served folder.
 
-When the assistant **authors** a workflow or storyboard (`save_workflows` /
+When the assistant **authors** a workflow or storyboard (`save_sheet` / `edit_board` /
 `save_algorithm`) and no tab is open yet, the server **opens the app in your
 default browser** so the result is in front of you; if a tab is already open it
 just live-reloads instead. Disable the auto-open with `ATLAS_NO_OPEN=1`.
@@ -79,15 +79,17 @@ under a home directory — `~/.workflow-atlas/projects/<project>/` by default,
 override the base with `$WORKFLOW_ATLAS_HOME`. So one install serves many projects,
 and parallel sessions stay isolated.
 
-- **Routing.** Each server process is bound to **one** project: by default the
-  directory it was launched in (so an MCP client opened in repo `acme` authors the
-  `acme` project automatically). Set `$WORKFLOW_ATLAS_PROJECT` to pick one
-  explicitly. The UI has a **project switcher** (top-left) to view any project, and
-  the active project shows in the browser tab title.
+- **Routing.** Each server process is bound to **one** project: by default the **git
+  repo root** (so an MCP client opened in repo `acme` — or any of its **git worktrees** —
+  authors the one `acme` project), else the launch directory's name when it isn't a git
+  repo. Set `$WORKFLOW_ATLAS_PROJECT` to pick one explicitly. The UI has a **project
+  switcher** (top-left) to view any project, and the active project shows in the tab title.
 - **Isolation & concurrency.** Different-project sessions never contend; writes are
-  atomic (temp-file + rename) so a torn write or two same-project sessions can't
-  corrupt a file. The destructive `save_workflows` (replace-all) snapshots the prior
-  file to `workflows.json.bak` first.
+  atomic (temp-file + rename) and serialized by a **cross-process lock**, so a torn write
+  or two same-project sessions (e.g. parallel worktrees) can't corrupt or silently drop a
+  file. Each sheet also carries a **`rev`** token: an MCP edit is rejected if the sheet
+  changed since the assistant last read it, so it can't overwrite a concurrent human edit.
+  The in-app **replace-all** save snapshots the prior file to `workflows.json.bak` first.
 - **Seeding.** New projects start empty; `WORKFLOW_ATLAS_SEED=1` copies the bundled
   demos into a fresh project.
 
@@ -148,21 +150,23 @@ depth itself is unbounded.
 All content is **JSON** — no diagram syntax, no code — stored per project under
 `$WORKFLOW_ATLAS_HOME` (see [Projects](#projects)) and edited through the **MCP
 tools** (the assistant authors it; changes show on reload). For workflows, prefer
-the **per-sheet** tools (`save_sheet`, `delete_sheet`, `reorder_sheets`) over the
-replace-all `save_workflows` — they edit one piece without resending the rest.
-`save_sheet` takes a whole sheet including its nested `board` (see
-[the data shapes](#data-shapes) above); `set_station` / `delete_station` upsert one
-station in the **legacy spine** shorthand.
+the **granular** tools — `set_node` (one card) and `edit_board` (cards + edges in one
+board) — which edit one piece without resending the rest; reach for `save_sheet`
+only to **create** a sheet or rewrite it wholesale (`delete_sheet` / `reorder_sheets`
+manage the set). `save_sheet` takes a whole sheet including its nested `board` (see
+[the data shapes](#data-shapes) above); a **legacy `stations[]` spine** is still
+accepted and auto-migrates to a board on read.
 
-`save_sheet` / `save_workflows` **reject** a non-slug `id`, a `code` that isn't a
-short string, a bad `status`, and non-string `detail.open/in/out` (and
-`save_workflows` also rejects duplicate sheet ids); the response echoes non-fatal
-**lint warnings** (overlong badge, a sheet with no stations, a `loop.to` title with
-no matching station, an open question whose exact text repeats within a sheet).
-Deleting a sheet **keeps** its recorded decisions, so re-creating the same id later
-recovers them. The destructive `save_workflows` (replace-all) snapshots the prior
-file to the project's `workflows.json.bak` first, so an accidental reset is
-recoverable until the next replace-all.
+The write tools **reject** a non-slug `id`, a `code` that isn't a short string, a bad
+`status`, non-string `detail.open/in/out`, a dangling edge, a duplicate node/sheet id,
+and a `board`+`boardRef` conflict; `save_sheet` echoes non-fatal **lint warnings**
+(overlong badge, an empty sheet, an open question whose exact text repeats within a
+sheet). Every workflow write is serialized by a cross-process lock and carries a
+per-sheet **`rev`** token, so a stale assistant edit is rejected rather than
+overwriting a concurrent human edit (re-read, or pass `force`). Deleting a sheet
+**keeps** its recorded decisions, so re-creating the same id later recovers them. The
+in-app **replace-all** save snapshots the prior file to `workflows.json.bak` first, so
+an accidental reset is recoverable until the next replace-all.
 
 ## Algorithm storyboards
 
@@ -222,15 +226,17 @@ Claude Code launches it) *and* at `/mcp` over HTTP (for manual testing). Every t
 acts on the session's project. Tools:
 
 - **Read** — `list_algorithms`, `get_algorithm`, `list_sheets` (TOC: ids + status
-  counts, no boards), `get_workflows`, `get_sheet`, `get_node` (one node by its
-  `#sheet/nodeId/…` path), `get_review`, `get_workflow_review`, `list_open_questions`.
-  `get_workflows` / `get_sheet` take an optional `depth` (positive int) that includes
-  nested boards only that many levels deep — a deeper `node.board` becomes a stub
-  `{ nodes, path }` you fetch with `get_node`, so a deep sheet reads shallowly
+  counts + each sheet's `rev`, no boards), `get_sheet`, `get_node` (one node by its
+  `#sheet/nodeId/…` path), `find_nodes` (search/index nodes by text or status →
+  returns each match's path), `get_review`, `list_open_questions`, `list_shared`.
+  `get_sheet` takes an optional `depth` (positive int) that includes nested boards only
+  that many levels deep — a deeper `node.board` becomes a stub `{ nodes, path }` you
+  fetch with `get_node`, so a deep sheet reads shallowly
 - **Author algorithms** — `save_algorithm`, `delete_algorithm`
-- **Author workflows** — `save_sheet` / `delete_sheet` / `reorder_sheets` and
-  `set_station` / `delete_station` (per-piece upserts; preferred), or
-  `save_workflows` (replace-all)
+- **Author workflows** — `set_node` (patch one card) and `edit_board` (cards + edges
+  in one board, atomic) are the granular, preferred path; `save_sheet` creates or
+  rewrites a whole sheet; `delete_sheet` / `reorder_sheets` manage the set. Writes are
+  serialized and `rev`-guarded so a stale assistant edit can't overwrite a human one
 - **Review / decisions** — `set_param`, `set_comment`, `set_decision`,
   `reopen_question` (algorithms); `set_workflow_decision`,
   `reopen_workflow_question` (workflow open questions)

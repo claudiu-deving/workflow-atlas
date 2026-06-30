@@ -622,17 +622,22 @@ body {
 .node-chrome { padding: 12px 14px; }
 .node-top { display: flex; align-items: center; gap: 10px; }
 .node-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--edge); }
-.node[data-status="done"]    .node-dot { background: var(--done); }
-.node[data-status="partial"] .node-dot { background: var(--partial); }
-.node[data-status="todo"]    .node-dot { background: transparent; border: 1.5px dashed var(--todo); }
+/* `> .node-chrome` confines status colour to THIS node's own chrome — a descendant
+   selector here bled the parent's colour onto nested child nodes' dots/chips (a Done
+   child inside a Partial parent rendered amber, since the rules tie on specificity and
+   `partial` is declared after `done`). The child board lives under .node-inner, so the
+   direct-child hop never reaches it. */
+.node[data-status="done"]    > .node-chrome .node-dot { background: var(--done); }
+.node[data-status="partial"] > .node-chrome .node-dot { background: var(--partial); }
+.node[data-status="todo"]    > .node-chrome .node-dot { background: transparent; border: 1.5px dashed var(--todo); }
 .node-title { font-family: var(--display); font-weight: 500; font-size: 16px; line-height: 1.2; margin: 0; flex: 1; min-width: 0; }
 .node-chip {
   flex: none; font-family: var(--mono); font-size: 9.5px; font-weight: 600; letter-spacing: .08em;
   text-transform: uppercase; padding: 3px 8px; border-radius: 999px; border: 1px solid currentColor;
 }
-.node[data-status="done"] .node-chip { color: var(--done); }
-.node[data-status="partial"] .node-chip { color: var(--partial); }
-.node[data-status="todo"] .node-chip { color: var(--todo); }
+.node[data-status="done"]    > .node-chrome .node-chip { color: var(--done); }
+.node[data-status="partial"] > .node-chrome .node-chip { color: var(--partial); }
+.node[data-status="todo"]    > .node-chrome .node-chip { color: var(--todo); }
 .node-sub { color: var(--muted); font-size: 12.5px; line-height: 1.4; margin: 6px 0 0; }
 .node-foot { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
 .node-tag {
@@ -653,9 +658,13 @@ body {
   font-family: var(--display); font-weight: 700; font-size: 14px; line-height: 1;
   box-shadow: 0 4px 12px -6px #000; pointer-events: none;
 }
-.node.has-open .node-q { display: flex; }
-.node.q-done .node-q { border-color: rgba(70, 200, 160, .6); color: var(--done); }
-.node[data-lod="dot"] .node-q { display: none; }   /* too small to read when zoomed out */
+/* `> .node-q` (a direct child of .node) keeps the question bubble bound to THIS node's
+   own state — a descendant selector showed the badge on every nested child card whenever
+   the parent had open questions. The parent still badges its own+nested count (paintNode
+   aggregates), and each child now shows a bubble only for its own questions. */
+.node.has-open > .node-q { display: flex; }
+.node.q-done > .node-q { border-color: rgba(70, 200, 160, .6); color: var(--done); }
+.node[data-lod="dot"] > .node-q { display: none; }   /* too small to read when zoomed out */
 
 /* level-of-detail tiers (set by the engine from apparent on-screen size) */
 .node[data-lod="dot"] .node-sub, .node[data-lod="dot"] .node-foot, .node[data-lod="dot"] .node-chip { display: none; }

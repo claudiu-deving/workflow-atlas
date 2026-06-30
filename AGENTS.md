@@ -31,11 +31,19 @@ The runtime ships zero dependencies; tests use dev-only deps (`npm install` firs
 The canvas exposes `window.__atlasCanvas` (e.g. `getNav()`, `popFocus()`,
 `focusPath()`, `_cam()`, `_settled()`) as the test/automation handle.
 
-**Projects.** Each session works on ONE project — by default the directory the
-server was launched in (so opening repo `acme` authors the `acme` project), or set
-`$WORKFLOW_ATLAS_PROJECT`. Data lives under `$WORKFLOW_ATLAS_HOME`
-(`~/.workflow-atlas` by default), so parallel sessions on different projects stay
-isolated. Every tool below acts on this session's project.
+**Projects.** Each session works on ONE project — by default the **git repo root**
+(so opening repo `acme`, or any of its **worktrees**, authors the one `acme` project),
+else the launch directory's name when it isn't a git repo, or set `$WORKFLOW_ATLAS_PROJECT`
+to override. Data lives under `$WORKFLOW_ATLAS_HOME` (`~/.workflow-atlas` by default), so
+parallel sessions on different projects stay isolated. Every tool below acts on this
+session's project.
+
+**Concurrency.** Each sheet carries a `rev` (a content token). Any edit — yours in the app
+or the assistant's over MCP — bumps it. A reading MCP tool records the rev it saw, and a later
+`edit_board` / `set_node` / `save_sheet` is **auto-rejected** if the sheet changed since (you
+edited it in the app meanwhile) — re-read and re-apply, or pass `force:true`. So the assistant
+can't silently overwrite your hand edits. (`baseRev` pins it explicitly; a cross-process file
+lock keeps two worktree sessions from clobbering each other.)
 
 When you author a workflow or storyboard and no tab is open, the server opens the
 app in the user's browser so they see it immediately (suppress with
@@ -73,23 +81,40 @@ Author the `board` directly to build nesting. A flat `stations: [...]` spine sti
 works (auto-migrated: fan → a nested child board, loop → a `loop` edge) — reach for it
 only for a quick linear flow.
 
-## MCP tools
+## MCP tools (25)
 
-- **Read** — `list_algorithms`, `get_algorithm`, `get_workflows`, `get_sheet`,
-  `get_review`, `get_workflow_review`, `list_open_questions`
-- **Author algorithms** — `save_algorithm` (create/replace a storyboard from a
-  JSON spec), `delete_algorithm`
-- **Author workflows** — `save_sheet` writes a whole sheet **with its nested `board`**
-  of nodes/edges (see the model above); `delete_sheet`/`reorder_sheets` manage the set;
-  `save_workflows` replaces all sheets. `set_station`/`delete_station` upsert one
-  station in the legacy linear-spine shorthand (`loop.to` = station index or target
-  title). A sheet's `code` is a SHORT badge (`"WA-01"`), not pseudocode.
-- **Review / decisions** — `set_param`, `set_comment`, `set_decision`,
-  `reopen_question` (algorithms); `set_workflow_decision`,
-  `reopen_workflow_question` answer a station's `open[]` question (by sheet id +
-  exact question text)
-- **The look** — `list_files`, `get_file`, `set_file` (raw CSS/HTML/JS that styles
-  the app; project data is edited with the content tools, not these)
+- **Read** — `list_sheets` (TOC: ids + status counts + each sheet's `rev`, no boards — start
+  here), `get_sheet` (one sheet, optional `depth`), `get_node` (one node by its
+  `#sheet/nodeId/…` path, optional `depth`), `find_nodes` (search/index every node by
+  text or status across a sheet or the whole project → returns each match's **path**, so
+  you jump straight to it instead of drilling board by board), `list_algorithms`,
+  `get_algorithm`, `get_review`, `list_open_questions` (open/decided across storyboards
+  AND sheets), `list_shared` (transcluded components).
+- **Author algorithms** — `save_algorithm` (create/replace a storyboard from a JSON spec),
+  `delete_algorithm`.
+- **Author workflows (whole sheet)** — `save_sheet` writes a whole sheet **with its nested
+  `board`** of nodes/edges (see the model above); `delete_sheet` / `reorder_sheets` manage the
+  set. Reach for `save_sheet` to **create** a sheet or rewrite it wholesale. A sheet's `code` is
+  a SHORT badge (`"WA-01"`), not pseudocode. A legacy `stations[]` spine is still accepted here
+  and auto-migrates to a board on read.
+- **Author workflows (granular — preferred for edits)** — keep the diagram in sync without
+  resending the sheet:
+  - `set_node` — patch ONE card by its `#sheet/nodeId/…` path. `set` merges into the node
+    (top-level keys replace; `detail` merges per key — `{detail:{note}}` leaves `in/out/open`
+    untouched; a `null` clears a field; an array replaces the whole array). **Patch-by-default**:
+    an unknown node id errors (no silent phantom) unless `create:true` (a new node needs a title).
+  - `edit_board` — edit a whole board in one atomic call: `at` = a sheet id (root board) or
+    `sheetId/nodeId/…` (a nested board); `nodes[]`/`edges[]` upsert-merge by id; `deleteNodes[]`
+    (cascades incident edges) / `deleteEdges[]` remove. Use for edges, deletes, or several cards
+    at once. Editing into a leaf node with no board yet **creates** that child board (so you can
+    author nesting); a typo in a non-leaf segment errors rather than vivifying empty boards.
+  - Both take `baseRev` / `force` and are guarded against a concurrent human edit (see
+    Concurrency above).
+- **Review / decisions** — `set_param`, `set_comment`, `set_decision`, `reopen_question`
+  (algorithms, by step); `set_workflow_decision`, `reopen_workflow_question` answer a node's
+  `open[]` question (by sheet id + exact question text).
+- **The look** — `list_files`, `get_file`, `set_file` (raw CSS/HTML/JS that styles the app;
+  project data is edited with the content tools, not these).
 
 `save_algorithm` takes `{ spec }`. The simplest spec is explicit frames:
 `{ id, name, kind:"array", code:[…pseudocode…], params:[], steps:[ {array, cls,
@@ -102,9 +127,9 @@ All project data is under `$WORKFLOW_ATLAS_HOME/projects/<this-session's-project
 (default `~/.workflow-atlas`) — you reach it through the tools, not the filesystem:
 
 - **Storyboards** → use `save_algorithm` / `get_algorithm` / `list_algorithms`.
-- **Workflow maps** → use `save_sheet`/`set_station` (per-piece) or `save_workflows`
-  (replace-all).
+- **Workflow maps** → `set_node` / `edit_board` (granular, preferred) for edits, or
+  `save_sheet` to create/rewrite a whole sheet; `delete_sheet` / `reorder_sheets` manage the set.
 - **Review overlay** (tuned params / comments / decisions) → use the review tools;
   the user edits these in the app, so read them back with `get_review` /
-  `get_workflow_review` / `list_open_questions` after they say they've answered.
+  `list_open_questions` after they say they've answered.
 - **Styling** → `styles.css` and the HTML shells, via `set_file`.

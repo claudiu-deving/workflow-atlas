@@ -23,12 +23,12 @@
         },
         {
           "title": "Author over MCP",
-          "sub": "save_algorithm / save_workflows",
+          "sub": "save_algorithm / edit_board",
           "status": "done",
           "detail": {
             "in": [
               "save_algorithm { spec }",
-              "save_workflows { sheets }"
+              "save_sheet / edit_board / set_node"
             ],
             "out": [
               "Validated JSON"
